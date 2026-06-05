@@ -1,0 +1,23 @@
+[package]
+name = "prism-server"
+description = "Network server, dispatcher, auth, and the embedded in-process API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Library form exposes the embedded API; the `prismd` binary wraps it.
+[lib]
+name = "prism_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "prismd"
+path = "src/bin/prismd.rs"
+
+[dependencies]
+prism-sql = { workspace = true }
+prism-doc = { workspace = true }
+prism-kv = { workspace = true }
+prism-protocol = { workspace = true }

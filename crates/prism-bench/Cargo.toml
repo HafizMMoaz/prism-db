@@ -1,0 +1,16 @@
+[package]
+name = "prism-bench"
+description = "Benchmark harness: synthetic workloads, latency/throughput reporting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "prism-bench"
+path = "src/main.rs"
+
+# Drives the embedded API via prism-server's library form.
+[dependencies]
+prism-server = { workspace = true }

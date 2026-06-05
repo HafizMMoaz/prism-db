@@ -1,0 +1,12 @@
+[package]
+name = "prism-doc"
+description = "Document engine: tagged-binary format, Mongo-subset predicates, path indexes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prism-core = { workspace = true }
+prism-index = { workspace = true }

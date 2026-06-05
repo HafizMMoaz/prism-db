@@ -1,0 +1,12 @@
+[package]
+name = "prism-kv"
+description = "Key-value engine: namespaces, get/put/delete/range over the record store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prism-core = { workspace = true }
+prism-index = { workspace = true }

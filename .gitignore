@@ -1,0 +1,31 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo (workspace lockfile IS committed — it has binaries)
+# Do not ignore Cargo.lock
+
+# proptest persists minimized regressions; these ARE committed
+# (do not ignore proptest-regressions/)
+
+# Coverage / profiling
+*.profraw
+*.profdata
+
+# Node SDK
+crates/prism-sdk-node/node_modules/
+crates/prism-sdk-node/*.node
+crates/prism-sdk-node/npm/
+
+# Local database files produced by manual runs / tests
+*.prism
+/data/
+/tmp-data/
+
+# Editor / OS
+.idea/
+.vscode/*
+!.vscode/extensions.json
+.DS_Store
+Thumbs.db

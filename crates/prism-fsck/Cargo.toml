@@ -1,0 +1,17 @@
+[package]
+name = "prism-fsck"
+description = "Offline integrity checker: page checksums, WAL integrity, consistency."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "prism-fsck"
+path = "src/main.rs"
+
+# Only the on-disk formats, no live engine state.
+[dependencies]
+prism-storage = { workspace = true }
+prism-wal = { workspace = true }

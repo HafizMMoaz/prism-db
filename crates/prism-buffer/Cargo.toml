@@ -1,0 +1,12 @@
+[package]
+name = "prism-buffer"
+description = "Buffer pool: clock-sweep replacement, pin/unpin, WAL invariant."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prism-storage = { workspace = true }
+prism-wal = { workspace = true }

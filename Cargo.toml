@@ -1,0 +1,93 @@
+# Prism — workspace manifest.
+# This file is the source of truth for crates, shared dependencies, and build
+# profiles. Crate dependency direction is downward only; see
+# docs/architecture/module-layout.md.
+
+[workspace]
+resolver = "2"
+members = [
+    "crates/prism-storage",
+    "crates/prism-wal",
+    "crates/prism-buffer",
+    "crates/prism-core",
+    "crates/prism-index",
+    "crates/prism-sql",
+    "crates/prism-doc",
+    "crates/prism-kv",
+    "crates/prism-protocol",
+    "crates/prism-server",
+    "crates/prism-shell",
+    "crates/prism-sdk-node",
+    "crates/prism-fsck",
+    "crates/prism-bench",
+    "crates/prism-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/prism-db/prism"
+authors = ["The Prism authors"]
+
+# Internal crates (path deps) — referenced by members via `{ workspace = true }`.
+[workspace.dependencies]
+prism-storage = { path = "crates/prism-storage" }
+prism-wal = { path = "crates/prism-wal" }
+prism-buffer = { path = "crates/prism-buffer" }
+prism-core = { path = "crates/prism-core" }
+prism-index = { path = "crates/prism-index" }
+prism-sql = { path = "crates/prism-sql" }
+prism-doc = { path = "crates/prism-doc" }
+prism-kv = { path = "crates/prism-kv" }
+prism-protocol = { path = "crates/prism-protocol" }
+prism-server = { path = "crates/prism-server" }
+prism-testkit = { path = "crates/prism-testkit" }
+
+# Shared external crates are pre-staged here so versions stay consistent across
+# the workspace. They are NOT downloaded until a member actually depends on one,
+# so the Step 0 skeleton (no external deps yet) builds fully offline.
+# Wire these in per phase as components are implemented.
+bytes = "1"
+crc32fast = "1.4"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+parking_lot = "0.12"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+proptest = "1"
+sqlparser = "0.54"
+tokio = { version = "1", features = ["full"] }
+
+# ── Build profiles ─────────────────────────────────────────────────────────
+# Mirrors docs/operations/build-and-dev.md.
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"   # symbols for prod debugging without size blowup
+
+[profile.bench]
+opt-level = 3
+lto = "thin"                 # faster than fat LTO for benchmark iteration
+codegen-units = 1
+debug = true
+
+# Production binaries that need full debug info.
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+
+# cargo-fuzz targets (see docs/operations/testing-strategy.md).
+[profile.fuzz]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true

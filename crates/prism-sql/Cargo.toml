@@ -1,0 +1,12 @@
+[package]
+name = "prism-sql"
+description = "Relational engine: parser, binder, planner, Volcano executor."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prism-core = { workspace = true }
+prism-index = { workspace = true }

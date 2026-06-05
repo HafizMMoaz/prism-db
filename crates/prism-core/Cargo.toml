@@ -1,0 +1,13 @@
+[package]
+name = "prism-core"
+description = "Transaction manager, record store, MVCC, lock manager, recovery, catalog."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+prism-storage = { workspace = true }
+prism-wal = { workspace = true }
+prism-buffer = { workspace = true }

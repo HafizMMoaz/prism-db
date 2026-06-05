@@ -1,0 +1,12 @@
+[package]
+name = "prism-protocol"
+description = "Wire protocol types and serialization. Pure data definitions, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Intentionally has no Prism dependencies — both the server and clients pull
+# this in. See docs/architecture/module-layout.md.
+[dependencies]

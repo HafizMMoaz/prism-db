@@ -1,0 +1,16 @@
+[package]
+name = "prism-sdk-node"
+description = "Node.js SDK via napi-rs. Default: remote client over TCP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# napi-rs produces a cdylib; wired up in Phase 4. Plain lib for the skeleton so
+# the workspace builds without the napi toolchain present.
+[lib]
+crate-type = ["lib"]
+
+[dependencies]
+prism-protocol = { workspace = true }

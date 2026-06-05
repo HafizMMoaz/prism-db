@@ -1,0 +1,15 @@
+[package]
+name = "prism-shell"
+description = "Interactive shell: readline REPL with per-model output formatting."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "prism-shell"
+path = "src/main.rs"
+
+[dependencies]
+prism-protocol = { workspace = true }

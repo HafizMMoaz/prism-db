@@ -1,0 +1,6 @@
+# Pinned toolchain. MSRV is 1.85.0 (Rust edition 2024 floor).
+# Updating this requires an ADR (see docs/architecture/module-layout.md).
+[toolchain]
+channel = "1.85.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
