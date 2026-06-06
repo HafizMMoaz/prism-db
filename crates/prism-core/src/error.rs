@@ -38,4 +38,8 @@ pub enum CoreError {
     /// An operation referenced a transaction that is not active.
     #[error("transaction {0} is not active")]
     TxnNotActive(TxnId),
+
+    /// Recovery could not reconstruct a consistent state from the WAL.
+    #[error("recovery error: {0}")]
+    Recovery(String),
 }

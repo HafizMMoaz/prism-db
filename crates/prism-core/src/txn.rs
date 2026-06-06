@@ -166,6 +166,24 @@ impl TxnManager {
         m
     }
 
+    /// Construct a manager from a recovery pass: resume id allocation and seed
+    /// the commit log so visibility classifies pre-crash transactions correctly.
+    pub fn new_recovered(
+        wal: Arc<Wal>,
+        next_txn: TxnId,
+        committed: &[(TxnId, Lsn)],
+        aborted: &[TxnId],
+    ) -> Self {
+        let m = Self::with_next_txn(wal, next_txn);
+        for &(txn, commit_lsn) in committed {
+            m.commit_log.record_commit(txn, commit_lsn);
+        }
+        for &txn in aborted {
+            m.commit_log.record_abort(txn);
+        }
+        m
+    }
+
     /// The commit log (for the visibility function).
     pub fn commit_log(&self) -> &CommitLog {
         &self.commit_log
