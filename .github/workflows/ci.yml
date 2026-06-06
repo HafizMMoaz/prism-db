@@ -46,6 +46,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
+      - uses: dtolnay/rust-toolchain@1.85.0
+      # Install the cargo-deny binary directly (prebuilt) rather than the
+      # Docker-based action, which intermittently fails to pull its base image.
+      - uses: taiki-e/install-action@cargo-deny
+      - run: cargo deny check
