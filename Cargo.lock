@@ -323,6 +323,11 @@ dependencies = [
 [[package]]
 name = "prism-testkit"
 version = "0.1.0"
+dependencies = [
+ "prism-buffer",
+ "prism-storage",
+ "prism-wal",
+]
 
 [[package]]
 name = "prism-wal"
