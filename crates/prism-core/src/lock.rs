@@ -103,8 +103,11 @@ impl LockManager {
 
             match decision {
                 Decision::Acquired => {
-                    drop(map);
+                    // Clear our wait edge BEFORE releasing the shard lock: once
+                    // another waiter can observe us as the holder it must not
+                    // see a stale edge, or it would detect a phantom cycle.
                     self.graph.clear(txn);
+                    drop(map);
                     self.held
                         .lock()
                         .expect("held poisoned")

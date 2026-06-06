@@ -13,6 +13,8 @@
 //! Still to come this milestone: the record store (MVCC tuple ops over the
 //! buffer pool), the lock manager, and ARIES recovery.
 
+#[cfg(test)]
+mod bank;
 pub mod error;
 pub mod lock;
 pub mod record;
