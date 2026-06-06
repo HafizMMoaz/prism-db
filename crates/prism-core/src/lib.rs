@@ -15,6 +15,7 @@
 
 pub mod error;
 pub mod record;
+pub mod store;
 pub mod txn;
 pub mod visibility;
 
@@ -23,6 +24,7 @@ pub use record::{
     FLAG_FORWARDED, FLAG_HAS_PREV, FLAG_LOCKED, FLAG_TOMBSTONE, RECORD_HEADER_SIZE, RecordHeader,
     RecordId,
 };
+pub use store::{HeapId, RecordStore};
 pub use txn::{CommitLog, CommitStatus, Snapshot, TxnHandle, TxnManager, TxnMode};
 pub use visibility::visible;
 

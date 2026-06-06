@@ -285,6 +285,22 @@ impl<'a> SlottedPage<'a> {
         record_at(self.buf, id)
     }
 
+    /// Mutable access to the record bytes for `id`, for in-place edits that do
+    /// not change the record's length (e.g. stamping an MVCC `xmax`). Returns
+    /// `None` if the slot is empty or invalid.
+    pub fn get_mut(&mut self, id: SlotId) -> Option<&mut [u8]> {
+        let i = id as usize;
+        if i >= self.slot_count() as usize {
+            return None;
+        }
+        let off = slot_offset(self.buf, i) as usize;
+        if off == 0 {
+            return None;
+        }
+        let len = (slot_length_field(self.buf, i) & SLOT_LENGTH_MASK) as usize;
+        self.buf.get_mut(off..off + len)
+    }
+
     /// Insert a record, returning its slot id, or `None` if it does not fit.
     ///
     /// Reuses an empty slot when one exists (saving the 4-byte slot overhead);
@@ -408,6 +424,17 @@ mod tests {
         assert_eq!(a, 0);
         assert_eq!(b, 1);
         assert_eq!(page.slot_count(), 2);
+    }
+
+    #[test]
+    fn get_mut_edits_in_place() {
+        let mut buf = fresh();
+        let mut page = SlottedPage::new(&mut buf);
+        let a = page.insert(b"abcd").unwrap();
+        page.get_mut(a).unwrap().copy_from_slice(b"WXYZ");
+        assert_eq!(page.get(a), Some(&b"WXYZ"[..]));
+        // Empty / out-of-range slots yield None.
+        assert!(page.get_mut(99).is_none());
     }
 
     #[test]
