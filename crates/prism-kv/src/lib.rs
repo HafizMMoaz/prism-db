@@ -68,6 +68,15 @@ fn decode_value(payload: &[u8]) -> &[u8] {
     payload.get(2 + key_len..).unwrap_or(&[])
 }
 
+/// Extract the key bytes from a KV payload.
+fn decode_key(payload: &[u8]) -> &[u8] {
+    if payload.len() < 2 {
+        return &[];
+    }
+    let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    payload.get(2..2 + key_len).unwrap_or(&[])
+}
+
 /// A hash-indexed key-value namespace: a heap of records plus a key→RID index.
 pub struct KvNamespace {
     store: Arc<RecordStore>,
@@ -155,6 +164,20 @@ impl KvNamespace {
         }
         self.put(txn, key, value)?;
         Ok(true)
+    }
+
+    /// Rebuild the in-memory key→RID index by scanning the namespace's heap
+    /// for the versions visible to `txn`. Call after recovery (with a fresh
+    /// read-only transaction) to restore lookups for data that survived a
+    /// restart — the placeholder until the persistent hash index lands.
+    pub fn rebuild_index(&self, txn: &TxnHandle) -> Result<()> {
+        let rows = self.store.scan(txn, self.heap)?;
+        let mut index = self.index.lock().expect("kv index poisoned");
+        index.clear();
+        for (rid, payload) in rows {
+            index.insert(decode_key(&payload).to_vec(), rid);
+        }
+        Ok(())
     }
 
     /// Set `key` to `new` only if its current visible value equals `expected`.
@@ -326,6 +349,92 @@ mod tests {
             Some(&b"third"[..])
         );
         t.commit().unwrap();
+    }
+
+    #[test]
+    fn kv_survives_restart() {
+        use prism_core::recover;
+        use prism_storage::DiskManager as Disk;
+
+        let tmp = TempDir::new("kv-restart").unwrap();
+        let heap_path = tmp.path().join("heap.db");
+        let heap = HeapId(1);
+
+        // Session 1: write some committed data, then crash (drop, no flush).
+        {
+            let disk = Arc::new(Disk::open(&heap_path, true).unwrap());
+            let wal = Arc::new(
+                Wal::open(
+                    &tmp.path().join("wal"),
+                    WalConfig {
+                        segment_size: 256 * 1024,
+                        sync_mode: SyncMode::None,
+                    },
+                )
+                .unwrap(),
+            );
+            let buffer = Arc::new(
+                BufferPool::new(disk.clone(), wal.clone(), BufConfig { frame_count: 8 }).unwrap(),
+            );
+            let txns = Arc::new(TxnManager::new(wal.clone()));
+            let store = Arc::new(RecordStore::new(buffer.clone(), wal.clone(), txns.clone()));
+            let ns = KvNamespace::new(store.clone(), heap);
+
+            let t = txns.begin(TxnMode::ReadWrite);
+            ns.put(&t, b"k1", b"v1").unwrap();
+            ns.put(&t, b"k2", b"v2").unwrap();
+            ns.put(&t, b"gone", b"x").unwrap();
+            ns.delete(&t, b"gone").unwrap();
+            t.commit().unwrap();
+
+            drop(ns);
+            drop(store);
+            drop(buffer);
+            drop(txns);
+            drop(disk);
+        }
+
+        // Recover the heap, then reopen seeded from the recovery report.
+        let wal = Arc::new(
+            Wal::open(
+                &tmp.path().join("wal"),
+                WalConfig {
+                    segment_size: 256 * 1024,
+                    sync_mode: SyncMode::None,
+                },
+            )
+            .unwrap(),
+        );
+        let report = {
+            let disk = Disk::open(&heap_path, false).unwrap();
+            let r = recover(&wal, &disk).unwrap();
+            disk.close().unwrap();
+            r
+        };
+
+        let disk = Arc::new(Disk::open(&heap_path, false).unwrap());
+        let buffer =
+            Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 8 }).unwrap());
+        let txns = Arc::new(TxnManager::new_recovered(
+            wal.clone(),
+            report.next_txn_id,
+            &report.committed,
+            &report.aborted,
+        ));
+        let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
+        store.seed_heap_directory(&report.heaps);
+
+        let ns = KvNamespace::new(store, heap);
+        let reader = txns.begin(TxnMode::ReadOnly);
+        ns.rebuild_index(&reader).unwrap();
+        assert_eq!(ns.get(&reader, b"k1").unwrap().as_deref(), Some(&b"v1"[..]));
+        assert_eq!(ns.get(&reader, b"k2").unwrap().as_deref(), Some(&b"v2"[..]));
+        assert_eq!(
+            ns.get(&reader, b"gone").unwrap(),
+            None,
+            "deleted key stays deleted"
+        );
+        reader.commit().unwrap();
     }
 
     #[test]

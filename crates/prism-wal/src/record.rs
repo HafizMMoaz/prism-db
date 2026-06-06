@@ -24,6 +24,7 @@ const T_BEGIN_CHECKPOINT: u8 = 0x30;
 const T_CHECKPOINT_CONTENTS: u8 = 0x31;
 const T_END_CHECKPOINT: u8 = 0x32;
 const T_FULL_PAGE_IMAGE: u8 = 0x50;
+const T_HEAP_PAGE: u8 = 0x60;
 
 /// A single WAL record: common header fields plus a typed payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,6 +136,15 @@ pub enum RecordPayload {
         /// Exactly `PAGE_SIZE` bytes.
         image: Vec<u8>,
     },
+    /// A page was added to a heap (the durable heap directory). Logged when the
+    /// record store allocates a fresh page for a heap; recovery rebuilds the
+    /// `heap -> pages` map from these so heaps survive restart.
+    HeapPage {
+        /// The heap (table/collection/namespace) object id.
+        heap_id: u64,
+        /// The page now belonging to that heap.
+        page_id: PageId,
+    },
 }
 
 // ── Encoding ────────────────────────────────────────────────────────────────
@@ -224,6 +234,11 @@ pub fn encode_body(payload: &RecordPayload, out: &mut Vec<u8>) -> u8 {
             put_u64(out, page_id.as_u64());
             put_bytes_u32(out, image);
             T_FULL_PAGE_IMAGE
+        }
+        RecordPayload::HeapPage { heap_id, page_id } => {
+            put_u64(out, *heap_id);
+            put_u64(out, page_id.as_u64());
+            T_HEAP_PAGE
         }
     }
 }
@@ -347,6 +362,10 @@ fn decode_body(rtype: u8, body: &[u8]) -> Result<RecordPayload> {
         T_FULL_PAGE_IMAGE => RecordPayload::FullPageImage {
             page_id: PageId(r.u64()?),
             image: r.bytes_u32()?,
+        },
+        T_HEAP_PAGE => RecordPayload::HeapPage {
+            heap_id: r.u64()?,
+            page_id: PageId(r.u64()?),
         },
         other => return Err(WalError::UnknownRecordType(other)),
     };
@@ -493,6 +512,10 @@ mod tests {
         roundtrip(&LogRecord::system(RecordPayload::FullPageImage {
             page_id: PageId(12),
             image: vec![0xAB; 256],
+        }));
+        roundtrip(&LogRecord::system(RecordPayload::HeapPage {
+            heap_id: 1234,
+            page_id: PageId(56),
         }));
     }
 

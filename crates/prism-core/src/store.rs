@@ -56,6 +56,24 @@ impl RecordStore {
         }
     }
 
+    /// Seed the heap directory from a recovery pass (the `heap -> pages` map
+    /// rebuilt from the WAL's `HeapPage` records), so heaps and `scan` work after
+    /// restart. Each heap's pages are given in allocation order.
+    pub fn seed_heap_directory(&self, heaps: &[(u64, Vec<PageId>)]) {
+        let mut tables = self.heaps.lock().expect("heaps poisoned");
+        for (heap_id, pages) in heaps {
+            let heap = HeapId(*heap_id);
+            for &page in pages {
+                tables.page_heap.insert(page, heap);
+            }
+            tables
+                .pages
+                .entry(heap)
+                .or_default()
+                .extend(pages.iter().copied());
+        }
+    }
+
     /// Insert a new record into `heap`, returning its id.
     pub fn insert(&self, txn: &TxnHandle, heap: HeapId, payload: &[u8]) -> Result<RecordId> {
         let header = RecordHeader::new_insert(txn.id());
@@ -212,6 +230,15 @@ impl RecordStore {
             let mut page = SlottedPage::init(&mut guard, PageType::Heap);
             page.insert(bytes).ok_or(CoreError::SerializationFailure)? // record too large for an empty page
         };
+        // Record the heap->page membership durably (the heap directory) before
+        // the record itself, so recovery can rebuild heaps on restart.
+        self.log(
+            txn,
+            RecordPayload::HeapPage {
+                heap_id: heap.0,
+                page_id: pid,
+            },
+        )?;
         self.log_insert(txn, &mut guard, pid, slot, bytes)?;
         tables.pages.entry(heap).or_default().push(pid);
         tables.page_heap.insert(pid, heap);

@@ -43,6 +43,9 @@ pub struct RecoveryReport {
     pub committed: Vec<(TxnId, Lsn)>,
     /// Transactions that aborted or were losers (active at crash) — invisible.
     pub aborted: Vec<TxnId>,
+    /// The heap directory: `heap_id -> pages` (allocation order), for seeding
+    /// the record store so heaps and `scan` work after restart.
+    pub heaps: Vec<(u64, Vec<PageId>)>,
 }
 
 /// Recover the database: replay the WAL, rebuild page contents on `disk`, and
@@ -55,6 +58,9 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
     let mut committed: HashMap<TxnId, Lsn> = HashMap::new();
     let mut aborted: HashSet<TxnId> = HashSet::new();
     let mut data_txns: HashSet<TxnId> = HashSet::new();
+    // Heap directory rebuilt from HeapPage records, in WAL (allocation) order.
+    let mut heap_dir: Vec<(u64, Vec<PageId>)> = Vec::new();
+    let mut heap_index: HashMap<u64, usize> = HashMap::new();
     let mut max_txn = BOOTSTRAP_TXN;
     let mut replayed = 0usize;
 
@@ -109,6 +115,13 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
                 pages.insert(page_id.as_u64(), buf);
                 data_txns.insert(record.txn_id);
             }
+            RecordPayload::HeapPage { heap_id, page_id } => {
+                let idx = *heap_index.entry(heap_id).or_insert_with(|| {
+                    heap_dir.push((heap_id, Vec::new()));
+                    heap_dir.len() - 1
+                });
+                heap_dir[idx].1.push(page_id);
+            }
             RecordPayload::Commit { .. } => {
                 committed.insert(record.txn_id, lsn);
             }
@@ -145,6 +158,7 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
         pages_rebuilt,
         committed: committed.into_iter().collect(),
         aborted: aborted.into_iter().collect(),
+        heaps: heap_dir,
     })
 }
 
@@ -340,6 +354,63 @@ mod tests {
             read(rid_ghost),
             None,
             "loser's insert is invisible after recovery"
+        );
+        reader.commit().unwrap();
+    }
+
+    #[test]
+    fn scan_works_after_recovery() {
+        let tmp = TempDir::new("recover-scan").unwrap();
+        let heap = tmp.path().join("heap.db");
+
+        {
+            let disk = Arc::new(DiskManager::open(&heap, true).unwrap());
+            let wal = open_wal(tmp.path());
+            let buffer = Arc::new(
+                BufferPool::new(disk.clone(), wal.clone(), BufConfig { frame_count: 4 }).unwrap(),
+            );
+            let txns = Arc::new(TxnManager::new(wal.clone()));
+            let store = RecordStore::new(buffer.clone(), wal.clone(), txns.clone());
+
+            let t = txns.begin(TxnMode::ReadWrite);
+            for i in 0..20u8 {
+                store.insert(&t, HEAP, &[i; 32]).unwrap();
+            }
+            t.commit().unwrap();
+
+            drop(store);
+            drop(buffer);
+            drop(txns);
+            drop(disk);
+        }
+
+        let wal = open_wal(tmp.path());
+        let report = {
+            let disk = DiskManager::open(&heap, false).unwrap();
+            let r = recover(&wal, &disk).unwrap();
+            disk.close().unwrap();
+            r
+        };
+        assert!(!report.heaps.is_empty(), "heap directory was rebuilt");
+
+        let disk = Arc::new(DiskManager::open(&heap, false).unwrap());
+        let buffer =
+            Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 4 }).unwrap());
+        let txns = Arc::new(TxnManager::new_recovered(
+            wal.clone(),
+            report.next_txn_id,
+            &report.committed,
+            &report.aborted,
+        ));
+        let store = RecordStore::new(buffer, wal, txns.clone());
+        store.seed_heap_directory(&report.heaps); // <-- the directory makes scan work
+
+        let reader = txns.begin(TxnMode::ReadOnly);
+        let rows = store.scan(&reader, HEAP).unwrap();
+        assert_eq!(
+            rows.len(),
+            20,
+            "all committed rows visible via scan after recovery"
         );
         reader.commit().unwrap();
     }
