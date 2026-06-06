@@ -27,6 +27,14 @@ pub enum CoreError {
     #[error("serialization failure (write-write conflict)")]
     SerializationFailure,
 
+    /// This transaction was chosen as the victim to break a deadlock. Retry.
+    #[error("deadlock detected; transaction chosen as victim")]
+    Deadlock,
+
+    /// A lock could not be acquired within the timeout.
+    #[error("lock acquisition timed out")]
+    LockTimeout,
+
     /// An operation referenced a transaction that is not active.
     #[error("transaction {0} is not active")]
     TxnNotActive(TxnId),

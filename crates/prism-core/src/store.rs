@@ -92,6 +92,11 @@ impl RecordStore {
     pub fn update(&self, txn: &TxnHandle, rid: RecordId, payload: &[u8]) -> Result<RecordId> {
         let heap = self.heap_of(rid.page)?;
 
+        // Take the write lock first (blocks behind an in-progress writer; held
+        // until this txn commits/aborts), then validate the post-wait state.
+        let locks = self.txns.locks();
+        locks.acquire(txn.id(), rid, locks.default_timeout())?;
+
         // Validate the target version before producing a new one.
         {
             let guard = self.buffer.fetch_read(rid.page)?;
@@ -120,6 +125,8 @@ impl RecordStore {
 
     /// Mark the record at `rid` deleted (set its `xmax`).
     pub fn delete(&self, txn: &TxnHandle, rid: RecordId) -> Result<()> {
+        let locks = self.txns.locks();
+        locks.acquire(txn.id(), rid, locks.default_timeout())?;
         {
             let guard = self.buffer.fetch_read(rid.page)?;
             let page = SlottedPageRef::new(&guard);

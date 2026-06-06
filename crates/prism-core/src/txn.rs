@@ -15,6 +15,7 @@ use prism_wal::record::RecordPayload;
 use prism_wal::{LogRecord, Lsn, Wal};
 
 use crate::error::Result;
+use crate::lock::{LockConfig, LockManager};
 use crate::{BOOTSTRAP_TXN, FIRST_USER_TXN, TxnId};
 
 /// Isolation/access mode for a transaction.
@@ -128,12 +129,14 @@ impl Default for CommitLog {
     }
 }
 
-/// Owns transaction lifecycle: id allocation, the active set, and the commit log.
+/// Owns transaction lifecycle: id allocation, the active set, the commit log,
+/// and the lock manager (whose locks it releases on commit/abort).
 pub struct TxnManager {
     wal: Arc<Wal>,
     next_txn: AtomicU64,
     active: Mutex<BTreeSet<TxnId>>,
     commit_log: CommitLog,
+    locks: LockManager,
 }
 
 impl TxnManager {
@@ -145,7 +148,13 @@ impl TxnManager {
             next_txn: AtomicU64::new(FIRST_USER_TXN),
             active: Mutex::new(BTreeSet::new()),
             commit_log: CommitLog::new(),
+            locks: LockManager::new(LockConfig::default()),
         }
+    }
+
+    /// The lock manager (used by the record store to acquire write locks).
+    pub fn locks(&self) -> &LockManager {
+        &self.locks
     }
 
     /// Create a manager whose id allocator resumes at `next_txn` (used by
@@ -220,6 +229,9 @@ impl TxnManager {
                 self.commit_log.record_commit(txn_id, Lsn::ZERO);
             }
         }
+        // Release write locks only after the commit is durable, so blocked
+        // writers wake to a committed state.
+        self.locks.release_all(txn_id);
         self.active
             .lock()
             .expect("active set poisoned")
@@ -238,6 +250,7 @@ impl TxnManager {
             self.wal.flush_through(abort_lsn)?;
         }
         self.commit_log.record_abort(txn_id);
+        self.locks.release_all(txn_id);
         self.active
             .lock()
             .expect("active set poisoned")

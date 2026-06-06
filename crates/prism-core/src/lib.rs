@@ -14,12 +14,14 @@
 //! buffer pool), the lock manager, and ARIES recovery.
 
 pub mod error;
+pub mod lock;
 pub mod record;
 pub mod store;
 pub mod txn;
 pub mod visibility;
 
 pub use error::{CoreError, Result};
+pub use lock::{LockConfig, LockManager};
 pub use record::{
     FLAG_FORWARDED, FLAG_HAS_PREV, FLAG_LOCKED, FLAG_TOMBSTONE, RECORD_HEADER_SIZE, RecordHeader,
     RecordId,
