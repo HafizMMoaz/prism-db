@@ -274,8 +274,12 @@ dependencies = [
 name = "prism-kv"
 version = "0.1.0"
 dependencies = [
+ "prism-buffer",
  "prism-core",
- "prism-index",
+ "prism-storage",
+ "prism-testkit",
+ "prism-wal",
+ "thiserror",
 ]
 
 [[package]]

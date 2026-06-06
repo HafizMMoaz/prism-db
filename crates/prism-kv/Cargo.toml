@@ -9,4 +9,10 @@ repository.workspace = true
 
 [dependencies]
 prism-core = { workspace = true }
-prism-index = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+prism-storage = { workspace = true }
+prism-buffer = { workspace = true }
+prism-wal = { workspace = true }
+prism-testkit = { workspace = true }
