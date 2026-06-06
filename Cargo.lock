@@ -241,7 +241,10 @@ version = "0.1.0"
 dependencies = [
  "prism-buffer",
  "prism-storage",
+ "prism-testkit",
  "prism-wal",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

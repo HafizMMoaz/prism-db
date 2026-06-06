@@ -11,3 +11,8 @@ repository.workspace = true
 prism-storage = { workspace = true }
 prism-wal = { workspace = true }
 prism-buffer = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+prism-testkit = { workspace = true }
