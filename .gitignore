@@ -23,6 +23,9 @@ crates/prism-sdk-node/npm/
 /data/
 /tmp-data/
 
+# Local Claude Code harness settings (personal, not shared)
+.claude/settings.local.json
+
 # Editor / OS
 .idea/
 .vscode/*
