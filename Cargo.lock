@@ -326,7 +326,10 @@ version = "0.1.0"
 name = "prism-wal"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "prism-storage",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]

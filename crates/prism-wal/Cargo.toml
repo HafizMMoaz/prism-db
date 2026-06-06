@@ -9,3 +9,8 @@ repository.workspace = true
 
 [dependencies]
 prism-storage = { workspace = true }
+crc32fast = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
