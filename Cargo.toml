@@ -31,19 +31,21 @@ license = "Apache-2.0"
 repository = "https://github.com/prism-db/prism"
 authors = ["The Prism authors"]
 
-# Internal crates (path deps) — referenced by members via `{ workspace = true }`.
+# Internal crates — referenced by members via `{ workspace = true }`. Each carries
+# an explicit version alongside its path: the path drives local builds, the
+# version keeps the deps concrete (not wildcards) for tooling and publishing.
 [workspace.dependencies]
-prism-storage = { path = "crates/prism-storage" }
-prism-wal = { path = "crates/prism-wal" }
-prism-buffer = { path = "crates/prism-buffer" }
-prism-core = { path = "crates/prism-core" }
-prism-index = { path = "crates/prism-index" }
-prism-sql = { path = "crates/prism-sql" }
-prism-doc = { path = "crates/prism-doc" }
-prism-kv = { path = "crates/prism-kv" }
-prism-protocol = { path = "crates/prism-protocol" }
-prism-server = { path = "crates/prism-server" }
-prism-testkit = { path = "crates/prism-testkit" }
+prism-storage = { path = "crates/prism-storage", version = "0.1.0" }
+prism-wal = { path = "crates/prism-wal", version = "0.1.0" }
+prism-buffer = { path = "crates/prism-buffer", version = "0.1.0" }
+prism-core = { path = "crates/prism-core", version = "0.1.0" }
+prism-index = { path = "crates/prism-index", version = "0.1.0" }
+prism-sql = { path = "crates/prism-sql", version = "0.1.0" }
+prism-doc = { path = "crates/prism-doc", version = "0.1.0" }
+prism-kv = { path = "crates/prism-kv", version = "0.1.0" }
+prism-protocol = { path = "crates/prism-protocol", version = "0.1.0" }
+prism-server = { path = "crates/prism-server", version = "0.1.0" }
+prism-testkit = { path = "crates/prism-testkit", version = "0.1.0" }
 
 # Shared external crates are pre-staged here so versions stay consistent across
 # the workspace. They are NOT downloaded until a member actually depends on one,
