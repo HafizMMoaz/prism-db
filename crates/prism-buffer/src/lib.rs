@@ -1,9 +1,15 @@
 //! `prism-buffer` — the buffer pool.
 //!
-//! Fixed-size frame array, page table (`PageId -> FrameId`), pin/unpin,
-//! clock-sweep eviction, dirty tracking, and the background page cleaner.
-//! Enforces the WAL invariant: a dirty page is never flushed before the log
-//! record describing its modification is durable. See
-//! `docs/components/buffer-pool.md` and `docs/adr/0007-clock-sweep-buffer-pool.md`.
+//! The in-memory cache of pages. Owns a fixed pool of frames; loads pages on
+//! demand, pins them during use, and evicts under pressure via clock sweep.
+//! Crucially, it enforces the **WAL invariant**: a dirty page never reaches
+//! disk until the WAL is durable through that page's `page_lsn`. See
+//! `docs/components/buffer-pool.md` and ADR 0007.
 //!
-//! Status: skeleton (Phase 1 / M1 not yet started).
+//! Built on `prism-storage` (the disk) and `prism-wal` (durability).
+
+pub mod error;
+mod pool;
+
+pub use error::{BufferError, Result};
+pub use pool::{BufferPool, Config, PageReadGuard, PageWriteGuard};
