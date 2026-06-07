@@ -308,10 +308,15 @@ dependencies = [
 name = "prism-server"
 version = "0.1.0"
 dependencies = [
+ "prism-buffer",
+ "prism-core",
  "prism-doc",
  "prism-kv",
  "prism-protocol",
  "prism-sql",
+ "prism-storage",
+ "prism-testkit",
+ "prism-wal",
 ]
 
 [[package]]

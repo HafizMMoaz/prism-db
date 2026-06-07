@@ -21,3 +21,12 @@ prism-sql = { workspace = true }
 prism-doc = { workspace = true }
 prism-kv = { workspace = true }
 prism-protocol = { workspace = true }
+
+# For the cross-model integration tests: build the shared storage stack
+# (disk + WAL + buffer pool + transaction manager + record store) directly.
+[dev-dependencies]
+prism-core = { workspace = true }
+prism-storage = { workspace = true }
+prism-buffer = { workspace = true }
+prism-wal = { workspace = true }
+prism-testkit = { workspace = true }
