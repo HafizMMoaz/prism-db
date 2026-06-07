@@ -61,7 +61,10 @@ anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 proptest = "1"
-sqlparser = "0.54"
+# default-features off drops `recursive-protection`, whose transitive build-dep
+# (ar_archive_writer) requires Rust > our pinned 1.85 MSRV. Re-enabling it (deep-
+# nesting stack-overflow protection) is an MSRV bump and needs an ADR.
+sqlparser = { version = "0.54", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
 
 # ── Build profiles ─────────────────────────────────────────────────────────
