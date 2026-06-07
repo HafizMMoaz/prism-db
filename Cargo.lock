@@ -267,7 +267,13 @@ dependencies = [
 name = "prism-index"
 version = "0.1.0"
 dependencies = [
+ "prism-buffer",
  "prism-core",
+ "prism-storage",
+ "prism-testkit",
+ "prism-wal",
+ "proptest",
+ "thiserror",
 ]
 
 [[package]]
