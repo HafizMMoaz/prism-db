@@ -11,6 +11,25 @@
 //! manager) and undo/redo recovery are later increments. Heap free-space uses a
 //! simple "last page, else new page" probe under one lock; a free-space map is a
 //! documented follow-up.
+//!
+//! ## Locking discipline (deadlock freedom)
+//!
+//! Three lockables are in play: the record lock manager (per-RID write locks),
+//! this store's `heaps` directory mutex, and the buffer pool's latches (its
+//! directory mutex + per-page content latches). They are always taken in the
+//! global order **record lock → `heaps` → buffer latches**, and:
+//! - `heaps` is never acquired while a page latch is held (`heap_of` resolves
+//!   the heap *before* any latch; `scan` clones the page list, then drops
+//!   `heaps`, then latches);
+//! - at most one page content latch is held at a time on any op;
+//! - a transaction blocked in the lock manager holds no `heaps`/page latch, so
+//!   other transactions keep making progress.
+//!
+//! The only blocking wait is the lock manager's, which is bounded by a timeout
+//! (so a missed wakeup degrades to `LockTimeout`, never a hang); buffer-pool
+//! eviction is bounded and never waits on a pinned frame. Cycles therefore can
+//! only form among record locks, where the wait-for graph detects them. Keep new
+//! code within this order.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -536,6 +555,65 @@ mod tests {
         let reader = env.txns.begin(TxnMode::ReadOnly);
         let visible_rows = env.store.scan(&reader, HEAP).unwrap();
         assert_eq!(visible_rows.len(), 45, "50 inserted - 5 deleted");
+        reader.commit().unwrap();
+    }
+
+    #[test]
+    fn concurrent_inserts_to_one_heap_are_safe() {
+        use std::thread;
+
+        let tmp = TempDir::new("store-concurrent").unwrap();
+        let disk = Arc::new(DiskManager::open(&tmp.path().join("heap.db"), true).unwrap());
+        let wal = Arc::new(
+            Wal::open(
+                &tmp.path().join("wal"),
+                WalConfig {
+                    segment_size: 1 << 20,
+                    sync_mode: SyncMode::None,
+                },
+            )
+            .unwrap(),
+        );
+        // A modest pool so inserts and scans churn frames (eviction) under load.
+        let buffer =
+            Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 32 }).unwrap());
+        let txns = Arc::new(TxnManager::new(wal.clone()));
+        let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
+
+        const THREADS: usize = 8;
+        const PER: usize = 60;
+
+        // Many threads insert into the SAME heap concurrently, interleaved with
+        // scans — the path that serializes on the `heaps` mutex while taking page
+        // latches and appending to the WAL. It must finish (no deadlock) and lose
+        // nothing. A regression guard for the store's locking discipline.
+        thread::scope(|scope| {
+            for t in 0..THREADS {
+                let store = store.clone();
+                let txns = txns.clone();
+                scope.spawn(move || {
+                    for i in 0..PER {
+                        let w = txns.begin(TxnMode::ReadWrite);
+                        let payload = format!("t{t}-r{i}").into_bytes();
+                        store.insert(&w, HEAP, &payload).unwrap();
+                        w.commit().unwrap();
+                        if i % 12 == 0 {
+                            let r = txns.begin(TxnMode::ReadOnly);
+                            store.scan(&r, HEAP).unwrap();
+                            r.commit().unwrap();
+                        }
+                    }
+                });
+            }
+        });
+
+        let reader = txns.begin(TxnMode::ReadOnly);
+        let rows = store.scan(&reader, HEAP).unwrap();
+        assert_eq!(
+            rows.len(),
+            THREADS * PER,
+            "every committed insert is present"
+        );
         reader.commit().unwrap();
     }
 }
