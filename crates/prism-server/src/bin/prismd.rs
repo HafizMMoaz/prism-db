@@ -1,9 +1,90 @@
 //! `prismd` — the Prism server binary.
 //!
-//! Subcommands (planned): `init` to create a database, `run` to serve it.
+//! Usage:
+//! - `prismd init <dir>` — create a database directory.
+//! - `prismd run <dir> [bind_addr]` — open a database and serve it over TCP
+//!   (default bind `0.0.0.0:4444`).
+//!
 //! See `docs/operations/build-and-dev.md`.
 
-fn main() {
-    eprintln!("prismd: not yet implemented (Phase 4 / M4).");
-    std::process::exit(1);
+use std::path::Path;
+use std::process::ExitCode;
+use std::sync::Arc;
+
+use prism_protocol::DEFAULT_PORT;
+use prism_server::{Database, Server};
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(String::as_str) {
+        Some("init") => match args.get(2) {
+            Some(dir) => init(dir),
+            None => usage(),
+        },
+        Some("run") => match args.get(2) {
+            Some(dir) => {
+                let bind = args
+                    .get(3)
+                    .cloned()
+                    .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
+                run(dir, &bind).await
+            }
+            None => usage(),
+        },
+        _ => usage(),
+    }
+}
+
+fn init(dir: &str) -> ExitCode {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("prismd: cannot create {dir}: {e}");
+        return ExitCode::FAILURE;
+    }
+    match Database::open(Path::new(dir)) {
+        Ok(_) => {
+            eprintln!("prismd: initialized database at {dir}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("prismd: init failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(dir: &str, bind: &str) -> ExitCode {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("prismd: cannot create {dir}: {e}");
+        return ExitCode::FAILURE;
+    }
+    let db = match Database::open(Path::new(dir)) {
+        Ok(db) => Arc::new(db),
+        Err(e) => {
+            eprintln!("prismd: open {dir} failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let server = match Server::bind(db, bind).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("prismd: bind {bind} failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let addr = server
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| bind.to_string());
+    eprintln!("prismd: listening on {addr}");
+    if let Err(e) = server.run().await {
+        eprintln!("prismd: server error: {e}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+fn usage() -> ExitCode {
+    eprintln!("usage: prismd <init|run> <dir> [bind_addr]");
+    ExitCode::FAILURE
 }

@@ -292,6 +292,22 @@ impl Session {
     }
 }
 
+impl Drop for Session {
+    /// A session that goes away with an explicit transaction still open aborts
+    /// it — so a dropped connection never leaves a transaction holding locks.
+    fn drop(&mut self) {
+        if let SessionTxn::Explicit {
+            txn_id,
+            mode,
+            last_lsn,
+            ..
+        } = &self.txn
+        {
+            let _ = self.db.txns().abort_txn(*txn_id, *mode, *last_lsn);
+        }
+    }
+}
+
 // ---- request dispatch helpers ------------------------------------------------
 
 /// What an executed document op produced.

@@ -340,6 +340,25 @@ fn errors_are_reported_with_a_trailer() {
 }
 
 #[test]
+fn dropping_a_session_aborts_its_open_transaction() {
+    let (db, _tmp) = database();
+    {
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE t (id BIGINT NOT NULL)"));
+        s.handle(Message::Begin {
+            mode: TxnMode::ReadWrite,
+        });
+        sql_affected(s.handle(sql("INSERT INTO t VALUES (1)")));
+        // `s` is dropped here with the transaction still open.
+    }
+    let mut reader = Session::new(db);
+    assert!(
+        sql_select(reader.handle(sql("SELECT id FROM t"))).is_empty(),
+        "the dropped session's open transaction was rolled back"
+    );
+}
+
+#[test]
 fn cannot_begin_twice_or_commit_without_a_transaction() {
     let (db, _tmp) = database();
     let mut s = Session::new(db);

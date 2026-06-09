@@ -10,16 +10,19 @@
 //! transaction spans SQL, document, and KV atomically. See
 //! `docs/components/network-server.md`.
 //!
-//! **Status (Phase 4 / M4, in progress):** the synchronous, in-process
-//! dispatcher — the embedded API, and the core the network layer will wrap. The
-//! Tokio TCP listener, TLS, authentication, idempotency, and cancellation are a
-//! follow-up increment; see [`Session`] for the per-request simplifications in
-//! this slice.
+//! **Status (Phase 4 / M4, in progress):** the in-process dispatcher
+//! ([`Session`], the embedded API) plus the Tokio TCP front-end ([`Server`])
+//! that wraps it — a client can now talk to PrismDB over a socket. TLS,
+//! authentication, idempotency, cancellation, and connection/transaction limits
+//! are a follow-up; see [`Session`] for the per-request simplifications and
+//! [`server`] for the deferred network features.
 
 pub mod database;
 pub mod error;
+pub mod server;
 pub mod session;
 
 pub use database::{Config, Database};
 pub use error::{Result, ServerError};
+pub use server::Server;
 pub use session::Session;
