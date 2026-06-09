@@ -1,12 +1,16 @@
-//! The control-plane messages and the packet (header + body) codec.
+//! The protocol messages and the packet (header + body) codec.
 //!
-//! This slice covers the session and transaction control plane from
-//! `docs/specs/wire-protocol.md`: the handshake (`Hello`/`Auth` and their acks),
-//! transaction control (`Begin`/`Commit`/`Abort`/`TxnAck`), cancellation,
-//! notices, and keep-alive (`Ping`/`Pong`). The query data plane
-//! (`SqlExecute`/`DocOp`/`KvOp` and their results) is a follow-up increment.
+//! Covers the full message set from `docs/specs/wire-protocol.md`: the session
+//! and transaction control plane — the handshake (`Hello`/`Auth` and their
+//! acks), transaction control (`Begin`/`Commit`/`Abort`/`TxnAck`), cancellation,
+//! notices, keep-alive (`Ping`/`Pong`) — and the query data plane
+//! (`SqlExecute`/`SqlResult`, `DocOp`/`DocResult`, `KvOp`/`KvResult`), whose
+//! op-specific bodies and value types live in [`crate::data`].
 
 use crate::codec::{Reader, Writer};
+use crate::data::{
+    ColumnDesc, DocCommand, KvCommand, KvResultBody, Row, Value, decode_rows, encode_rows,
+};
 use crate::error::{ProtocolError, Result};
 use crate::frame;
 
@@ -35,6 +39,18 @@ pub enum MessageType {
     Abort = 0x12,
     /// Server → client: transaction control acknowledgement.
     TxnAck = 0x13,
+    /// Client → server: execute a SQL statement.
+    SqlExecute = 0x20,
+    /// Server → client: SQL result set (possibly streamed).
+    SqlResult = 0x21,
+    /// Client → server: a document operation.
+    DocOp = 0x30,
+    /// Server → client: document operation result.
+    DocResult = 0x31,
+    /// Client → server: a KV operation.
+    KvOp = 0x40,
+    /// Server → client: KV operation result.
+    KvResult = 0x41,
     /// Client → server: cancel an in-flight request.
     Cancel = 0x50,
     /// Server → client: an unsolicited connection-level event.
@@ -57,6 +73,12 @@ impl TryFrom<u8> for MessageType {
             0x11 => MessageType::Commit,
             0x12 => MessageType::Abort,
             0x13 => MessageType::TxnAck,
+            0x20 => MessageType::SqlExecute,
+            0x21 => MessageType::SqlResult,
+            0x30 => MessageType::DocOp,
+            0x31 => MessageType::DocResult,
+            0x40 => MessageType::KvOp,
+            0x41 => MessageType::KvResult,
             0x50 => MessageType::Cancel,
             0x60 => MessageType::Notice,
             0x70 => MessageType::Ping,
@@ -221,8 +243,9 @@ fn get_trailer(r: &mut Reader, status: u8) -> Result<Option<ErrorInfo>> {
     }
 }
 
-/// A decoded protocol message body (the control plane).
-#[derive(Clone, PartialEq, Eq, Debug)]
+/// A decoded protocol message body. (`Eq` is not derived: `SqlExecute` and
+/// `SqlResult` carry [`Value`]s, which include an `f64`.)
+#[derive(Clone, PartialEq, Debug)]
 pub enum Message {
     /// `Hello` (0x01).
     Hello {
@@ -289,6 +312,68 @@ pub enum Message {
         /// Present iff `status != 0`.
         error: Option<ErrorInfo>,
     },
+    /// `SqlExecute` (0x20).
+    SqlExecute {
+        /// The SQL text.
+        sql: String,
+        /// Bound parameters, in order.
+        params: Vec<Value>,
+        /// Options bitmask (bit 0 = return rows).
+        options: u32,
+    },
+    /// `SqlResult` (0x21).
+    SqlResult {
+        /// 0 = OK.
+        status: u8,
+        /// Affected rows for INSERT/UPDATE/DELETE; 0 for SELECT.
+        affected_rows: u64,
+        /// Output column descriptors.
+        columns: Vec<ColumnDesc>,
+        /// Result rows in this frame, each aligned with `columns`.
+        rows: Vec<Row>,
+        /// Whether more `SqlResult` frames follow for this request.
+        more_frames: bool,
+        /// Present iff `status != 0`.
+        error: Option<ErrorInfo>,
+    },
+    /// `DocOp` (0x30).
+    DocOp {
+        /// The target collection.
+        collection: String,
+        /// The op-specific command.
+        command: DocCommand,
+    },
+    /// `DocResult` (0x31).
+    DocResult {
+        /// 0 = OK.
+        status: u8,
+        /// Documents affected (matched/modified/deleted), or inserted count.
+        affected: u64,
+        /// The `_id`s assigned by inserts.
+        inserted_ids: Vec<[u8; 12]>,
+        /// Returned documents in this frame (opaque tagged-binary bytes).
+        docs: Vec<Vec<u8>>,
+        /// Whether more `DocResult` frames follow for this request.
+        more_frames: bool,
+        /// Present iff `status != 0`.
+        error: Option<ErrorInfo>,
+    },
+    /// `KvOp` (0x40).
+    KvOp {
+        /// The target namespace.
+        namespace: String,
+        /// The op-specific command.
+        command: KvCommand,
+    },
+    /// `KvResult` (0x41).
+    KvResult {
+        /// 0 = OK.
+        status: u8,
+        /// The op-specific result body (echoes the op type).
+        body: KvResultBody,
+        /// Present iff `status != 0`.
+        error: Option<ErrorInfo>,
+    },
     /// `Cancel` (0x50).
     Cancel {
         /// The `request_id` of the in-flight request to abort.
@@ -321,6 +406,12 @@ impl Message {
             Message::Commit { .. } => MessageType::Commit,
             Message::Abort => MessageType::Abort,
             Message::TxnAck { .. } => MessageType::TxnAck,
+            Message::SqlExecute { .. } => MessageType::SqlExecute,
+            Message::SqlResult { .. } => MessageType::SqlResult,
+            Message::DocOp { .. } => MessageType::DocOp,
+            Message::DocResult { .. } => MessageType::DocResult,
+            Message::KvOp { .. } => MessageType::KvOp,
+            Message::KvResult { .. } => MessageType::KvResult,
             Message::Cancel { .. } => MessageType::Cancel,
             Message::Notice { .. } => MessageType::Notice,
             Message::Ping => MessageType::Ping,
@@ -386,6 +477,114 @@ impl Message {
                 w.put_u8(*status);
                 w.put_u64(*txn_id);
                 w.put_u64(*commit_lsn);
+                put_trailer(w, *status, error)?;
+            }
+            Message::SqlExecute {
+                sql,
+                params,
+                options,
+            } => {
+                w.put_str_u32("sql.sql", sql)?;
+                let count: u16 =
+                    params
+                        .len()
+                        .try_into()
+                        .map_err(|_| ProtocolError::ValueTooLarge {
+                            field: "sql.param_count",
+                        })?;
+                w.put_u16(count);
+                for p in params {
+                    p.encode_tagged(w)?;
+                }
+                w.put_u32(*options);
+            }
+            Message::SqlResult {
+                status,
+                affected_rows,
+                columns,
+                rows,
+                more_frames,
+                error,
+            } => {
+                w.put_u8(*status);
+                w.put_u64(*affected_rows);
+                let col_count: u16 =
+                    columns
+                        .len()
+                        .try_into()
+                        .map_err(|_| ProtocolError::ValueTooLarge {
+                            field: "sql.column_count",
+                        })?;
+                w.put_u16(col_count);
+                for c in columns {
+                    c.encode(w)?;
+                }
+                let row_count: u32 =
+                    rows.len()
+                        .try_into()
+                        .map_err(|_| ProtocolError::ValueTooLarge {
+                            field: "sql.row_count",
+                        })?;
+                w.put_u32(row_count);
+                encode_rows(columns, rows, w)?;
+                w.put_u8(u8::from(*more_frames));
+                put_trailer(w, *status, error)?;
+            }
+            Message::DocOp {
+                collection,
+                command,
+            } => {
+                w.put_u8(command.op_type());
+                w.put_str_u16("doc.collection", collection)?;
+                command.encode_body(w)?;
+            }
+            Message::DocResult {
+                status,
+                affected,
+                inserted_ids,
+                docs,
+                more_frames,
+                error,
+            } => {
+                w.put_u8(*status);
+                w.put_u64(*affected);
+                let id_count: u32 =
+                    inserted_ids
+                        .len()
+                        .try_into()
+                        .map_err(|_| ProtocolError::ValueTooLarge {
+                            field: "doc.inserted_count",
+                        })?;
+                w.put_u32(id_count);
+                for id in inserted_ids {
+                    w.put_raw(id);
+                }
+                let doc_count: u32 =
+                    docs.len()
+                        .try_into()
+                        .map_err(|_| ProtocolError::ValueTooLarge {
+                            field: "doc.doc_count",
+                        })?;
+                w.put_u32(doc_count);
+                for d in docs {
+                    w.put_bytes_u32("doc.result_doc", d)?;
+                }
+                w.put_u8(u8::from(*more_frames));
+                put_trailer(w, *status, error)?;
+            }
+            Message::KvOp { namespace, command } => {
+                w.put_u8(command.op_type());
+                w.put_str_u16("kv.namespace", namespace)?;
+                command.encode_body(w)?;
+            }
+            Message::KvResult {
+                status,
+                body,
+                error,
+            } => {
+                w.put_u8(*status);
+                w.put_u8(body.op_type());
+                body.encode_body(w)?;
                 put_trailer(w, *status, error)?;
             }
             Message::Cancel { target_request_id } => w.put_u32(*target_request_id),
@@ -465,6 +664,88 @@ impl Message {
                     error: get_trailer(r, status)?,
                 }
             }
+            MessageType::SqlExecute => {
+                let sql = r.get_str_u32("sql.sql")?;
+                let param_count = r.get_u16("sql.param_count")? as usize;
+                let mut params = Vec::with_capacity(param_count);
+                for _ in 0..param_count {
+                    params.push(Value::decode_tagged(r)?);
+                }
+                Message::SqlExecute {
+                    sql,
+                    params,
+                    options: r.get_u32("sql.options")?,
+                }
+            }
+            MessageType::SqlResult => {
+                let status = r.get_u8("sql.status")?;
+                let affected_rows = r.get_u64("sql.affected_rows")?;
+                let col_count = r.get_u16("sql.column_count")? as usize;
+                let mut columns = Vec::with_capacity(col_count);
+                for _ in 0..col_count {
+                    columns.push(ColumnDesc::decode(r)?);
+                }
+                let row_count = r.get_u32("sql.row_count")? as usize;
+                let rows = decode_rows(&columns, row_count, r)?;
+                let more_frames = r.get_u8("sql.more_frames")? != 0;
+                Message::SqlResult {
+                    status,
+                    affected_rows,
+                    columns,
+                    rows,
+                    more_frames,
+                    error: get_trailer(r, status)?,
+                }
+            }
+            MessageType::DocOp => {
+                let op_type = r.get_u8("doc.op_type")?;
+                let collection = r.get_str_u16("doc.collection")?;
+                Message::DocOp {
+                    collection,
+                    command: DocCommand::decode_body(op_type, r)?,
+                }
+            }
+            MessageType::DocResult => {
+                let status = r.get_u8("doc.status")?;
+                let affected = r.get_u64("doc.affected")?;
+                let id_count = r.get_u32("doc.inserted_count")? as usize;
+                let mut inserted_ids = Vec::with_capacity(id_count);
+                for _ in 0..id_count {
+                    inserted_ids.push(r.get_array::<12>("doc.inserted_id")?);
+                }
+                let doc_count = r.get_u32("doc.doc_count")? as usize;
+                let mut docs = Vec::with_capacity(doc_count);
+                for _ in 0..doc_count {
+                    docs.push(r.get_bytes_u32("doc.result_doc")?.to_vec());
+                }
+                let more_frames = r.get_u8("doc.more_frames")? != 0;
+                Message::DocResult {
+                    status,
+                    affected,
+                    inserted_ids,
+                    docs,
+                    more_frames,
+                    error: get_trailer(r, status)?,
+                }
+            }
+            MessageType::KvOp => {
+                let op_type = r.get_u8("kv.op_type")?;
+                let namespace = r.get_str_u16("kv.namespace")?;
+                Message::KvOp {
+                    namespace,
+                    command: KvCommand::decode_body(op_type, r)?,
+                }
+            }
+            MessageType::KvResult => {
+                let status = r.get_u8("kv.status")?;
+                let op_type = r.get_u8("kv.op_type")?;
+                let body = KvResultBody::decode_body(op_type, r)?;
+                Message::KvResult {
+                    status,
+                    body,
+                    error: get_trailer(r, status)?,
+                }
+            }
             MessageType::Cancel => Message::Cancel {
                 target_request_id: r.get_u32("cancel.target_request_id")?,
             },
@@ -482,7 +763,7 @@ impl Message {
 /// A full protocol packet: a `request_id` plus a [`Message`]. This is the unit
 /// the spec calls a "payload" — the 12-byte common header followed by the
 /// message-specific body. Frame it with [`frame::encode`] to put it on the wire.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Packet {
     /// Client-assigned on client→server frames; echoed on the reply. 0 for
     /// server-initiated frames such as `Notice`.

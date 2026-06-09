@@ -23,6 +23,16 @@ pub enum ProtocolError {
     },
     /// The message-type byte in the header is not one we know.
     UnknownMessageType(u8),
+    /// A value type tag is not one this protocol version encodes on the wire
+    /// (e.g. nested Array/Object, which travel inside opaque document bytes).
+    UnknownValueType(u8),
+    /// An op-type byte (document or KV op) is out of range.
+    UnknownOpType {
+        /// Which op family the byte belonged to.
+        family: &'static str,
+        /// The offending value.
+        value: u8,
+    },
     /// An enum-like discriminant byte was out of range.
     BadEnum {
         /// The field that held the bad discriminant.
@@ -55,6 +65,10 @@ impl fmt::Display for ProtocolError {
             }
             ProtocolError::BadUtf8 { field } => write!(f, "invalid UTF-8 in field {field}"),
             ProtocolError::UnknownMessageType(t) => write!(f, "unknown message type 0x{t:02x}"),
+            ProtocolError::UnknownValueType(t) => write!(f, "unknown value type tag 0x{t:02x}"),
+            ProtocolError::UnknownOpType { family, value } => {
+                write!(f, "unknown {family} op type {value}")
+            }
             ProtocolError::BadEnum { field, value } => {
                 write!(f, "invalid value {value} for field {field}")
             }

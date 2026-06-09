@@ -88,6 +88,11 @@ impl Writer {
         self.put_bytes_u16(field, s.as_bytes())
     }
 
+    /// Append a `u32`-length-prefixed UTF-8 string.
+    pub fn put_str_u32(&mut self, field: &'static str, s: &str) -> Result<()> {
+        self.put_bytes_u32(field, s.as_bytes())
+    }
+
     /// Consume the writer, returning the encoded bytes.
     pub fn into_vec(self) -> Vec<u8> {
         self.buf
@@ -191,6 +196,14 @@ impl<'a> Reader<'a> {
     /// Read a `u16`-length-prefixed UTF-8 string.
     pub fn get_str_u16(&mut self, field: &'static str) -> Result<String> {
         let bytes = self.get_bytes_u16(field)?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| ProtocolError::BadUtf8 { field })
+    }
+
+    /// Read a `u32`-length-prefixed UTF-8 string.
+    pub fn get_str_u32(&mut self, field: &'static str) -> Result<String> {
+        let bytes = self.get_bytes_u32(field)?;
         std::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_| ProtocolError::BadUtf8 { field })
