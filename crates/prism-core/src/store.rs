@@ -75,6 +75,16 @@ impl RecordStore {
         }
     }
 
+    /// The shared buffer pool (so engines can build indexes over the same pages).
+    pub fn buffer(&self) -> Arc<BufferPool> {
+        self.buffer.clone()
+    }
+
+    /// The shared write-ahead log (so indexes can log their page mutations).
+    pub fn wal(&self) -> Arc<Wal> {
+        self.wal.clone()
+    }
+
     /// Seed the heap directory from a recovery pass (the `heap -> pages` map
     /// rebuilt from the WAL's `HeapPage` records), so heaps and `scan` work after
     /// restart. Each heap's pages are given in allocation order.

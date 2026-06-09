@@ -12,6 +12,10 @@ pub enum IndexError {
     #[error("buffer error: {0}")]
     Buffer(#[from] prism_buffer::BufferError),
 
+    /// An error appending to the write-ahead log.
+    #[error("WAL error: {0}")]
+    Wal(#[from] prism_wal::WalError),
+
     /// An index page failed to decode (corruption or version mismatch).
     #[error("index page corrupt: {0}")]
     Corrupt(String),

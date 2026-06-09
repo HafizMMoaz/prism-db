@@ -9,11 +9,11 @@ repository.workspace = true
 
 [dependencies]
 prism-storage = { workspace = true }
+prism-wal = { workspace = true }
 prism-buffer = { workspace = true }
 prism-core = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-prism-wal = { workspace = true }
 prism-testkit = { workspace = true }
 proptest = { workspace = true }

@@ -27,7 +27,7 @@ use prism_core::txn::{TxnHandle, TxnManager, TxnMode};
 use prism_doc::{DocCollection, DocValue, Document, Filter};
 use prism_kv::KvNamespace;
 use prism_sql::{Outcome, SqlEngine, Value};
-use prism_storage::DiskManager;
+use prism_storage::{DiskManager, PageId};
 use prism_testkit::TempDir;
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
@@ -50,6 +50,7 @@ fn open_models(
     tmp: &TempDir,
     create: bool,
     recovered: Option<&prism_core::RecoveryReport>,
+    kv_root: Option<PageId>,
 ) -> Models {
     let disk = Arc::new(DiskManager::open(&tmp.path().join("heap.db"), create).unwrap());
     let wal = Arc::new(
@@ -77,10 +78,14 @@ fn open_models(
     if let Some(r) = recovered {
         store.seed_heap_directory(&r.heaps);
     }
+    let kv = match kv_root {
+        Some(root) => KvNamespace::open(store.clone(), KV_HEAP, root),
+        None => KvNamespace::create(store.clone(), KV_HEAP).unwrap(),
+    };
     Models {
         sql: SqlEngine::new(store.clone(), txns.clone()),
-        docs: DocCollection::new(store.clone(), DOC_HEAP),
-        kv: KvNamespace::new(store, KV_HEAP),
+        docs: DocCollection::new(store, DOC_HEAP),
+        kv,
         txns,
     }
 }
@@ -133,7 +138,7 @@ fn doc_accts(m: &Models, reader: &TxnHandle, tag: &str) -> Vec<i64> {
 #[test]
 fn commit_is_atomic_across_all_three_models() {
     let tmp = TempDir::new("xmodel-commit").unwrap();
-    let m = open_models(&tmp, true, None);
+    let m = open_models(&tmp, true, None, None);
     m.sql
         .execute_autocommit("CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT)")
         .unwrap();
@@ -184,8 +189,8 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
     let tmp = TempDir::new("xmodel-crash").unwrap();
 
     // ---- Session 1: a committed cross-model txn, a loser, then a crash. ----
-    {
-        let m = open_models(&tmp, true, None);
+    let kv_root = {
+        let m = open_models(&tmp, true, None, None);
         m.sql
             .execute_autocommit("CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT)")
             .unwrap();
@@ -213,8 +218,10 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
         // best-effort abort, but it is never flushed — so the durable WAL ends
         // at T3's commit, with T2's data records present but T2 uncommitted: a
         // genuine mid-flight loser for recovery to neutralize.
+        let kv_root = m.kv.index_root();
         let _ = &t2;
-    }
+        kv_root
+    };
 
     // ---- Recover the heap from the WAL. ----
     let report = {
@@ -233,15 +240,15 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
     };
 
     // ---- Session 2: reopen seeded from recovery; verify every model. ----
-    let m = open_models(&tmp, false, Some(&report));
+    let m = open_models(&tmp, false, Some(&report), Some(kv_root));
     // Re-create the catalog so SELECT can find the table. The first table is
     // assigned heap 1000 again, matching the heap recovery rebuilt.
     m.sql
         .execute_autocommit("CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT)")
         .unwrap();
 
+    // The KV index tree reopens at its persisted root (no rescan needed).
     let reader = m.txns.begin(TxnMode::ReadOnly);
-    m.kv.rebuild_index(&reader).unwrap();
 
     // The committed cross-model transaction survived — in full, in every model.
     assert_eq!(

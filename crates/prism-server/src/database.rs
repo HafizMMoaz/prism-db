@@ -25,7 +25,7 @@ use prism_core::txn::{TxnManager, TxnMode};
 use prism_doc::DocCollection;
 use prism_kv::KvNamespace;
 use prism_sql::SqlEngine;
-use prism_storage::DiskManager;
+use prism_storage::{DiskManager, PageId};
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
 use crate::auth::UserStore;
@@ -195,8 +195,16 @@ impl Database {
             return Ok(ns.clone());
         }
         let heap = HeapId(self.kv_next.fetch_add(1, Ordering::Relaxed));
-        self.persist(ObjectKind::Namespace, name, heap)?;
-        let ns = Arc::new(KvNamespace::new(self.store.clone(), heap));
+        // Create the durable index tree first, then record its root so the
+        // namespace reopens without a rescan after restart.
+        let ns = Arc::new(KvNamespace::create(self.store.clone(), heap)?);
+        self.persist_entry(&CatalogEntry {
+            kind: ObjectKind::Namespace,
+            name: name.to_string(),
+            heap: heap.0,
+            root_page: ns.index_root().as_u64(),
+            columns: vec![],
+        })?;
         map.insert(name.to_string(), ns.clone());
         Ok(ns)
     }
@@ -216,6 +224,7 @@ impl Database {
                 kind: ObjectKind::Table,
                 name: table.name.clone(),
                 heap: table.heap.0,
+                root_page: 0,
                 columns: table.columns.clone(),
             };
             self.persist_entry(&entry)?;
@@ -224,12 +233,13 @@ impl Database {
         Ok(())
     }
 
-    /// Write a (non-table) catalog entry.
+    /// Write a (non-table, non-namespace) catalog entry.
     fn persist(&self, kind: ObjectKind, name: &str, heap: HeapId) -> Result<()> {
         self.persist_entry(&CatalogEntry {
             kind,
             name: name.to_string(),
             heap: heap.0,
+            root_page: 0,
             columns: vec![],
         })
     }
@@ -284,8 +294,9 @@ impl Database {
                     next_doc = next_doc.max(entry.heap + 1);
                 }
                 ObjectKind::Namespace => {
-                    let ns = KvNamespace::new(self.store.clone(), heap);
-                    ns.rebuild_index(&reader)?;
+                    // Reopen the durable index tree at its persisted root — no
+                    // rescan to rebuild an in-memory map.
+                    let ns = KvNamespace::open(self.store.clone(), heap, PageId(entry.root_page));
                     kv_namespaces.insert(entry.name, Arc::new(ns));
                     next_kv = next_kv.max(entry.heap + 1);
                 }

@@ -1,28 +1,30 @@
 //! `prism-kv` — the key-value engine.
 //!
-//! Byte-string keys mapped to byte-string values, organized into namespaces.
-//! The simplest of the three access methods; per the roadmap it ships first as a
-//! smoke test of the unified record store. A namespace is just a heap of records
-//! whose payload is `(key_len, key, value)` ([`docs/specs/record-format.md`]),
-//! with an index mapping `key -> RecordId`. Get/put/delete go through the record
-//! store, so MVCC visibility, write locks, and cross-model transactions all
-//! apply for free. See `docs/components/kv-engine.md`.
+//! Byte-string keys mapped to byte-string values, organized into namespaces. A
+//! namespace is a heap of records whose payload is `(key_len, key, value)`
+//! ([`docs/specs/record-format.md`]) plus a persistent `key -> RecordId` index.
+//! Get/put/delete go through the record store, so MVCC visibility, write locks,
+//! and cross-model transactions all apply for free. See
+//! `docs/components/kv-engine.md`.
 //!
-//! **Scope (this increment):** a hash-style namespace with point operations.
-//! The key→RID index is an in-memory `HashMap` — a placeholder for the
-//! persistent extendible-hash index (`prism-index`, a later increment). As a
-//! consequence, the index is not yet durable across restart (same class of
-//! deferral as the catalog), and concurrent writes to the *same* key in one
-//! namespace are not yet safe; distinct keys and single-writer-per-key are.
-//! Range/scan are btree-namespace features and arrive with `prism-index`.
+//! The index is a WAL-logged [`prism_index::BTree`], so it is durable: after a
+//! restart the namespace reopens at its (fixed) root page — no scan to rebuild an
+//! in-memory map. The namespace's heap and its index root are recorded by the
+//! catalog so both are found again on open.
+//!
+//! **Scope (this increment):** point operations. Concurrent writes to the *same*
+//! key in one namespace are not yet safe (lookup and index update are separate
+//! steps); distinct keys and single-writer-per-key are. Range/scan over the
+//! ordered index is a follow-up.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use prism_core::RecordId;
 use prism_core::error::CoreError;
 use prism_core::store::{HeapId, RecordStore};
 use prism_core::txn::TxnHandle;
+use prism_index::BTree;
+use prism_storage::PageId;
 use thiserror::Error;
 
 /// Maximum key length, in bytes.
@@ -34,6 +36,10 @@ pub enum KvError {
     /// An error from the transactional core (MVCC, locks, storage).
     #[error(transparent)]
     Core(#[from] CoreError),
+
+    /// An error from the index (B+tree page I/O, WAL).
+    #[error(transparent)]
+    Index(#[from] prism_index::IndexError),
 
     /// The key exceeds [`MAX_KEY_SIZE`].
     #[error("key too large: {size} bytes (max {MAX_KEY_SIZE})")]
@@ -68,50 +74,40 @@ fn decode_value(payload: &[u8]) -> &[u8] {
     payload.get(2 + key_len..).unwrap_or(&[])
 }
 
-/// Extract the key bytes from a KV payload.
-fn decode_key(payload: &[u8]) -> &[u8] {
-    if payload.len() < 2 {
-        return &[];
-    }
-    let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    payload.get(2..2 + key_len).unwrap_or(&[])
-}
-
-/// A hash-indexed key-value namespace: a heap of records plus a key→RID index.
+/// A key-value namespace: a heap of records plus a durable key→RID B+tree index.
 pub struct KvNamespace {
     store: Arc<RecordStore>,
     heap: HeapId,
-    index: Mutex<HashMap<Vec<u8>, RecordId>>,
+    index: BTree,
 }
 
 impl KvNamespace {
-    /// Create a namespace backed by `heap` in `store`.
-    pub fn new(store: Arc<RecordStore>, heap: HeapId) -> Self {
-        Self {
-            store,
-            heap,
-            index: Mutex::new(HashMap::new()),
-        }
+    /// Create a new namespace backed by `heap`, allocating a fresh index tree.
+    /// The caller persists [`KvNamespace::index_root`] so the tree can be
+    /// reopened after restart.
+    pub fn create(store: Arc<RecordStore>, heap: HeapId) -> Result<Self> {
+        let index = BTree::create(store.buffer(), store.wal())?;
+        Ok(Self { store, heap, index })
     }
 
-    fn lookup(&self, key: &[u8]) -> Option<RecordId> {
-        self.index
-            .lock()
-            .expect("kv index poisoned")
-            .get(key)
-            .copied()
+    /// Reopen an existing namespace whose index tree is rooted at `index_root`.
+    pub fn open(store: Arc<RecordStore>, heap: HeapId, index_root: PageId) -> Self {
+        let index = BTree::open(store.buffer(), store.wal(), index_root, usize::MAX);
+        Self { store, heap, index }
     }
 
-    fn set_index(&self, key: &[u8], rid: RecordId) {
-        self.index
-            .lock()
-            .expect("kv index poisoned")
-            .insert(key.to_vec(), rid);
+    /// The index tree's (fixed) root page, for the catalog to persist.
+    pub fn index_root(&self) -> PageId {
+        self.index.root_page()
+    }
+
+    fn lookup(&self, key: &[u8]) -> Result<Option<RecordId>> {
+        Ok(self.index.search(key)?)
     }
 
     /// The value for `key` visible to `txn`, or `None` if absent/invisible.
     pub fn get(&self, txn: &TxnHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let Some(rid) = self.lookup(key) else {
+        let Some(rid) = self.lookup(key)? else {
             return Ok(None);
         };
         Ok(self
@@ -131,13 +127,13 @@ impl KvNamespace {
             return Err(KvError::KeyTooLarge { size: key.len() });
         }
         let payload = encode(key, value);
-        let new_rid = match self.lookup(key) {
+        let new_rid = match self.lookup(key)? {
             Some(rid) if self.store.read(txn, rid)?.is_some() => {
                 self.store.update(txn, rid, &payload)?
             }
             _ => self.store.insert(txn, self.heap, &payload)?,
         };
-        self.set_index(key, new_rid);
+        self.index.insert(key, new_rid)?;
         Ok(())
     }
 
@@ -147,7 +143,7 @@ impl KvNamespace {
     /// snapshots still see the pre-delete version (the deleting transaction's
     /// `xmax` is invisible to them), and a later `put` re-inserts.
     pub fn delete(&self, txn: &TxnHandle, key: &[u8]) -> Result<bool> {
-        let Some(rid) = self.lookup(key) else {
+        let Some(rid) = self.lookup(key)? else {
             return Ok(false);
         };
         if self.store.read(txn, rid)?.is_none() {
@@ -164,20 +160,6 @@ impl KvNamespace {
         }
         self.put(txn, key, value)?;
         Ok(true)
-    }
-
-    /// Rebuild the in-memory key→RID index by scanning the namespace's heap
-    /// for the versions visible to `txn`. Call after recovery (with a fresh
-    /// read-only transaction) to restore lookups for data that survived a
-    /// restart — the placeholder until the persistent hash index lands.
-    pub fn rebuild_index(&self, txn: &TxnHandle) -> Result<()> {
-        let rows = self.store.scan(txn, self.heap)?;
-        let mut index = self.index.lock().expect("kv index poisoned");
-        index.clear();
-        for (rid, payload) in rows {
-            index.insert(decode_key(&payload).to_vec(), rid);
-        }
-        Ok(())
     }
 
     /// Set `key` to `new` only if its current visible value equals `expected`.
@@ -232,7 +214,7 @@ mod tests {
             );
             let txns = Arc::new(TxnManager::new(wal.clone()));
             let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
-            let ns = KvNamespace::new(store, HeapId(1));
+            let ns = KvNamespace::create(store, HeapId(1)).unwrap();
             Env {
                 ns,
                 txns,
@@ -352,33 +334,28 @@ mod tests {
     }
 
     #[test]
-    fn kv_survives_restart() {
+    fn kv_survives_restart_without_rescan() {
         use prism_core::recover;
         use prism_storage::DiskManager as Disk;
 
         let tmp = TempDir::new("kv-restart").unwrap();
         let heap_path = tmp.path().join("heap.db");
+        let wal_path = tmp.path().join("wal");
         let heap = HeapId(1);
+        let wal_cfg = WalConfig {
+            segment_size: 256 * 1024,
+            sync_mode: SyncMode::None,
+        };
 
-        // Session 1: write some committed data, then crash (drop, no flush).
-        {
+        // Session 1: write committed data, capture the index root, then crash.
+        let root = {
             let disk = Arc::new(Disk::open(&heap_path, true).unwrap());
-            let wal = Arc::new(
-                Wal::open(
-                    &tmp.path().join("wal"),
-                    WalConfig {
-                        segment_size: 256 * 1024,
-                        sync_mode: SyncMode::None,
-                    },
-                )
-                .unwrap(),
-            );
-            let buffer = Arc::new(
-                BufferPool::new(disk.clone(), wal.clone(), BufConfig { frame_count: 8 }).unwrap(),
-            );
+            let wal = Arc::new(Wal::open(&wal_path, wal_cfg).unwrap());
+            let buffer =
+                Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 8 }).unwrap());
             let txns = Arc::new(TxnManager::new(wal.clone()));
-            let store = Arc::new(RecordStore::new(buffer.clone(), wal.clone(), txns.clone()));
-            let ns = KvNamespace::new(store.clone(), heap);
+            let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
+            let ns = KvNamespace::create(store, heap).unwrap();
 
             let t = txns.begin(TxnMode::ReadWrite);
             ns.put(&t, b"k1", b"v1").unwrap();
@@ -386,32 +363,17 @@ mod tests {
             ns.put(&t, b"gone", b"x").unwrap();
             ns.delete(&t, b"gone").unwrap();
             t.commit().unwrap();
+            ns.index_root()
+        };
 
-            drop(ns);
-            drop(store);
-            drop(buffer);
-            drop(txns);
-            drop(disk);
-        }
-
-        // Recover the heap, then reopen seeded from the recovery report.
-        let wal = Arc::new(
-            Wal::open(
-                &tmp.path().join("wal"),
-                WalConfig {
-                    segment_size: 256 * 1024,
-                    sync_mode: SyncMode::None,
-                },
-            )
-            .unwrap(),
-        );
+        // Recover the heap from the WAL (rebuilds both the data and index pages).
+        let wal = Arc::new(Wal::open(&wal_path, wal_cfg).unwrap());
         let report = {
             let disk = Disk::open(&heap_path, false).unwrap();
             let r = recover(&wal, &disk).unwrap();
             disk.close().unwrap();
             r
         };
-
         let disk = Arc::new(Disk::open(&heap_path, false).unwrap());
         let buffer =
             Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 8 }).unwrap());
@@ -424,9 +386,9 @@ mod tests {
         let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
         store.seed_heap_directory(&report.heaps);
 
-        let ns = KvNamespace::new(store, heap);
+        // Reopen at the persisted index root — no rebuild scan.
+        let ns = KvNamespace::open(store, heap, root);
         let reader = txns.begin(TxnMode::ReadOnly);
-        ns.rebuild_index(&reader).unwrap();
         assert_eq!(ns.get(&reader, b"k1").unwrap().as_deref(), Some(&b"v1"[..]));
         assert_eq!(ns.get(&reader, b"k2").unwrap().as_deref(), Some(&b"v2"[..]));
         assert_eq!(

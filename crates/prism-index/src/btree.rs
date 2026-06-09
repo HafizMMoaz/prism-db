@@ -18,6 +18,8 @@ use std::sync::{Arc, Mutex};
 use prism_buffer::{BufferPool, PageWriteGuard};
 use prism_core::RecordId;
 use prism_storage::{PAGE_SIZE, PageId, PageType, checksum};
+use prism_wal::record::RecordPayload;
+use prism_wal::{LogRecord, Wal};
 
 use crate::error::{IndexError, Result};
 
@@ -68,9 +70,19 @@ impl Internal {
 }
 
 /// The ordered index.
+///
+/// The root lives at a **fixed page** for its whole lifetime: a root split moves
+/// the old root's contents to a new page and rewrites the fixed page as the new
+/// parent, so [`BTree::root_page`] never changes. That lets a catalog persist the
+/// root once. Every node write is WAL-logged as a full-page image (redo-only),
+/// so the tree's pages are crash-durable and rebuilt by recovery — no rescan.
 pub struct BTree {
     buffer: Arc<BufferPool>,
-    root: Mutex<PageId>,
+    wal: Arc<Wal>,
+    root: PageId,
+    /// Serializes operations (the single-threaded core; Lehman-Yao latching is a
+    /// later increment).
+    lock: Mutex<()>,
     /// Max keys/entries per node before splitting (besides the byte-size bound).
     order: usize,
 }
@@ -78,44 +90,49 @@ pub struct BTree {
 impl BTree {
     /// Create an empty B+tree (a single empty leaf root), splitting only when a
     /// node fills a page.
-    pub fn create(buffer: Arc<BufferPool>) -> Result<Self> {
-        Self::with_order(buffer, usize::MAX)
+    pub fn create(buffer: Arc<BufferPool>, wal: Arc<Wal>) -> Result<Self> {
+        Self::with_order(buffer, wal, usize::MAX)
     }
 
     /// Create an empty B+tree that also splits once a node exceeds `order`
     /// entries/keys (used by tests to force splits and multi-level trees).
-    pub fn with_order(buffer: Arc<BufferPool>, order: usize) -> Result<Self> {
-        let tree = Self {
+    pub fn with_order(buffer: Arc<BufferPool>, wal: Arc<Wal>, order: usize) -> Result<Self> {
+        // Temporary tree to allocate the root through the normal logged path.
+        let mut tree = Self {
             buffer,
-            root: Mutex::new(PageId(0)),
+            wal,
+            root: PageId(0),
+            lock: Mutex::new(()),
             order: order.max(2),
         };
         let root = tree.alloc_node(&Node::Leaf(Leaf {
             right_sibling: None,
             entries: Vec::new(),
         }))?;
-        *tree.root.lock().expect("btree root poisoned") = root;
+        tree.root = root;
         Ok(tree)
     }
 
-    /// Reopen an existing tree rooted at `root_page`.
-    pub fn open(buffer: Arc<BufferPool>, root_page: PageId, order: usize) -> Self {
+    /// Reopen an existing tree rooted at `root_page` (its fixed root).
+    pub fn open(buffer: Arc<BufferPool>, wal: Arc<Wal>, root_page: PageId, order: usize) -> Self {
         Self {
             buffer,
-            root: Mutex::new(root_page),
+            wal,
+            root: root_page,
+            lock: Mutex::new(()),
             order: order.max(2),
         }
     }
 
-    /// The current root page (for persistence by a future catalog).
+    /// The (fixed) root page, for persistence by the catalog.
     pub fn root_page(&self) -> PageId {
-        *self.root.lock().expect("btree root poisoned")
+        self.root
     }
 
     /// Look up `key`, returning its `RecordId` if present.
     pub fn search(&self, key: &[u8]) -> Result<Option<RecordId>> {
-        let _root = self.root.lock().expect("btree root poisoned");
-        let mut page = *_root;
+        let _guard = self.lock.lock().expect("btree lock poisoned");
+        let mut page = self.root;
         loop {
             match self.read_node(page)? {
                 Node::Internal(n) => page = n.route(key),
@@ -132,20 +149,27 @@ impl BTree {
 
     /// Insert or replace the entry for `key`.
     pub fn insert(&self, key: &[u8], rid: RecordId) -> Result<()> {
-        let mut root = self.root.lock().expect("btree root poisoned");
-        if let Some((pivot, new_right)) = self.insert_into(*root, key, rid)? {
-            let old_root = *root;
-            let level = match self.read_node(old_root)? {
+        let _guard = self.lock.lock().expect("btree lock poisoned");
+        let root = self.root;
+        if let Some((pivot, new_right)) = self.insert_into(root, key, rid)? {
+            // The root split. To keep the root at its fixed page, move the old
+            // root's (now left-half) contents to a fresh page and rewrite the
+            // fixed root page as the new internal parent.
+            let left_node = self.read_node(root)?;
+            let level = match &left_node {
                 Node::Internal(n) => n.level + 1,
                 Node::Leaf(_) => 1,
             };
-            let new_root = self.alloc_node(&Node::Internal(Internal {
-                level,
-                right_sibling: None,
-                keys: vec![pivot],
-                children: vec![old_root, new_right],
-            }))?;
-            *root = new_root;
+            let left_page = self.alloc_node(&left_node)?;
+            self.write_node(
+                root,
+                &Node::Internal(Internal {
+                    level,
+                    right_sibling: None,
+                    keys: vec![pivot],
+                    children: vec![left_page, new_right],
+                }),
+            )?;
         }
         Ok(())
     }
@@ -153,8 +177,8 @@ impl BTree {
     /// Delete `key`. Returns whether an entry was removed. (No leaf merging in
     /// v1; nodes may become sparse but stay correct.)
     pub fn delete(&self, key: &[u8]) -> Result<bool> {
-        let root = self.root.lock().expect("btree root poisoned");
-        let mut page = *root;
+        let _guard = self.lock.lock().expect("btree lock poisoned");
+        let mut page = self.root;
         loop {
             match self.read_node(page)? {
                 Node::Internal(n) => page = n.route(key),
@@ -177,8 +201,8 @@ impl BTree {
 
     /// All `(key, rid)` with `start <= key < end`, in ascending key order.
     pub fn range(&self, start: &[u8], end: &[u8]) -> Result<Vec<(Vec<u8>, RecordId)>> {
-        let root = self.root.lock().expect("btree root poisoned");
-        let mut page = *root;
+        let _guard = self.lock.lock().expect("btree lock poisoned");
+        let mut page = self.root;
         while let Node::Internal(n) = self.read_node(page)? {
             page = n.route(start);
         }
@@ -267,22 +291,40 @@ impl BTree {
 
     fn write_node(&self, page: PageId, node: &Node) -> Result<()> {
         let mut guard = self.buffer.fetch_write(page)?;
-        put_node(&mut guard, node)
+        put_node(&mut guard, node)?;
+        self.log_page(&mut guard, page)
     }
 
     fn alloc_node(&self, node: &Node) -> Result<PageId> {
         let mut guard = self.buffer.new_page()?;
         let page = guard.page_id();
         put_node(&mut guard, node)?;
+        self.log_page(&mut guard, page)?;
         Ok(page)
+    }
+
+    /// WAL-log the (already-written) page as a full-page image and stamp its
+    /// `page_lsn` to that record, so the buffer pool won't flush it before the
+    /// log is durable and recovery can rebuild it (redo-only). The checksum
+    /// covers `[16..]`, so stamping the LSN at `[0..8]` leaves it valid.
+    fn log_page(&self, guard: &mut PageWriteGuard<'_>, page: PageId) -> Result<()> {
+        let image = guard[..].to_vec();
+        let lsn = self
+            .wal
+            .append(LogRecord::system(RecordPayload::FullPageImage {
+                page_id: page,
+                image,
+            }))?;
+        guard.set_page_lsn(lsn);
+        Ok(())
     }
 
     /// Collect every `(key, rid)` in order by walking the leftmost leaf then the
     /// right-sibling chain. Test helper / consistency check.
     #[cfg(test)]
     fn collect_all(&self) -> Result<Vec<(Vec<u8>, RecordId)>> {
-        let root = self.root.lock().expect("btree root poisoned");
-        let mut page = *root;
+        let _guard = self.lock.lock().expect("btree lock poisoned");
+        let mut page = self.root;
         while let Node::Internal(n) = self.read_node(page)? {
             page = n.children[0];
         }
@@ -481,7 +523,7 @@ mod tests {
         RecordId::new(PageId(n), (n % 7) as u16)
     }
 
-    fn buffer() -> (TempDir, Arc<BufferPool>) {
+    fn buffer() -> (TempDir, Arc<BufferPool>, Arc<Wal>) {
         let tmp = TempDir::new("btree").unwrap();
         let disk = Arc::new(DiskManager::open(&tmp.path().join("heap.db"), true).unwrap());
         let wal = Arc::new(
@@ -494,14 +536,15 @@ mod tests {
             )
             .unwrap(),
         );
-        let bp = Arc::new(BufferPool::new(disk, wal, BufConfig { frame_count: 64 }).unwrap());
-        (tmp, bp)
+        let bp =
+            Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 64 }).unwrap());
+        (tmp, bp, wal)
     }
 
     #[test]
     fn insert_search_delete() {
-        let (_t, bp) = buffer();
-        let tree = BTree::with_order(bp, 4).unwrap();
+        let (_t, bp, wal) = buffer();
+        let tree = BTree::with_order(bp, wal, 4).unwrap();
         tree.insert(b"b", rid(2)).unwrap();
         tree.insert(b"a", rid(1)).unwrap();
         tree.insert(b"c", rid(3)).unwrap();
@@ -520,8 +563,8 @@ mod tests {
 
     #[test]
     fn grows_multiple_levels_and_keeps_keys_sorted() {
-        let (_t, bp) = buffer();
-        let tree = BTree::with_order(bp, 4).unwrap(); // small order forces splits
+        let (_t, bp, wal) = buffer();
+        let tree = BTree::with_order(bp, wal, 4).unwrap(); // small order forces splits
         for i in 0..200u32 {
             tree.insert(&i.to_be_bytes(), rid(i as u64)).unwrap();
         }
@@ -542,8 +585,8 @@ mod tests {
 
     #[test]
     fn range_scan_is_ordered_and_bounded() {
-        let (_t, bp) = buffer();
-        let tree = BTree::with_order(bp, 4).unwrap();
+        let (_t, bp, wal) = buffer();
+        let tree = BTree::with_order(bp, wal, 4).unwrap();
         for i in 0..50u32 {
             tree.insert(&i.to_be_bytes(), rid(i as u64)).unwrap();
         }
@@ -563,8 +606,8 @@ mod tests {
             (proptest::bool::ANY, 0u16..64, 0u64..1000),
             0..400,
         )) {
-            let (_t, bp) = buffer();
-            let tree = BTree::with_order(bp, 4).unwrap();
+            let (_t, bp, wal) = buffer();
+            let tree = BTree::with_order(bp, wal, 4).unwrap();
             let mut model: BTreeMap<Vec<u8>, RecordId> = BTreeMap::new();
 
             for (is_insert, k, rv) in ops {
@@ -593,6 +636,59 @@ mod tests {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect();
             proptest::prop_assert_eq!(got_range, exp_range);
+        }
+    }
+
+    #[test]
+    fn tree_survives_restart_via_wal() {
+        use prism_core::recover;
+        use prism_storage::DiskManager as Disk;
+
+        let tmp = TempDir::new("btree-restart").unwrap();
+        let heap_path = tmp.path().join("heap.db");
+        let wal_path = tmp.path().join("wal");
+        let wal_cfg = WalConfig {
+            segment_size: 1 << 20,
+            sync_mode: SyncMode::None,
+        };
+
+        // Session 1: build a multi-level tree, make its WAL durable, then crash.
+        let root = {
+            let disk = Arc::new(Disk::open(&heap_path, true).unwrap());
+            let wal = Arc::new(Wal::open(&wal_path, wal_cfg).unwrap());
+            let bp = Arc::new(
+                BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 16 }).unwrap(),
+            );
+            let tree = BTree::with_order(bp, wal.clone(), 4).unwrap();
+            for i in 0..200u32 {
+                tree.insert(&i.to_be_bytes(), rid(i as u64)).unwrap();
+            }
+            let root = tree.root_page();
+            // No txn drives a flush here, so flush the index's WAL records.
+            wal.flush_through(wal.last_lsn()).unwrap();
+            root // drop the tree/buffer/wal (crash: dirty pages never flushed)
+        };
+
+        // Recover the heap from the WAL — rebuilds the tree's pages from their
+        // full-page-image records.
+        let wal = Arc::new(Wal::open(&wal_path, wal_cfg).unwrap());
+        {
+            let disk = Disk::open(&heap_path, false).unwrap();
+            recover(&wal, &disk).unwrap();
+            disk.close().unwrap();
+        }
+        let disk = Arc::new(Disk::open(&heap_path, false).unwrap());
+        let bp =
+            Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 16 }).unwrap());
+
+        // Reopen at the fixed root — no rescan — and read everything back.
+        let tree = BTree::open(bp, wal, root, 4);
+        for i in 0..200u32 {
+            assert_eq!(
+                tree.search(&i.to_be_bytes()).unwrap(),
+                Some(rid(i as u64)),
+                "key {i} survived restart"
+            );
         }
     }
 }

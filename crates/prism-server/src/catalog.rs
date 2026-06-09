@@ -44,7 +44,8 @@ impl ObjectKind {
     }
 }
 
-/// One catalog entry: a named object and its heap, plus a schema for tables.
+/// One catalog entry: a named object and its heap, plus a schema for tables and
+/// an index-tree root for KV namespaces.
 #[derive(Clone, Debug)]
 pub struct CatalogEntry {
     /// The object kind.
@@ -53,6 +54,8 @@ pub struct CatalogEntry {
     pub name: String,
     /// The heap holding the object's records.
     pub heap: u64,
+    /// The KV index tree's root page (namespaces only; 0 otherwise).
+    pub root_page: u64,
     /// Column schema (tables only; empty otherwise).
     pub columns: Vec<Column>,
 }
@@ -63,6 +66,7 @@ impl CatalogEntry {
         let mut w = Writer::new();
         w.put_u8(self.kind.code());
         w.put_u64(self.heap);
+        w.put_u64(self.root_page);
         w.put_str_u16("catalog.name", &self.name)?;
         let ncols: u16 = self
             .columns
@@ -83,6 +87,7 @@ impl CatalogEntry {
         let mut r = Reader::new(bytes);
         let kind = ObjectKind::from_code(r.get_u8("catalog.kind")?)?;
         let heap = r.get_u64("catalog.heap")?;
+        let root_page = r.get_u64("catalog.root_page")?;
         let name = r.get_str_u16("catalog.name")?;
         let ncols = r.get_u16("catalog.ncols")?;
         let mut columns = Vec::with_capacity(ncols as usize);
@@ -100,6 +105,7 @@ impl CatalogEntry {
             kind,
             name,
             heap,
+            root_page,
             columns,
         })
     }
@@ -132,6 +138,7 @@ mod tests {
             kind: ObjectKind::Table,
             name: "accounts".into(),
             heap: 1000,
+            root_page: 0,
             columns: vec![
                 Column {
                     name: "id".into(),
@@ -157,11 +164,13 @@ mod tests {
             kind: ObjectKind::Namespace,
             name: "sessions".into(),
             heap: 1 << 41,
+            root_page: 77,
             columns: vec![],
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
         assert_eq!(decoded.kind, ObjectKind::Namespace);
         assert_eq!(decoded.heap, 1 << 41);
+        assert_eq!(decoded.root_page, 77);
         assert!(decoded.columns.is_empty());
     }
 
