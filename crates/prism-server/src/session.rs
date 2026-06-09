@@ -15,7 +15,10 @@
 //!   each field. Query operators (`$gt`, …) and update operators (`$inc`, …)
 //!   over the wire await nested-document support in `prism-doc`.
 //! - KV `range`/`scan` are unsupported on the hash namespace.
-//! - `Hello`/`Auth` are accepted unconditionally (authentication is deferred).
+//!
+//! A network session ([`Session::new_authenticating`]) must complete the
+//! `Hello` → `Auth` handshake (scrypt-verified credentials) before any request
+//! is served; the embedded [`Session::new`] is pre-authenticated and trusted.
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,14 +28,20 @@ use prism_core::txn::{Snapshot, TxnHandle, TxnMode};
 use prism_doc::{DocCollection, DocValue, Document, Filter, Update};
 use prism_kv::KvNamespace;
 use prism_protocol::{
-    ColumnDesc, DocCommand, KvCommand, KvResultBody, Message, NoticeSeverity, Packet, Row,
-    TxnMode as WireTxnMode, Value as WireValue,
+    ColumnDesc, DocCommand, KvCommand, KvResultBody, Message, NoticeSeverity, PROTOCOL_VERSION,
+    Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
 };
 use prism_sql::{Outcome, Value as SqlValue};
 use prism_wal::Lsn;
 
+use crate::auth::SYSTEM_OID;
 use crate::database::Database;
 use crate::error::{Result, ServerError};
+
+// AuthAck status codes (docs/specs/wire-protocol.md).
+const AUTH_BAD_CREDENTIALS: u8 = 1;
+// HelloAck status: non-zero means the server will close the connection.
+const HELLO_VERSION_MISMATCH: u8 = 1;
 
 const SERVER_VERSION: &str = concat!("prism ", env!("CARGO_PKG_VERSION"));
 
@@ -50,18 +59,48 @@ enum SessionTxn {
     },
 }
 
+/// Where a session is in the authentication handshake.
+enum AuthState {
+    /// Awaiting `Hello`.
+    New,
+    /// `Hello` accepted; awaiting `Auth`.
+    Greeted,
+    /// Authenticated as the given user OID; requests are served.
+    Authenticated { _user_oid: u64 },
+}
+
 /// A client session over a shared [`Database`].
 pub struct Session {
     db: Arc<Database>,
+    auth: AuthState,
     txn: SessionTxn,
+    /// Set when a fatal handshake condition (version mismatch, bad credentials,
+    /// out-of-order message) requires the connection to close after the reply.
+    closing: bool,
 }
 
 impl Session {
-    /// Open a new session on `db`.
+    /// A trusted, already-authenticated session for the embedded API (no network
+    /// handshake). Use [`Session::new_authenticating`] for connections.
     pub fn new(db: Arc<Database>) -> Self {
         Self {
             db,
+            auth: AuthState::Authenticated {
+                _user_oid: SYSTEM_OID,
+            },
             txn: SessionTxn::None,
+            closing: false,
+        }
+    }
+
+    /// A network session that must complete the `Hello` → `Auth` handshake
+    /// before it will serve any request.
+    pub fn new_authenticating(db: Arc<Database>) -> Self {
+        Self {
+            db,
+            auth: AuthState::New,
+            txn: SessionTxn::None,
+            closing: false,
         }
     }
 
@@ -70,26 +109,112 @@ impl Session {
         matches!(self.txn, SessionTxn::Explicit { .. })
     }
 
+    /// Whether the connection should be closed after the latest response (a
+    /// failed handshake or a protocol violation).
+    pub fn is_closing(&self) -> bool {
+        self.closing
+    }
+
     /// Handle one request packet, echoing the `request_id` on the response.
     pub fn handle_packet(&mut self, request: Packet) -> Packet {
         Packet::new(request.request_id, self.handle(request.message))
     }
 
-    /// Handle one request message and produce the response message.
+    /// Handle one request message and produce the response message, enforcing
+    /// the authentication handshake before any query is served.
     pub fn handle(&mut self, request: Message) -> Message {
+        match self.auth {
+            AuthState::New => self.greet(request),
+            AuthState::Greeted => self.authenticate(request),
+            AuthState::Authenticated { .. } => self.dispatch(request),
+        }
+    }
+
+    /// `New` state: only `Hello` is accepted; anything else closes the
+    /// connection.
+    fn greet(&mut self, request: Message) -> Message {
         match request {
-            Message::Hello { .. } => Message::HelloAck {
-                status: 0,
-                server_version: SERVER_VERSION.to_string(),
-                features: 0,
-                session_id: new_session_id(),
-                error: None,
+            Message::Hello {
+                protocol_version, ..
+            } => {
+                if protocol_version != PROTOCOL_VERSION {
+                    self.closing = true;
+                    return Message::HelloAck {
+                        status: HELLO_VERSION_MISMATCH,
+                        server_version: SERVER_VERSION.to_string(),
+                        features: 0,
+                        session_id: 0,
+                        error: Some(
+                            ServerError::State(format!(
+                                "unsupported protocol version {protocol_version}; \
+                                 this server speaks {PROTOCOL_VERSION}"
+                            ))
+                            .to_error_info(),
+                        ),
+                    };
+                }
+                self.auth = AuthState::Greeted;
+                Message::HelloAck {
+                    status: 0,
+                    server_version: SERVER_VERSION.to_string(),
+                    features: 0,
+                    session_id: new_session_id(),
+                    error: None,
+                }
+            }
+            _ => {
+                self.closing = true;
+                Message::Notice {
+                    severity: NoticeSeverity::Error,
+                    code: 0x0001,
+                    message: "expected Hello as the first message".into(),
+                }
+            }
+        }
+    }
+
+    /// `Greeted` state: only `Auth` is accepted; success authenticates the
+    /// session, failure closes the connection.
+    fn authenticate(&mut self, request: Message) -> Message {
+        match request {
+            Message::Auth {
+                username, password, ..
+            } => match self.db.verify_user(&username, &password) {
+                Some(user_oid) => {
+                    self.auth = AuthState::Authenticated {
+                        _user_oid: user_oid,
+                    };
+                    Message::AuthAck {
+                        status: 0,
+                        user_oid,
+                        error: None,
+                    }
+                }
+                None => {
+                    self.closing = true;
+                    Message::AuthAck {
+                        status: AUTH_BAD_CREDENTIALS,
+                        user_oid: 0,
+                        error: Some(
+                            ServerError::State("authentication failed".into()).to_error_info(),
+                        ),
+                    }
+                }
             },
-            Message::Auth { .. } => Message::AuthAck {
-                status: 0,
-                user_oid: 1,
-                error: None,
-            },
+            _ => {
+                self.closing = true;
+                Message::Notice {
+                    severity: NoticeSeverity::Error,
+                    code: 0x0001,
+                    message: "expected Auth after Hello".into(),
+                }
+            }
+        }
+    }
+
+    /// `Authenticated` state: serve a request.
+    fn dispatch(&mut self, request: Message) -> Message {
+        match request {
             Message::Ping => Message::Pong,
             Message::Begin { mode } => self.begin(mode),
             Message::Commit { .. } => self.commit(),
@@ -108,7 +233,7 @@ impl Session {
                 severity: NoticeSeverity::Error,
                 code: 0x0001,
                 message: format!(
-                    "unexpected message type {:?} from client",
+                    "unexpected message type {:?} for an authenticated session",
                     other.message_type()
                 ),
             },

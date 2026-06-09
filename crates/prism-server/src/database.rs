@@ -25,6 +25,7 @@ use prism_sql::SqlEngine;
 use prism_storage::DiskManager;
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
+use crate::auth::UserStore;
 use crate::error::Result;
 
 // Heap-id ranges, kept disjoint per model so the in-memory registries never
@@ -59,6 +60,7 @@ pub struct Database {
     store: Arc<RecordStore>,
     txns: Arc<TxnManager>,
     sql: SqlEngine,
+    users: UserStore,
     doc_heaps: Mutex<HashMap<String, HeapId>>,
     doc_next: AtomicU64,
     kv_namespaces: Mutex<HashMap<String, Arc<KvNamespace>>>,
@@ -95,11 +97,22 @@ impl Database {
             store,
             txns,
             sql,
+            users: UserStore::with_default_admin()?,
             doc_heaps: Mutex::new(HashMap::new()),
             doc_next: AtomicU64::new(DOC_HEAP_BASE),
             kv_namespaces: Mutex::new(HashMap::new()),
             kv_next: AtomicU64::new(KV_HEAP_BASE),
         })
+    }
+
+    /// Create (or replace) a user account with a password.
+    pub fn add_user(&self, username: &str, password: &str) -> Result<u64> {
+        self.users.add_user(username, password)
+    }
+
+    /// Verify a username/password, returning the user's OID on success.
+    pub fn verify_user(&self, username: &str, password: &str) -> Option<u64> {
+        self.users.verify(username, password)
     }
 
     /// The shared transaction manager.

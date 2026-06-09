@@ -66,6 +66,7 @@ proptest = "1"
 # nesting stack-overflow protection) is an MSRV bump and needs an ADR.
 sqlparser = { version = "0.54", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
+scrypt = "0.11"
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Mirrors docs/operations/build-and-dev.md.
@@ -73,6 +74,18 @@ tokio = { version = "1", features = ["full"] }
 [profile.dev]
 opt-level = 0
 debug = true
+
+# scrypt's work factor is punishing at opt-level 0 (the salsa20 core dominates
+# password hashing). Optimize just the crypto crates in dev/test builds so auth
+# stays fast without weakening parameters or making our own code harder to debug.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
 
 [profile.release]
 opt-level = 3

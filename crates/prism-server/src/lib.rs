@@ -17,6 +17,7 @@
 //! are a follow-up; see [`Session`] for the per-request simplifications and
 //! [`server`] for the deferred network features.
 
+pub mod auth;
 pub mod database;
 pub mod error;
 pub mod server;
@@ -24,5 +25,5 @@ pub mod session;
 
 pub use database::{Config, Database};
 pub use error::{Result, ServerError};
-pub use server::Server;
+pub use server::{Server, ServerConfig};
 pub use session::Session;

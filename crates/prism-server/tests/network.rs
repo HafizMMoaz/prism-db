@@ -42,6 +42,29 @@ impl Client {
         assert_eq!(packet.request_id, id, "response echoes the request id");
         packet.message
     }
+
+    /// Complete the `Hello` → `Auth` handshake with the default admin account.
+    async fn login(&mut self) {
+        assert!(matches!(
+            self.request(Message::Hello {
+                protocol_version: PROTOCOL_VERSION,
+                client_name: "itest".into(),
+                client_version: "0".into(),
+                features: 0,
+            })
+            .await,
+            Message::HelloAck { status: 0, .. }
+        ));
+        assert!(matches!(
+            self.request(Message::Auth {
+                mechanism: AuthMechanism::Password,
+                username: "admin".into(),
+                password: "admin".into(),
+            })
+            .await,
+            Message::AuthAck { status: 0, .. }
+        ));
+    }
 }
 
 async fn start_server() -> (std::net::SocketAddr, TempDir) {
@@ -66,25 +89,7 @@ async fn handshake_then_sql_over_tcp() {
     let (addr, _tmp) = start_server().await;
     let mut c = Client::connect(addr).await;
 
-    assert!(matches!(
-        c.request(Message::Hello {
-            protocol_version: PROTOCOL_VERSION,
-            client_name: "itest".into(),
-            client_version: "0".into(),
-            features: 0,
-        })
-        .await,
-        Message::HelloAck { status: 0, .. }
-    ));
-    assert!(matches!(
-        c.request(Message::Auth {
-            mechanism: AuthMechanism::Password,
-            username: "u".into(),
-            password: "p".into(),
-        })
-        .await,
-        Message::AuthAck { status: 0, .. }
-    ));
+    c.login().await;
     assert!(matches!(c.request(Message::Ping).await, Message::Pong));
 
     c.request(sql("CREATE TABLE t (id BIGINT NOT NULL, name TEXT)"))
@@ -117,6 +122,7 @@ async fn handshake_then_sql_over_tcp() {
 async fn explicit_cross_model_transaction_over_tcp() {
     let (addr, _tmp) = start_server().await;
     let mut c = Client::connect(addr).await;
+    c.login().await;
 
     c.request(sql("CREATE TABLE accounts (id BIGINT NOT NULL)"))
         .await;
@@ -161,6 +167,7 @@ async fn explicit_cross_model_transaction_over_tcp() {
 
     // A second connection sees all three committed writes.
     let mut c2 = Client::connect(addr).await;
+    c2.login().await;
     match c2.request(sql("SELECT id FROM accounts")).await {
         Message::SqlResult { rows, .. } => assert_eq!(rows.len(), 1),
         other => panic!("expected SqlResult, got {other:?}"),

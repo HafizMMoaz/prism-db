@@ -141,29 +141,86 @@ fn kv_get(ns: &str, key: &[u8]) -> Message {
 
 // ---- tests -------------------------------------------------------------------
 
+fn hello() -> Message {
+    Message::Hello {
+        protocol_version: prism_protocol::PROTOCOL_VERSION,
+        client_name: "test".into(),
+        client_version: "0".into(),
+        features: 0,
+    }
+}
+
+fn auth(username: &str, password: &str) -> Message {
+    Message::Auth {
+        mechanism: AuthMechanism::Password,
+        username: username.into(),
+        password: password.into(),
+    }
+}
+
 #[test]
 fn handshake_and_ping() {
     let (db, _tmp) = database();
-    let mut s = Session::new(db);
+    let mut s = Session::new_authenticating(db);
 
     assert!(matches!(
-        s.handle(Message::Hello {
-            protocol_version: prism_protocol::PROTOCOL_VERSION,
-            client_name: "test".into(),
-            client_version: "0".into(),
-            features: 0,
-        }),
+        s.handle(hello()),
         Message::HelloAck { status: 0, .. }
     ));
     assert!(matches!(
-        s.handle(Message::Auth {
-            mechanism: AuthMechanism::Password,
-            username: "admin".into(),
-            password: "x".into(),
-        }),
+        s.handle(auth("admin", "admin")), // the default seeded account
         Message::AuthAck { status: 0, .. }
     ));
+    assert!(!s.is_closing());
     assert!(matches!(s.handle(Message::Ping), Message::Pong));
+}
+
+#[test]
+fn authentication_is_enforced() {
+    let (db, _tmp) = database();
+
+    // A query before the handshake is rejected and closes the connection.
+    let mut early = Session::new_authenticating(db.clone());
+    assert!(matches!(
+        early.handle(sql("SELECT 1")),
+        Message::Notice { .. }
+    ));
+    assert!(
+        early.is_closing(),
+        "a pre-handshake query closes the session"
+    );
+
+    // Wrong protocol version is rejected.
+    let mut bad_version = Session::new_authenticating(db.clone());
+    assert!(matches!(
+        bad_version.handle(Message::Hello {
+            protocol_version: 999,
+            client_name: "x".into(),
+            client_version: "0".into(),
+            features: 0,
+        }),
+        Message::HelloAck { status, .. } if status != 0
+    ));
+    assert!(bad_version.is_closing());
+
+    // Wrong password is rejected and closes the connection.
+    let mut bad_pw = Session::new_authenticating(db.clone());
+    bad_pw.handle(hello());
+    assert!(matches!(
+        bad_pw.handle(auth("admin", "wrong")),
+        Message::AuthAck { status, .. } if status != 0
+    ));
+    assert!(bad_pw.is_closing());
+
+    // A freshly added user can authenticate.
+    db.add_user("svc", "s3cret").unwrap();
+    let mut ok = Session::new_authenticating(db);
+    ok.handle(hello());
+    assert!(matches!(
+        ok.handle(auth("svc", "s3cret")),
+        Message::AuthAck { status: 0, .. }
+    ));
+    assert!(!ok.is_closing());
 }
 
 #[test]

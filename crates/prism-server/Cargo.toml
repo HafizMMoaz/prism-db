@@ -30,6 +30,7 @@ prism-buffer = { workspace = true }
 prism-wal = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+scrypt = { workspace = true }
 
 [dev-dependencies]
 prism-testkit = { workspace = true }
