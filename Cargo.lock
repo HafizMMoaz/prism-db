@@ -392,7 +392,11 @@ dependencies = [
 name = "prism-bench"
 version = "0.1.0"
 dependencies = [
+ "prism-doc",
+ "prism-protocol",
  "prism-server",
+ "prism-testkit",
+ "prism-wal",
 ]
 
 [[package]]

@@ -7,10 +7,23 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Library holds the (testable) workloads + statistics; the binary parses args and
+# prints the report.
+[lib]
+name = "prism_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "prism-bench"
 path = "src/main.rs"
 
-# Drives the embedded API via prism-server's library form.
+# Drives the embedded API via prism-server's library form (the one crate allowed
+# to depend on prism-server).
 [dependencies]
 prism-server = { workspace = true }
+prism-protocol = { workspace = true }
+prism-doc = { workspace = true }
+prism-wal = { workspace = true }
+
+[dev-dependencies]
+prism-testkit = { workspace = true }
