@@ -24,6 +24,7 @@ use std::sync::Arc;
 use prism_core::TxnManager;
 use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
+use prism_index::BTree;
 use sqlparser::ast::{
     BinaryOperator, ColumnOption, DataType, Expr, Query, SelectItem, SetExpr, Statement,
     TableFactor, TableObject, Value as SqlValue,
@@ -114,20 +115,66 @@ impl SqlEngine {
     fn exec_create_table(&self, ct: sqlparser::ast::CreateTable) -> Result<Outcome> {
         let name = object_name(&ct.name);
         let mut columns = Vec::with_capacity(ct.columns.len());
-        for col in &ct.columns {
+        let mut primary_key = None;
+        for (idx, col) in ct.columns.iter().enumerate() {
             let ty = map_data_type(&col.data_type)?;
-            let nullable = !col
-                .options
-                .iter()
-                .any(|o| matches!(o.option, ColumnOption::NotNull));
+            let nullable = !col.options.iter().any(|o| {
+                matches!(
+                    o.option,
+                    ColumnOption::NotNull
+                        | ColumnOption::Unique {
+                            is_primary: true,
+                            ..
+                        }
+                )
+            });
+            if col.options.iter().any(|o| {
+                matches!(
+                    o.option,
+                    ColumnOption::Unique {
+                        is_primary: true,
+                        ..
+                    }
+                )
+            }) {
+                if primary_key.is_some() {
+                    return Err(SqlError::Unsupported(
+                        "only one PRIMARY KEY column is supported".into(),
+                    ));
+                }
+                primary_key = Some(idx);
+            }
             columns.push(Column {
                 name: col.name.value.clone(),
                 ty,
                 nullable,
             });
         }
-        self.catalog.create_table(&name, columns)?;
+
+        // A PRIMARY KEY column gets a durable B+tree index (key -> row RID).
+        let index_root = if primary_key.is_some() {
+            let tree = BTree::create(self.store.buffer(), self.store.wal())?;
+            Some(tree.root_page())
+        } else {
+            None
+        };
+
+        self.catalog
+            .create_table(&name, columns, primary_key, index_root)?;
         Ok(Outcome::CreateTable)
+    }
+
+    /// Open the primary-key index tree for `table`, if it has one.
+    fn pk_index(&self, table: &Table) -> Option<BTree> {
+        match (table.primary_key, table.index_root) {
+            (Some(_), Some(root)) => Some(BTree::open(
+                self.store.buffer(),
+                self.store.wal(),
+                root,
+                usize::MAX,
+            )),
+            _ => None,
+        }
     }
 
     fn exec_insert(&self, txn: &TxnHandle, ins: sqlparser::ast::Insert) -> Result<Outcome> {
@@ -160,6 +207,7 @@ impl SqlEngine {
         };
 
         let types = table.types();
+        let index = self.pk_index(&table);
         let mut count = 0;
         for row_exprs in &values.rows {
             if row_exprs.len() != target.len() {
@@ -180,8 +228,30 @@ impl SqlEngine {
                     return Err(SqlError::Type(format!("column {} is NOT NULL", col.name)));
                 }
             }
+
+            // Maintain the primary-key index, rejecting a duplicate that is
+            // visible to this transaction (committed, or our own).
+            let pk_key = match (&index, table.primary_key) {
+                (Some(tree), Some(pk_col)) => {
+                    let key = encode_index_key(&row[pk_col])?;
+                    if let Some(existing) = tree.search(&key)? {
+                        if self.store.read(txn, existing)?.is_some() {
+                            return Err(SqlError::Constraint(format!(
+                                "duplicate primary key in {}",
+                                table.name
+                            )));
+                        }
+                    }
+                    Some(key)
+                }
+                _ => None,
+            };
+
             let bytes = types::encode_row(&types, &row)?;
-            self.store.insert(txn, table.heap, &bytes)?;
+            let rid = self.store.insert(txn, table.heap, &bytes)?;
+            if let (Some(tree), Some(key)) = (&index, pk_key) {
+                tree.insert(&key, rid)?;
+            }
             count += 1;
         }
         Ok(Outcome::Insert { count })
@@ -211,6 +281,25 @@ impl SqlEngine {
             .collect();
 
         let types = table.types();
+
+        // Index seek: `WHERE <pk> = <literal>` resolves to a single B+tree
+        // lookup instead of a full scan.
+        if let (Some(tree), Some(key_value)) = (
+            self.pk_index(&table),
+            self.pk_equality_literal(&select.selection, &table)?,
+        ) {
+            let key = encode_index_key(&key_value)?;
+            let mut rows = Vec::new();
+            if let Some(rid) = tree.search(&key)? {
+                if let Some(payload) = self.store.read(txn, rid)? {
+                    let full = types::decode_row(&types, &payload)?;
+                    rows.push(projection.iter().map(|&i| full[i].clone()).collect());
+                }
+            }
+            return Ok(Outcome::Select { columns, rows });
+        }
+
+        // Otherwise, a full sequential scan with the predicate applied per row.
         let mut rows = Vec::new();
         for (_, payload) in self.store.scan(txn, table.heap)? {
             let full = types::decode_row(&types, &payload)?;
@@ -222,6 +311,35 @@ impl SqlEngine {
             rows.push(projection.iter().map(|&i| full[i].clone()).collect());
         }
         Ok(Outcome::Select { columns, rows })
+    }
+
+    /// If `selection` is exactly `<pk> = <literal>` (either operand order) on a
+    /// table with a primary key whose type matches the literal, return that
+    /// literal value for an index seek; otherwise `None` (fall back to a scan).
+    fn pk_equality_literal(
+        &self,
+        selection: &Option<Expr>,
+        table: &Table,
+    ) -> Result<Option<Value>> {
+        let Some(pk_col) = table.primary_key else {
+            return Ok(None);
+        };
+        let Some(Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        }) = selection
+        else {
+            return Ok(None);
+        };
+        let pk_name = &table.columns[pk_col].name;
+        let lit = match (left.as_ref(), right.as_ref()) {
+            (Expr::Identifier(id), other) if &id.value == pk_name => literal(other).ok(),
+            (other, Expr::Identifier(id)) if &id.value == pk_name => literal(other).ok(),
+            _ => None,
+        };
+        // Only seek when the literal's type matches the key column.
+        Ok(lit.filter(|v| v.type_matches(table.columns[pk_col].ty)))
     }
 
     /// Whether `row` satisfies the boolean predicate `expr`.
@@ -297,6 +415,17 @@ fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<usize>>
         }
     }
     Ok(out)
+}
+
+/// Encode a value as an order-preserving B+tree index key. Integers use a
+/// sign-flipped big-endian form so the byte order matches numeric order.
+fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
+    Ok(match value {
+        Value::Int64(n) => (*n as u64 ^ (1u64 << 63)).to_be_bytes().to_vec(),
+        Value::Text(s) => s.as_bytes().to_vec(),
+        Value::Bool(b) => vec![u8::from(*b)],
+        Value::Null => return Err(SqlError::Constraint("primary key cannot be NULL".into())),
+    })
 }
 
 /// Convert a literal expression (possibly a unary minus on a number) to a value.
@@ -538,5 +667,79 @@ mod tests {
             "uncommitted insert is visible to its own txn"
         );
         txn.commit().unwrap();
+    }
+
+    #[test]
+    fn primary_key_seek_and_uniqueness() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+
+        // Equality on the PK seeks the index and returns exactly that row.
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT name FROM u WHERE id = 2")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Text("b".into())]]);
+
+        // A miss returns nothing.
+        assert!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT name FROM u WHERE id = 99")
+                    .unwrap()
+            )
+            .is_empty()
+        );
+
+        // A duplicate primary key is rejected.
+        assert!(matches!(
+            env.engine
+                .execute_autocommit("INSERT INTO u VALUES (2,'dup')"),
+            Err(SqlError::Constraint(_))
+        ));
+
+        // A duplicate within a single multi-row INSERT is also rejected (the
+        // first row's write is visible to the same transaction).
+        assert!(matches!(
+            env.engine
+                .execute_autocommit("INSERT INTO u VALUES (7,'x'),(7,'y')"),
+            Err(SqlError::Constraint(_))
+        ));
+    }
+
+    #[test]
+    fn primary_key_index_matches_a_scan() {
+        // The index seek must agree with a full scan over a non-indexed column.
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (10,'ten'),(20,'twenty')")
+            .unwrap();
+
+        // Seek by PK (index path).
+        let by_pk = rows(
+            env.engine
+                .execute_autocommit("SELECT id, name FROM u WHERE id = 20")
+                .unwrap(),
+        );
+        // Same row found by scanning a non-key column (scan path).
+        let by_scan = rows(
+            env.engine
+                .execute_autocommit("SELECT id, name FROM u WHERE name = 'twenty'")
+                .unwrap(),
+        );
+        assert_eq!(by_pk, by_scan);
+        assert_eq!(
+            by_pk,
+            vec![vec![Value::Int64(20), Value::Text("twenty".into())]]
+        );
     }
 }

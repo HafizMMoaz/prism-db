@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use prism_core::store::HeapId;
+use prism_storage::PageId;
 
 use crate::error::{Result, SqlError};
 use crate::types::Type;
@@ -32,6 +33,10 @@ pub struct Table {
     pub heap: HeapId,
     /// Columns, in declared order.
     pub columns: Vec<Column>,
+    /// The `PRIMARY KEY` column index, if the table has one.
+    pub primary_key: Option<usize>,
+    /// The root page of the primary-key B+tree index, if any.
+    pub index_root: Option<PageId>,
 }
 
 impl Table {
@@ -62,7 +67,14 @@ impl Catalog {
     }
 
     /// Register a new table, allocating its heap. Errors if the name is taken.
-    pub fn create_table(&self, name: &str, columns: Vec<Column>) -> Result<Table> {
+    /// `primary_key`/`index_root` describe the optional primary-key index.
+    pub fn create_table(
+        &self,
+        name: &str,
+        columns: Vec<Column>,
+        primary_key: Option<usize>,
+        index_root: Option<PageId>,
+    ) -> Result<Table> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
             return Err(SqlError::TableExists(name.to_string()));
@@ -77,6 +89,8 @@ impl Catalog {
             name: name.to_string(),
             heap,
             columns,
+            primary_key,
+            index_root,
         };
         tables.insert(name.to_string(), table.clone());
         Ok(table)
@@ -95,7 +109,14 @@ impl Catalog {
     /// Install a table at a known heap (used when reloading a persisted catalog
     /// after restart). Bumps the heap allocator past `heap` so new tables don't
     /// collide. Errors if the name is already registered.
-    pub fn register_table(&self, name: &str, columns: Vec<Column>, heap: HeapId) -> Result<()> {
+    pub fn register_table(
+        &self,
+        name: &str,
+        columns: Vec<Column>,
+        heap: HeapId,
+        primary_key: Option<usize>,
+        index_root: Option<PageId>,
+    ) -> Result<()> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
             return Err(SqlError::TableExists(name.to_string()));
@@ -106,6 +127,8 @@ impl Catalog {
                 name: name.to_string(),
                 heap,
                 columns,
+                primary_key,
+                index_root,
             },
         );
         let mut n = self.next_heap.lock().expect("catalog poisoned");

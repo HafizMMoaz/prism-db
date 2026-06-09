@@ -203,6 +203,7 @@ impl Database {
             name: name.to_string(),
             heap: heap.0,
             root_page: ns.index_root().as_u64(),
+            primary_key: None,
             columns: vec![],
         })?;
         map.insert(name.to_string(), ns.clone());
@@ -224,7 +225,8 @@ impl Database {
                 kind: ObjectKind::Table,
                 name: table.name.clone(),
                 heap: table.heap.0,
-                root_page: 0,
+                root_page: table.index_root.map_or(0, |p| p.as_u64()),
+                primary_key: table.primary_key.map(|p| p as u32),
                 columns: table.columns.clone(),
             };
             self.persist_entry(&entry)?;
@@ -240,6 +242,7 @@ impl Database {
             name: name.to_string(),
             heap: heap.0,
             root_page: 0,
+            primary_key: None,
             columns: vec![],
         })
     }
@@ -284,9 +287,15 @@ impl Database {
             let heap = HeapId(entry.heap);
             match entry.kind {
                 ObjectKind::Table => {
-                    self.sql
-                        .catalog()
-                        .register_table(&entry.name, entry.columns, heap)?;
+                    let primary_key = entry.primary_key.map(|p| p as usize);
+                    let index_root = primary_key.map(|_| PageId(entry.root_page));
+                    self.sql.catalog().register_table(
+                        &entry.name,
+                        entry.columns,
+                        heap,
+                        primary_key,
+                        index_root,
+                    )?;
                     persisted.insert(entry.name);
                 }
                 ObjectKind::Collection => {

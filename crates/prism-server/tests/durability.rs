@@ -167,3 +167,38 @@ fn doc_count(s: &mut Session, collection: &str) -> usize {
         other => panic!("expected DocResult, got {other:?}"),
     }
 }
+
+#[test]
+fn sql_primary_key_index_survives_restart() {
+    let tmp = TempDir::new("durability-pk").unwrap();
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE acct (id BIGINT PRIMARY KEY, owner TEXT)"));
+        s.handle(sql(
+            "INSERT INTO acct VALUES (1,'alice'),(2,'bob'),(3,'carol')",
+        ));
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+
+    // The primary-key index reopened at its persisted root: an index seek
+    // returns the right row after restart.
+    match s.handle(sql("SELECT owner FROM acct WHERE id = 2")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => assert_eq!(rows, vec![vec![Some(WireValue::Str("bob".into()))]]),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+
+    // The unique constraint still holds (the index was reloaded, not empty).
+    match s.handle(sql("INSERT INTO acct VALUES (1,'dup')")) {
+        Message::SqlResult { status, .. } => {
+            assert_ne!(status, 0, "duplicate primary key rejected after restart")
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}

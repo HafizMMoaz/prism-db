@@ -54,8 +54,11 @@ pub struct CatalogEntry {
     pub name: String,
     /// The heap holding the object's records.
     pub heap: u64,
-    /// The KV index tree's root page (namespaces only; 0 otherwise).
+    /// The index tree's root page: a KV namespace's hash/ordered index, or a
+    /// table's primary-key index. 0 = none.
     pub root_page: u64,
+    /// The primary-key column index (tables only).
+    pub primary_key: Option<u32>,
     /// Column schema (tables only; empty otherwise).
     pub columns: Vec<Column>,
 }
@@ -67,6 +70,8 @@ impl CatalogEntry {
         w.put_u8(self.kind.code());
         w.put_u64(self.heap);
         w.put_u64(self.root_page);
+        // u64::MAX encodes "no primary key".
+        w.put_u64(self.primary_key.map_or(u64::MAX, u64::from));
         w.put_str_u16("catalog.name", &self.name)?;
         let ncols: u16 = self
             .columns
@@ -88,6 +93,8 @@ impl CatalogEntry {
         let kind = ObjectKind::from_code(r.get_u8("catalog.kind")?)?;
         let heap = r.get_u64("catalog.heap")?;
         let root_page = r.get_u64("catalog.root_page")?;
+        let pk = r.get_u64("catalog.primary_key")?;
+        let primary_key = (pk != u64::MAX).then_some(pk as u32);
         let name = r.get_str_u16("catalog.name")?;
         let ncols = r.get_u16("catalog.ncols")?;
         let mut columns = Vec::with_capacity(ncols as usize);
@@ -106,6 +113,7 @@ impl CatalogEntry {
             name,
             heap,
             root_page,
+            primary_key,
             columns,
         })
     }
@@ -138,7 +146,8 @@ mod tests {
             kind: ObjectKind::Table,
             name: "accounts".into(),
             heap: 1000,
-            root_page: 0,
+            root_page: 42,
+            primary_key: Some(0),
             columns: vec![
                 Column {
                     name: "id".into(),
@@ -156,6 +165,8 @@ mod tests {
         assert_eq!(decoded.kind, ObjectKind::Table);
         assert_eq!(decoded.name, "accounts");
         assert_eq!(decoded.heap, 1000);
+        assert_eq!(decoded.root_page, 42);
+        assert_eq!(decoded.primary_key, Some(0));
         assert_eq!(decoded.columns.len(), 2);
         assert_eq!(decoded.columns[1].name, "owner");
         assert_eq!(decoded.columns[1].ty, Type::Text);
@@ -165,12 +176,14 @@ mod tests {
             name: "sessions".into(),
             heap: 1 << 41,
             root_page: 77,
+            primary_key: None,
             columns: vec![],
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
         assert_eq!(decoded.kind, ObjectKind::Namespace);
         assert_eq!(decoded.heap, 1 << 41);
         assert_eq!(decoded.root_page, 77);
+        assert_eq!(decoded.primary_key, None);
         assert!(decoded.columns.is_empty());
     }
 

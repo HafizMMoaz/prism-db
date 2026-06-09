@@ -12,6 +12,14 @@ pub enum SqlError {
     #[error(transparent)]
     Core(#[from] prism_core::CoreError),
 
+    /// An error from an index access method (the primary-key B+tree).
+    #[error(transparent)]
+    Index(#[from] prism_index::IndexError),
+
+    /// A constraint was violated (e.g. a duplicate primary key).
+    #[error("constraint violation: {0}")]
+    Constraint(String),
+
     /// The SQL string could not be parsed.
     #[error("parse error: {0}")]
     Parse(String),
