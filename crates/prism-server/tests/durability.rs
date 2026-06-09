@@ -26,6 +26,17 @@ fn doc_insert(collection: &str, fields: &[(&str, DocValue)]) -> Message {
     }
 }
 
+fn doc_find(collection: &str, query: &[(&str, DocValue)]) -> Message {
+    let q = Document::from_fields(query.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    Message::DocOp {
+        collection: collection.into(),
+        command: DocCommand::Find {
+            query: q.encode().unwrap(),
+            options: vec![],
+        },
+    }
+}
+
 fn doc_find_all(collection: &str) -> Message {
     Message::DocOp {
         collection: collection.into(),
@@ -200,5 +211,55 @@ fn sql_primary_key_index_survives_restart() {
             assert_ne!(status, 0, "duplicate primary key rejected after restart")
         }
         other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn document_id_index_survives_restart() {
+    let tmp = TempDir::new("durability-doc-id").unwrap();
+    let id;
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        // Insert with an explicit integer _id so we can seek it after restart.
+        match s.handle(doc_insert(
+            "people",
+            &[
+                ("_id", DocValue::Int64(7)),
+                ("name", DocValue::Str("zoe".into())),
+            ],
+        )) {
+            Message::DocResult { status: 0, .. } => {}
+            other => panic!("expected DocResult, got {other:?}"),
+        }
+        id = DocValue::Int64(7);
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+
+    // The _id index reopened at its persisted root: a seek finds the document.
+    match s.handle(doc_find("people", &[("_id", id.clone())])) {
+        Message::DocResult {
+            status: 0, docs, ..
+        } => {
+            assert_eq!(docs.len(), 1, "document found by _id seek after restart");
+            let doc = Document::decode(&docs[0]).unwrap();
+            assert_eq!(doc.get("name"), Some(&DocValue::Str("zoe".into())));
+        }
+        other => panic!("expected DocResult, got {other:?}"),
+    }
+
+    // The _id unique constraint still holds after restart.
+    match s.handle(doc_insert(
+        "people",
+        &[("_id", id), ("name", DocValue::Str("dup".into()))],
+    )) {
+        Message::DocResult { status, .. } => {
+            assert_ne!(status, 0, "duplicate _id rejected after restart")
+        }
+        other => panic!("expected DocResult, got {other:?}"),
     }
 }

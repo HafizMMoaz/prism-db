@@ -12,6 +12,10 @@ pub enum DocError {
     #[error(transparent)]
     Core(#[from] prism_core::CoreError),
 
+    /// An error from the `_id` B+tree index.
+    #[error(transparent)]
+    Index(#[from] prism_index::IndexError),
+
     /// A stored document could not be decoded.
     #[error("corrupt document: {0}")]
     Corrupt(String),
@@ -19,4 +23,8 @@ pub enum DocError {
     /// A document or field exceeds a size limit.
     #[error("document too large: {0}")]
     TooLarge(String),
+
+    /// A constraint was violated (e.g. a duplicate `_id`).
+    #[error("constraint violation: {0}")]
+    Constraint(String),
 }

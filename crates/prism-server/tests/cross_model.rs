@@ -51,6 +51,7 @@ fn open_models(
     create: bool,
     recovered: Option<&prism_core::RecoveryReport>,
     kv_root: Option<PageId>,
+    doc_root: Option<PageId>,
 ) -> Models {
     let disk = Arc::new(DiskManager::open(&tmp.path().join("heap.db"), create).unwrap());
     let wal = Arc::new(
@@ -82,9 +83,13 @@ fn open_models(
         Some(root) => KvNamespace::open(store.clone(), KV_HEAP, root),
         None => KvNamespace::create(store.clone(), KV_HEAP).unwrap(),
     };
+    let docs = match doc_root {
+        Some(root) => DocCollection::open(store.clone(), DOC_HEAP, root),
+        None => DocCollection::create(store.clone(), DOC_HEAP).unwrap(),
+    };
     Models {
         sql: SqlEngine::new(store.clone(), txns.clone()),
-        docs: DocCollection::new(store, DOC_HEAP),
+        docs,
         kv,
         txns,
     }
@@ -138,7 +143,7 @@ fn doc_accts(m: &Models, reader: &TxnHandle, tag: &str) -> Vec<i64> {
 #[test]
 fn commit_is_atomic_across_all_three_models() {
     let tmp = TempDir::new("xmodel-commit").unwrap();
-    let m = open_models(&tmp, true, None, None);
+    let m = open_models(&tmp, true, None, None, None);
     m.sql
         .execute_autocommit("CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT)")
         .unwrap();
@@ -189,8 +194,8 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
     let tmp = TempDir::new("xmodel-crash").unwrap();
 
     // ---- Session 1: a committed cross-model txn, a loser, then a crash. ----
-    let kv_root = {
-        let m = open_models(&tmp, true, None, None);
+    let roots = {
+        let m = open_models(&tmp, true, None, None, None);
         m.sql
             .execute_autocommit("CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT)")
             .unwrap();
@@ -218,10 +223,11 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
         // best-effort abort, but it is never flushed — so the durable WAL ends
         // at T3's commit, with T2's data records present but T2 uncommitted: a
         // genuine mid-flight loser for recovery to neutralize.
-        let kv_root = m.kv.index_root();
+        let roots = (m.kv.index_root(), m.docs.index_root());
         let _ = &t2;
-        kv_root
+        roots
     };
+    let (kv_root, doc_root) = roots;
 
     // ---- Recover the heap from the WAL. ----
     let report = {
@@ -240,7 +246,7 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
     };
 
     // ---- Session 2: reopen seeded from recovery; verify every model. ----
-    let m = open_models(&tmp, false, Some(&report), Some(kv_root));
+    let m = open_models(&tmp, false, Some(&report), Some(kv_root), Some(doc_root));
     // Re-create the catalog so SELECT can find the table. The first table is
     // assigned heap 1000 again, matching the heap recovery rebuilt.
     m.sql

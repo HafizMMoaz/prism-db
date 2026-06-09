@@ -5,12 +5,13 @@
 //! the unified record store, so documents share MVCC, locking, recovery, and
 //! cross-model transactions with SQL and KV. See `docs/components/document-engine.md`.
 //!
-//! **Scope (this slice):** CRUD (`insert`/`find`/`update`/`delete`) over a
-//! sequential scan, with programmatically-built [`Filter`]s
-//! (eq/ne/gt/lt/gte/lte/in/nin/exists/and/or/not) and [`Update`] operators
-//! (`$set`/`$unset`/`$inc`) on top-level scalar fields. Deferred: nested/dotted
-//! paths, arrays/objects, field-path indexes (seq scan only), a JSON query
-//! parser (queries are built in Rust), and `_id`-index durability.
+//! **Scope (this slice):** CRUD (`insert`/`find`/`update`/`delete`) with
+//! programmatically-built [`Filter`]s (eq/ne/gt/lt/gte/lte/in/nin/exists/and/or/
+//! not) and [`Update`] operators (`$set`/`$unset`/`$inc`) on top-level scalar
+//! fields. Every collection has a durable B+tree index on `_id` (unique), so an
+//! `_id`-equality filter is an index seek; other filters use a sequential scan.
+//! Deferred: nested/dotted paths, arrays/objects, secondary field-path indexes,
+//! and a JSON query parser (queries are built in Rust).
 
 pub mod error;
 pub mod value;
@@ -21,8 +22,11 @@ pub use value::{DocValue, Document, ObjectId, doc_cmp};
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use prism_core::RecordId;
 use prism_core::store::{HeapId, RecordStore};
 use prism_core::txn::TxnHandle;
+use prism_index::BTree;
+use prism_storage::PageId;
 
 /// A query predicate over top-level fields.
 #[derive(Clone, Debug)]
@@ -149,19 +153,53 @@ impl Update {
     }
 }
 
-/// A collection of documents backed by one heap.
+/// A collection of documents backed by one heap, with a durable B+tree index on
+/// `_id` (the document primary key): `find`/`update`/`delete` with an
+/// `_id`-equality filter is an index seek instead of a full scan, and `_id` is
+/// unique. Other filters fall back to a sequential scan.
 pub struct DocCollection {
     store: Arc<RecordStore>,
     heap: HeapId,
+    id_index_root: PageId,
 }
 
 impl DocCollection {
-    /// Create a collection backed by `heap`.
-    pub fn new(store: Arc<RecordStore>, heap: HeapId) -> Self {
-        Self { store, heap }
+    /// Create a collection backed by `heap`, building a fresh `_id` index.
+    pub fn create(store: Arc<RecordStore>, heap: HeapId) -> Result<Self> {
+        let tree = BTree::create(store.buffer(), store.wal())?;
+        let id_index_root = tree.root_page();
+        Ok(Self {
+            store,
+            heap,
+            id_index_root,
+        })
+    }
+
+    /// Reopen a collection whose `_id` index is rooted at `index_root`.
+    pub fn open(store: Arc<RecordStore>, heap: HeapId, index_root: PageId) -> Self {
+        Self {
+            store,
+            heap,
+            id_index_root: index_root,
+        }
+    }
+
+    /// The `_id` index tree's (fixed) root page, for persistence by the catalog.
+    pub fn index_root(&self) -> PageId {
+        self.id_index_root
+    }
+
+    fn id_index(&self) -> BTree {
+        BTree::open(
+            self.store.buffer(),
+            self.store.wal(),
+            self.id_index_root,
+            usize::MAX,
+        )
     }
 
     /// Insert `doc`, assigning an `_id` `ObjectId` if absent. Returns the `_id`.
+    /// Rejects a duplicate `_id` visible to `txn`.
     pub fn insert_one(&self, txn: &TxnHandle, mut doc: Document) -> Result<DocValue> {
         let id = match doc.get("_id") {
             Some(existing) => existing.clone(),
@@ -171,7 +209,15 @@ impl DocCollection {
                 id
             }
         };
-        self.store.insert(txn, self.heap, &doc.encode()?)?;
+        let key = index_key(&id)?;
+        let tree = self.id_index();
+        if let Some(existing) = tree.search(&key)? {
+            if self.store.read(txn, existing)?.is_some() {
+                return Err(DocError::Constraint("duplicate _id".into()));
+            }
+        }
+        let rid = self.store.insert(txn, self.heap, &doc.encode()?)?;
+        tree.insert(&key, rid)?;
         Ok(id)
     }
 
@@ -182,6 +228,9 @@ impl DocCollection {
 
     /// All documents matching `filter`, visible to `txn`.
     pub fn find(&self, txn: &TxnHandle, filter: &Filter) -> Result<Vec<Document>> {
+        if let Some(id) = eq_id(filter) {
+            return Ok(self.seek_id(txn, id)?.map(|(_, d)| d).into_iter().collect());
+        }
         let mut out = Vec::new();
         for (_, payload) in self.store.scan(txn, self.heap)? {
             let doc = Document::decode(&payload)?;
@@ -194,6 +243,9 @@ impl DocCollection {
 
     /// The first document matching `filter`.
     pub fn find_one(&self, txn: &TxnHandle, filter: &Filter) -> Result<Option<Document>> {
+        if let Some(id) = eq_id(filter) {
+            return Ok(self.seek_id(txn, id)?.map(|(_, d)| d));
+        }
         for (_, payload) in self.store.scan(txn, self.heap)? {
             let doc = Document::decode(&payload)?;
             if filter.matches(&doc) {
@@ -201,6 +253,17 @@ impl DocCollection {
             }
         }
         Ok(None)
+    }
+
+    /// Seek the (unique) document whose `_id == id`, visible to `txn`.
+    fn seek_id(&self, txn: &TxnHandle, id: &DocValue) -> Result<Option<(RecordId, Document)>> {
+        let Some(rid) = self.id_index().search(&index_key(id)?)? else {
+            return Ok(None);
+        };
+        match self.store.read(txn, rid)? {
+            Some(payload) => Ok(Some((rid, Document::decode(&payload)?))),
+            None => Ok(None),
+        }
     }
 
     /// Apply `update` to documents matching `filter`. Returns the count modified.
@@ -212,6 +275,21 @@ impl DocCollection {
         update: &Update,
         one: bool,
     ) -> Result<u64> {
+        let tree = self.id_index();
+
+        // `_id` seek: at most one document.
+        if let Some(id) = eq_id(filter) {
+            return match self.seek_id(txn, id)? {
+                Some((rid, mut doc)) => {
+                    update.apply(&mut doc);
+                    let new_rid = self.store.update(txn, rid, &doc.encode()?)?;
+                    self.reindex(&tree, &doc, new_rid)?;
+                    Ok(1)
+                }
+                None => Ok(0),
+            };
+        }
+
         let mut modified = 0;
         for (rid, payload) in self.store.scan(txn, self.heap)? {
             let mut doc = Document::decode(&payload)?;
@@ -219,13 +297,22 @@ impl DocCollection {
                 continue;
             }
             update.apply(&mut doc);
-            self.store.update(txn, rid, &doc.encode()?)?;
+            let new_rid = self.store.update(txn, rid, &doc.encode()?)?;
+            self.reindex(&tree, &doc, new_rid)?;
             modified += 1;
             if one {
                 break;
             }
         }
         Ok(modified)
+    }
+
+    /// Repoint the `_id` index at a document's new version after an update.
+    fn reindex(&self, tree: &BTree, doc: &Document, new_rid: RecordId) -> Result<()> {
+        if let Some(id) = doc.get("_id") {
+            tree.insert(&index_key(id)?, new_rid)?;
+        }
+        Ok(())
     }
 
     /// Update the first matching document. Returns the count modified (0 or 1).
@@ -239,6 +326,18 @@ impl DocCollection {
     }
 
     fn delete_internal(&self, txn: &TxnHandle, filter: &Filter, one: bool) -> Result<u64> {
+        // `_id` seek: at most one document. The index entry is left in place; MVCC
+        // hides the deleted version from new snapshots (as in the KV engine).
+        if let Some(id) = eq_id(filter) {
+            return match self.seek_id(txn, id)? {
+                Some((rid, _)) => {
+                    self.store.delete(txn, rid)?;
+                    Ok(1)
+                }
+                None => Ok(0),
+            };
+        }
+
         let mut deleted = 0;
         for (rid, payload) in self.store.scan(txn, self.heap)? {
             let doc = Document::decode(&payload)?;
@@ -263,6 +362,53 @@ impl DocCollection {
     pub fn delete_many(&self, txn: &TxnHandle, filter: &Filter) -> Result<u64> {
         self.delete_internal(txn, filter, false)
     }
+}
+
+/// If `filter` is exactly `_id == <value>`, return that value for an index seek.
+fn eq_id(filter: &Filter) -> Option<&DocValue> {
+    match filter {
+        Filter::Eq(field, value) if field == "_id" => Some(value),
+        _ => None,
+    }
+}
+
+/// Encode a document value as a byte key for the `_id` B+tree, tagged by type so
+/// values of different types never collide. Integers are sign-flipped big-endian
+/// (order-preserving).
+fn index_key(value: &DocValue) -> Result<Vec<u8>> {
+    let mut key = Vec::with_capacity(16);
+    match value {
+        DocValue::Null => return Err(DocError::Constraint("_id cannot be null".into())),
+        DocValue::Bool(b) => {
+            key.push(0x01);
+            key.push(u8::from(*b));
+        }
+        DocValue::Int32(n) => {
+            key.push(0x02);
+            key.extend_from_slice(&(*n as u32 ^ (1u32 << 31)).to_be_bytes());
+        }
+        DocValue::Int64(n) => {
+            key.push(0x03);
+            key.extend_from_slice(&(*n as u64 ^ (1u64 << 63)).to_be_bytes());
+        }
+        DocValue::Double(d) => {
+            key.push(0x04);
+            key.extend_from_slice(&d.to_be_bytes());
+        }
+        DocValue::Str(s) => {
+            key.push(0x05);
+            key.extend_from_slice(s.as_bytes());
+        }
+        DocValue::Timestamp(t) => {
+            key.push(0x09);
+            key.extend_from_slice(&(*t as u64 ^ (1u64 << 63)).to_be_bytes());
+        }
+        DocValue::ObjectId(oid) => {
+            key.push(0x0A);
+            key.extend_from_slice(&oid.0);
+        }
+    }
+    Ok(key)
 }
 
 #[cfg(test)]
@@ -298,7 +444,7 @@ mod tests {
         let txns = Arc::new(TxnManager::new(wal.clone()));
         let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
         Env {
-            coll: DocCollection::new(store, HeapId(5000)),
+            coll: DocCollection::create(store, HeapId(5000)).unwrap(),
             txns,
             _tmp: tmp,
         }
@@ -321,6 +467,82 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].get("name"), Some(&DocValue::Str("alice".into())));
         assert_eq!(found[0].get("_id"), Some(&id));
+        t.commit().unwrap();
+    }
+
+    #[test]
+    fn id_index_seek_uniqueness_and_reindex() {
+        let env = env();
+        let t = env.txns.begin(TxnMode::ReadWrite);
+        let id1 = env
+            .coll
+            .insert_one(&t, doc(&[("name", DocValue::Str("a".into()))]))
+            .unwrap();
+        env.coll
+            .insert_one(&t, doc(&[("name", DocValue::Str("b".into()))]))
+            .unwrap();
+
+        // Seek by _id returns exactly that document.
+        let found = env
+            .coll
+            .find(&t, &Filter::Eq("_id".into(), id1.clone()))
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].get("name"), Some(&DocValue::Str("a".into())));
+        // A missing _id finds nothing.
+        assert!(
+            env.coll
+                .find(&t, &Filter::Eq("_id".into(), DocValue::Int64(999)))
+                .unwrap()
+                .is_empty()
+        );
+
+        // A custom, explicit _id is honored and must be unique.
+        let custom = DocValue::Int64(42);
+        env.coll
+            .insert_one(
+                &t,
+                doc(&[("_id", custom.clone()), ("x", DocValue::Int64(1))]),
+            )
+            .unwrap();
+        assert!(matches!(
+            env.coll.insert_one(
+                &t,
+                doc(&[("_id", custom.clone()), ("x", DocValue::Int64(2))])
+            ),
+            Err(DocError::Constraint(_))
+        ));
+
+        // Update via _id seek repoints the index at the new version.
+        let n = env
+            .coll
+            .update_one(
+                &t,
+                &Filter::Eq("_id".into(), custom.clone()),
+                &Update::new().set("x", DocValue::Int64(99)),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+        let after = env
+            .coll
+            .find_one(&t, &Filter::Eq("_id".into(), custom.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.get("x"), Some(&DocValue::Int64(99)));
+
+        // Delete via _id seek, then the seek finds nothing.
+        assert_eq!(
+            env.coll
+                .delete_one(&t, &Filter::Eq("_id".into(), id1.clone()))
+                .unwrap(),
+            1
+        );
+        assert!(
+            env.coll
+                .find(&t, &Filter::Eq("_id".into(), id1))
+                .unwrap()
+                .is_empty()
+        );
         t.commit().unwrap();
     }
 

@@ -66,7 +66,8 @@ pub struct Database {
     txns: Arc<TxnManager>,
     sql: SqlEngine,
     users: UserStore,
-    doc_heaps: Mutex<HashMap<String, HeapId>>,
+    /// Document collection name -> (heap, `_id` index root).
+    doc_heaps: Mutex<HashMap<String, (HeapId, PageId)>>,
     doc_next: AtomicU64,
     kv_namespaces: Mutex<HashMap<String, Arc<KvNamespace>>>,
     kv_next: AtomicU64,
@@ -165,22 +166,26 @@ impl Database {
         &self.sql
     }
 
-    /// A document collection by name, creating (and persisting) its heap on
-    /// first use.
+    /// A document collection by name, creating (and persisting) its heap and
+    /// `_id` index on first use.
     pub fn collection(&self, name: &str) -> Result<DocCollection> {
-        let heap = {
-            let mut map = self.doc_heaps.lock().expect("doc heap map poisoned");
-            match map.get(name) {
-                Some(h) => *h,
-                None => {
-                    let heap = HeapId(self.doc_next.fetch_add(1, Ordering::Relaxed));
-                    self.persist(ObjectKind::Collection, name, heap)?;
-                    map.insert(name.to_string(), heap);
-                    heap
-                }
-            }
-        };
-        Ok(DocCollection::new(self.store.clone(), heap))
+        let mut map = self.doc_heaps.lock().expect("doc heap map poisoned");
+        if let Some((heap, root)) = map.get(name) {
+            return Ok(DocCollection::open(self.store.clone(), *heap, *root));
+        }
+        let heap = HeapId(self.doc_next.fetch_add(1, Ordering::Relaxed));
+        let coll = DocCollection::create(self.store.clone(), heap)?;
+        let root = coll.index_root();
+        self.persist_entry(&CatalogEntry {
+            kind: ObjectKind::Collection,
+            name: name.to_string(),
+            heap: heap.0,
+            root_page: root.as_u64(),
+            primary_key: None,
+            columns: vec![],
+        })?;
+        map.insert(name.to_string(), (heap, root));
+        Ok(coll)
     }
 
     /// A KV namespace by name, creating (and persisting) it on first use. The
@@ -235,18 +240,6 @@ impl Database {
         Ok(())
     }
 
-    /// Write a (non-table, non-namespace) catalog entry.
-    fn persist(&self, kind: ObjectKind, name: &str, heap: HeapId) -> Result<()> {
-        self.persist_entry(&CatalogEntry {
-            kind,
-            name: name.to_string(),
-            heap: heap.0,
-            root_page: 0,
-            primary_key: None,
-            columns: vec![],
-        })
-    }
-
     /// Append `entry` to the catalog heap in its own committed transaction.
     fn persist_entry(&self, entry: &CatalogEntry) -> Result<()> {
         let bytes = entry.encode()?;
@@ -299,7 +292,7 @@ impl Database {
                     persisted.insert(entry.name);
                 }
                 ObjectKind::Collection => {
-                    doc_heaps.insert(entry.name, heap);
+                    doc_heaps.insert(entry.name, (heap, PageId(entry.root_page)));
                     next_doc = next_doc.max(entry.heap + 1);
                 }
                 ObjectKind::Namespace => {
