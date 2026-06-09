@@ -229,6 +229,60 @@ impl TxnManager {
         }
     }
 
+    /// Begin a transaction but return only its identity and snapshot, for a
+    /// caller that will drive it across several calls via [`resume`] /
+    /// [`commit_txn`] / [`abort_txn`] rather than holding a [`TxnHandle`] (whose
+    /// lifetime is tied to this manager and which aborts on drop). A server
+    /// session uses this for an explicit, multi-request transaction.
+    ///
+    /// [`resume`]: TxnManager::resume
+    /// [`commit_txn`]: TxnManager::commit_txn
+    /// [`abort_txn`]: TxnManager::abort_txn
+    pub fn begin_detached(&self, mode: TxnMode) -> (TxnId, Snapshot) {
+        let handle = self.begin(mode);
+        let id = handle.txn_id;
+        let snapshot = handle.snapshot.clone();
+        // The caller now owns the lifecycle; suppress the drop-abort.
+        handle.finished.set(true);
+        (id, snapshot)
+    }
+
+    /// Rematerialize a transient [`TxnHandle`] for a transaction already begun
+    /// with [`begin_detached`], to run one statement. It does **not** allocate a
+    /// new id/snapshot and does **not** abort on drop; after the statement, read
+    /// [`TxnHandle::last_lsn`] back into the session so the `prev_lsn` chain
+    /// continues across statements.
+    ///
+    /// [`begin_detached`]: TxnManager::begin_detached
+    pub fn resume(
+        &self,
+        txn_id: TxnId,
+        mode: TxnMode,
+        snapshot: Snapshot,
+        last_lsn: Lsn,
+    ) -> TxnHandle<'_> {
+        TxnHandle {
+            manager: self,
+            txn_id,
+            mode,
+            snapshot,
+            last_lsn: Cell::new(last_lsn),
+            finished: Cell::new(true), // transient: dropping must not abort
+        }
+    }
+
+    /// Commit a transaction by id (the detached-lifecycle counterpart to
+    /// [`TxnHandle::commit`]).
+    pub fn commit_txn(&self, txn_id: TxnId, mode: TxnMode, last_lsn: Lsn) -> Result<()> {
+        self.commit_internal(txn_id, mode, last_lsn)
+    }
+
+    /// Abort a transaction by id (the detached-lifecycle counterpart to
+    /// [`TxnHandle::abort`]).
+    pub fn abort_txn(&self, txn_id: TxnId, mode: TxnMode, last_lsn: Lsn) -> Result<()> {
+        self.abort_internal(txn_id, mode, last_lsn)
+    }
+
     fn commit_internal(&self, txn_id: TxnId, mode: TxnMode, last_lsn: Lsn) -> Result<()> {
         match mode {
             TxnMode::ReadWrite => {
@@ -424,6 +478,28 @@ mod tests {
         }
         assert_eq!(mgr.commit_status(id), CommitStatus::Aborted);
         // No longer active.
+        assert!(!mgr.active.lock().unwrap().contains(&id));
+    }
+
+    #[test]
+    fn detached_lifecycle_commits_across_resumes() {
+        let (_t, _w, mgr) = manager();
+        // Begin detached (no live handle), then "run two statements" by resuming.
+        let (id, snap) = mgr.begin_detached(TxnMode::ReadWrite);
+        let mut last = Lsn::ZERO;
+        for _ in 0..2 {
+            let h = mgr.resume(id, TxnMode::ReadWrite, snap.clone(), last);
+            assert_eq!(h.id(), id);
+            // A resumed handle must not abort on drop.
+            last = h.last_lsn();
+        }
+        // Still in progress until we explicitly commit.
+        assert_eq!(mgr.commit_status(id), CommitStatus::InProgress);
+        mgr.commit_txn(id, TxnMode::ReadWrite, last).unwrap();
+        assert!(matches!(
+            mgr.commit_status(id),
+            CommitStatus::Committed { .. }
+        ));
         assert!(!mgr.active.lock().unwrap().contains(&id));
     }
 

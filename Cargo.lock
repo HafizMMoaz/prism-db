@@ -317,6 +317,7 @@ dependencies = [
  "prism-storage",
  "prism-testkit",
  "prism-wal",
+ "thiserror",
 ]
 
 [[package]]

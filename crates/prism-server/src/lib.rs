@@ -1,9 +1,25 @@
-//! `prism-server` — the server, and the embedded in-process API.
+//! `prism-server` — the server and the embedded in-process API.
 //!
-//! TCP listener with TLS, connection state machine, authentication, the query
-//! dispatcher (routes to the SQL/document/KV engine by request type), and
-//! implicit/explicit transaction handling. The library form exposes an
-//! in-process API for embedded use and for `prism-bench`. See
+//! This crate is the boundary between the wire protocol and the cross-model
+//! engine. [`Database`] assembles the shared storage stack (disk, WAL, buffer
+//! pool, transaction manager, record store) and the three engines on top of it;
+//! [`Session`] is the per-connection state machine that decodes a
+//! [`prism_protocol::Message`], runs it against the right engine in the session's
+//! transaction (explicit or implicit), and produces the response. Because all
+//! three engines share one store and one transaction manager, a single session
+//! transaction spans SQL, document, and KV atomically. See
 //! `docs/components/network-server.md`.
 //!
-//! Status: skeleton (Phase 4 / M4 not yet started).
+//! **Status (Phase 4 / M4, in progress):** the synchronous, in-process
+//! dispatcher — the embedded API, and the core the network layer will wrap. The
+//! Tokio TCP listener, TLS, authentication, idempotency, and cancellation are a
+//! follow-up increment; see [`Session`] for the per-request simplifications in
+//! this slice.
+
+pub mod database;
+pub mod error;
+pub mod session;
+
+pub use database::{Config, Database};
+pub use error::{Result, ServerError};
+pub use session::Session;

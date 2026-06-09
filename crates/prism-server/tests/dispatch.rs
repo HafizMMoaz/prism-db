@@ -1,0 +1,365 @@
+//! End-to-end tests for the in-process dispatcher: protocol messages in,
+//! protocol messages out, against a real shared engine — including a single
+//! explicit transaction that spans all three models.
+
+use std::sync::Arc;
+
+use prism_doc::{DocValue, Document};
+use prism_protocol::{
+    AuthMechanism, DocCommand, KvCommand, KvResultBody, Message, TxnMode, Value as WireValue,
+};
+use prism_server::{Database, Session};
+use prism_testkit::TempDir;
+
+fn database() -> (Arc<Database>, TempDir) {
+    let tmp = TempDir::new("server").unwrap();
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    (db, tmp)
+}
+
+// ---- response accessors ------------------------------------------------------
+
+fn sql_select(msg: Message) -> Vec<Vec<Option<WireValue>>> {
+    match msg {
+        Message::SqlResult {
+            status,
+            rows,
+            error,
+            ..
+        } => {
+            assert_eq!(status, 0, "sql error: {error:?}");
+            rows
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+fn sql_affected(msg: Message) -> u64 {
+    match msg {
+        Message::SqlResult {
+            status,
+            affected_rows,
+            error,
+            ..
+        } => {
+            assert_eq!(status, 0, "sql error: {error:?}");
+            affected_rows
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+fn kv_value(msg: Message) -> Option<Vec<u8>> {
+    match msg {
+        Message::KvResult {
+            status,
+            body: KvResultBody::Get { value },
+            error,
+        } => {
+            assert_eq!(status, 0, "kv error: {error:?}");
+            value
+        }
+        other => panic!("expected KvResult/Get, got {other:?}"),
+    }
+}
+
+fn doc_results(msg: Message) -> Vec<Document> {
+    match msg {
+        Message::DocResult {
+            status,
+            docs,
+            error,
+            ..
+        } => {
+            assert_eq!(status, 0, "doc error: {error:?}");
+            docs.iter().map(|b| Document::decode(b).unwrap()).collect()
+        }
+        other => panic!("expected DocResult, got {other:?}"),
+    }
+}
+
+fn txn_ok(msg: Message) -> u64 {
+    match msg {
+        Message::TxnAck {
+            status,
+            txn_id,
+            error,
+            ..
+        } => {
+            assert_eq!(status, 0, "txn error: {error:?}");
+            txn_id
+        }
+        other => panic!("expected TxnAck, got {other:?}"),
+    }
+}
+
+// ---- message builders --------------------------------------------------------
+
+fn sql(s: &str) -> Message {
+    Message::SqlExecute {
+        sql: s.into(),
+        params: vec![],
+        options: 1,
+    }
+}
+
+fn doc_insert(collection: &str, fields: &[(&str, DocValue)]) -> Message {
+    let doc = Document::from_fields(fields.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    Message::DocOp {
+        collection: collection.into(),
+        command: DocCommand::InsertOne(doc.encode().unwrap()),
+    }
+}
+
+fn doc_find(collection: &str, query: &[(&str, DocValue)]) -> Message {
+    let q = Document::from_fields(query.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    Message::DocOp {
+        collection: collection.into(),
+        command: DocCommand::Find {
+            query: q.encode().unwrap(),
+            options: vec![],
+        },
+    }
+}
+
+fn kv_put(ns: &str, key: &[u8], value: &[u8]) -> Message {
+    Message::KvOp {
+        namespace: ns.into(),
+        command: KvCommand::Put {
+            key: key.to_vec(),
+            value: value.to_vec(),
+        },
+    }
+}
+
+fn kv_get(ns: &str, key: &[u8]) -> Message {
+    Message::KvOp {
+        namespace: ns.into(),
+        command: KvCommand::Get { key: key.to_vec() },
+    }
+}
+
+// ---- tests -------------------------------------------------------------------
+
+#[test]
+fn handshake_and_ping() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    assert!(matches!(
+        s.handle(Message::Hello {
+            protocol_version: prism_protocol::PROTOCOL_VERSION,
+            client_name: "test".into(),
+            client_version: "0".into(),
+            features: 0,
+        }),
+        Message::HelloAck { status: 0, .. }
+    ));
+    assert!(matches!(
+        s.handle(Message::Auth {
+            mechanism: AuthMechanism::Password,
+            username: "admin".into(),
+            password: "x".into(),
+        }),
+        Message::AuthAck { status: 0, .. }
+    ));
+    assert!(matches!(s.handle(Message::Ping), Message::Pong));
+}
+
+#[test]
+fn sql_auto_commit_roundtrip() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    s.handle(sql("CREATE TABLE users (id BIGINT NOT NULL, name TEXT)"));
+    assert_eq!(
+        sql_affected(s.handle(sql("INSERT INTO users VALUES (1,'alice'),(2,'bob')"))),
+        2
+    );
+    let rows = sql_select(s.handle(sql("SELECT id, name FROM users WHERE id = 1")));
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some(WireValue::Int64(1)),
+            Some(WireValue::Str("alice".into()))
+        ]]
+    );
+}
+
+#[test]
+fn kv_auto_commit_roundtrip() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    assert!(matches!(
+        s.handle(kv_put("sessions", b"sid", b"payload")),
+        Message::KvResult {
+            status: 0,
+            body: KvResultBody::Put,
+            ..
+        }
+    ));
+    assert_eq!(
+        kv_value(s.handle(kv_get("sessions", b"sid"))).as_deref(),
+        Some(&b"payload"[..])
+    );
+    assert_eq!(kv_value(s.handle(kv_get("sessions", b"missing"))), None);
+}
+
+#[test]
+fn doc_auto_commit_roundtrip() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    s.handle(doc_insert(
+        "people",
+        &[
+            ("name", DocValue::Str("alice".into())),
+            ("age", DocValue::Int64(30)),
+        ],
+    ));
+    s.handle(doc_insert(
+        "people",
+        &[
+            ("name", DocValue::Str("bob".into())),
+            ("age", DocValue::Int64(25)),
+        ],
+    ));
+
+    let found = doc_results(s.handle(doc_find(
+        "people",
+        &[("name", DocValue::Str("alice".into()))],
+    )));
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].get("age"), Some(&DocValue::Int64(30)));
+
+    // Empty query matches all.
+    let all = doc_results(s.handle(doc_find("people", &[])));
+    assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn explicit_transaction_spans_all_three_models() {
+    let (db, _tmp) = database();
+    let mut writer = Session::new(db.clone());
+
+    // Set up the SQL table (auto-commit), then run one explicit transaction that
+    // writes to SQL, document, and KV together.
+    writer.handle(sql(
+        "CREATE TABLE accounts (id BIGINT NOT NULL, owner TEXT)",
+    ));
+
+    txn_ok(writer.handle(Message::Begin {
+        mode: TxnMode::ReadWrite,
+    }));
+    assert!(writer.in_transaction());
+    sql_affected(writer.handle(sql("INSERT INTO accounts VALUES (1,'alice')")));
+    writer.handle(doc_insert("audit", &[("acct", DocValue::Int64(1))]));
+    writer.handle(kv_put("balances", b"acct:1", b"100"));
+
+    // Before commit, a separate session sees none of it.
+    let mut reader = Session::new(db.clone());
+    assert!(sql_select(reader.handle(sql("SELECT id FROM accounts"))).is_empty());
+    assert_eq!(kv_value(reader.handle(kv_get("balances", b"acct:1"))), None);
+    assert!(doc_results(reader.handle(doc_find("audit", &[]))).is_empty());
+
+    txn_ok(writer.handle(Message::Commit { idempotency_key: 0 }));
+    assert!(!writer.in_transaction());
+
+    // After commit, a fresh reader sees all three writes.
+    let mut after = Session::new(db);
+    assert_eq!(
+        sql_select(after.handle(sql("SELECT id FROM accounts"))).len(),
+        1
+    );
+    assert_eq!(
+        kv_value(after.handle(kv_get("balances", b"acct:1"))).as_deref(),
+        Some(&b"100"[..])
+    );
+    assert_eq!(doc_results(after.handle(doc_find("audit", &[]))).len(), 1);
+}
+
+#[test]
+fn aborted_transaction_leaves_no_trace_in_any_model() {
+    let (db, _tmp) = database();
+    let mut writer = Session::new(db.clone());
+    writer.handle(sql("CREATE TABLE t (id BIGINT NOT NULL)"));
+
+    writer.handle(Message::Begin {
+        mode: TxnMode::ReadWrite,
+    });
+    sql_affected(writer.handle(sql("INSERT INTO t VALUES (99)")));
+    writer.handle(doc_insert("scratch", &[("v", DocValue::Int64(99))]));
+    writer.handle(kv_put("scratch", b"k", b"v"));
+    txn_ok(writer.handle(Message::Abort));
+
+    let mut reader = Session::new(db);
+    assert!(sql_select(reader.handle(sql("SELECT id FROM t"))).is_empty());
+    assert_eq!(kv_value(reader.handle(kv_get("scratch", b"k"))), None);
+    assert!(doc_results(reader.handle(doc_find("scratch", &[]))).is_empty());
+}
+
+#[test]
+fn errors_are_reported_with_a_trailer() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    // SELECT from a missing table.
+    match s.handle(sql("SELECT * FROM nope")) {
+        Message::SqlResult { status, error, .. } => {
+            assert_ne!(status, 0);
+            assert!(error.is_some(), "error trailer present");
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+
+    // SQL params are not yet supported.
+    let with_param = Message::SqlExecute {
+        sql: "SELECT 1".into(),
+        params: vec![WireValue::Int64(1)],
+        options: 0,
+    };
+    assert!(matches!(
+        s.handle(with_param),
+        Message::SqlResult { status: 1, .. }
+    ));
+
+    // KV range is unsupported on a hash namespace.
+    let range = Message::KvOp {
+        namespace: "n".into(),
+        command: KvCommand::Range {
+            start: b"a".to_vec(),
+            end: b"z".to_vec(),
+            max_results: 10,
+        },
+    };
+    assert!(matches!(
+        s.handle(range),
+        Message::KvResult { status: 1, .. }
+    ));
+}
+
+#[test]
+fn cannot_begin_twice_or_commit_without_a_transaction() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    // Commit with no open transaction → error.
+    assert!(matches!(
+        s.handle(Message::Commit { idempotency_key: 0 }),
+        Message::TxnAck { status: 1, .. }
+    ));
+
+    txn_ok(s.handle(Message::Begin {
+        mode: TxnMode::ReadWrite,
+    }));
+    // A second Begin while one is open → error, and the first stays open.
+    assert!(matches!(
+        s.handle(Message::Begin {
+            mode: TxnMode::ReadWrite
+        }),
+        Message::TxnAck { status: 1, .. }
+    ));
+    assert!(s.in_transaction());
+    txn_ok(s.handle(Message::Abort));
+}

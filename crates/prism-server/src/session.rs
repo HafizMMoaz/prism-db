@@ -1,0 +1,544 @@
+//! The per-connection session: the transaction state machine and the request
+//! dispatcher that turns a [`Message`] into engine calls and a response.
+//!
+//! A session has at most one open transaction. A query with no open transaction
+//! runs in its own implicit transaction (begin → run → commit); a `Begin` starts
+//! an explicit transaction that subsequent requests run in until `Commit`/
+//! `Abort`. This is the single point where the wire protocol meets the
+//! cross-model engine.
+//!
+//! **Documented simplifications (this increment):**
+//! - SQL parameters are not yet bound (`SqlExecute.params` must be empty; use
+//!   literals). `TxnAck.commit_lsn` is reported as 0.
+//! - Document queries are flat field-equality (`{a: 1, b: 2}` ⇒ `a = 1 AND
+//!   b = 2`; empty ⇒ match all); a flat update document is an implicit `$set` of
+//!   each field. Query operators (`$gt`, …) and update operators (`$inc`, …)
+//!   over the wire await nested-document support in `prism-doc`.
+//! - KV `range`/`scan` are unsupported on the hash namespace.
+//! - `Hello`/`Auth` are accepted unconditionally (authentication is deferred).
+
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use prism_core::TxnId;
+use prism_core::txn::{Snapshot, TxnHandle, TxnMode};
+use prism_doc::{DocCollection, DocValue, Document, Filter, Update};
+use prism_kv::KvNamespace;
+use prism_protocol::{
+    ColumnDesc, DocCommand, KvCommand, KvResultBody, Message, NoticeSeverity, Packet, Row,
+    TxnMode as WireTxnMode, Value as WireValue,
+};
+use prism_sql::{Outcome, Value as SqlValue};
+use prism_wal::Lsn;
+
+use crate::database::Database;
+use crate::error::{Result, ServerError};
+
+const SERVER_VERSION: &str = concat!("prism ", env!("CARGO_PKG_VERSION"));
+
+/// The transaction state of a session.
+enum SessionTxn {
+    /// No open transaction; queries auto-commit.
+    None,
+    /// An explicit transaction is open, driven across requests via the detached
+    /// transaction lifecycle (`begin_detached`/`resume`/`commit_txn`).
+    Explicit {
+        txn_id: TxnId,
+        mode: TxnMode,
+        snapshot: Snapshot,
+        last_lsn: Lsn,
+    },
+}
+
+/// A client session over a shared [`Database`].
+pub struct Session {
+    db: Arc<Database>,
+    txn: SessionTxn,
+}
+
+impl Session {
+    /// Open a new session on `db`.
+    pub fn new(db: Arc<Database>) -> Self {
+        Self {
+            db,
+            txn: SessionTxn::None,
+        }
+    }
+
+    /// Whether an explicit transaction is currently open.
+    pub fn in_transaction(&self) -> bool {
+        matches!(self.txn, SessionTxn::Explicit { .. })
+    }
+
+    /// Handle one request packet, echoing the `request_id` on the response.
+    pub fn handle_packet(&mut self, request: Packet) -> Packet {
+        Packet::new(request.request_id, self.handle(request.message))
+    }
+
+    /// Handle one request message and produce the response message.
+    pub fn handle(&mut self, request: Message) -> Message {
+        match request {
+            Message::Hello { .. } => Message::HelloAck {
+                status: 0,
+                server_version: SERVER_VERSION.to_string(),
+                features: 0,
+                session_id: new_session_id(),
+                error: None,
+            },
+            Message::Auth { .. } => Message::AuthAck {
+                status: 0,
+                user_oid: 1,
+                error: None,
+            },
+            Message::Ping => Message::Pong,
+            Message::Begin { mode } => self.begin(mode),
+            Message::Commit { .. } => self.commit(),
+            Message::Abort => self.abort(),
+            Message::SqlExecute {
+                sql,
+                params,
+                options: _,
+            } => self.run_sql(sql, params),
+            Message::DocOp {
+                collection,
+                command,
+            } => self.run_doc(collection, command),
+            Message::KvOp { namespace, command } => self.run_kv(namespace, command),
+            other => Message::Notice {
+                severity: NoticeSeverity::Error,
+                code: 0x0001,
+                message: format!(
+                    "unexpected message type {:?} from client",
+                    other.message_type()
+                ),
+            },
+        }
+    }
+
+    // ---- transaction control -------------------------------------------------
+
+    fn begin(&mut self, mode: WireTxnMode) -> Message {
+        if let SessionTxn::Explicit { txn_id, .. } = self.txn {
+            return txn_ack_err(
+                txn_id,
+                &ServerError::State("a transaction is already open".into()),
+            );
+        }
+        let mode = core_mode(mode);
+        let (txn_id, snapshot) = self.db.txns().begin_detached(mode);
+        self.txn = SessionTxn::Explicit {
+            txn_id,
+            mode,
+            snapshot,
+            last_lsn: Lsn::ZERO,
+        };
+        Message::TxnAck {
+            status: 0,
+            txn_id,
+            commit_lsn: 0,
+            error: None,
+        }
+    }
+
+    fn commit(&mut self) -> Message {
+        match std::mem::replace(&mut self.txn, SessionTxn::None) {
+            SessionTxn::Explicit {
+                txn_id,
+                mode,
+                last_lsn,
+                ..
+            } => match self.db.txns().commit_txn(txn_id, mode, last_lsn) {
+                Ok(()) => Message::TxnAck {
+                    status: 0,
+                    txn_id,
+                    commit_lsn: 0, // reported as 0 this increment
+                    error: None,
+                },
+                Err(e) => txn_ack_err(txn_id, &ServerError::from(e)),
+            },
+            SessionTxn::None => {
+                txn_ack_err(0, &ServerError::State("no transaction to commit".into()))
+            }
+        }
+    }
+
+    fn abort(&mut self) -> Message {
+        match std::mem::replace(&mut self.txn, SessionTxn::None) {
+            SessionTxn::Explicit {
+                txn_id,
+                mode,
+                last_lsn,
+                ..
+            } => match self.db.txns().abort_txn(txn_id, mode, last_lsn) {
+                Ok(()) => Message::TxnAck {
+                    status: 0,
+                    txn_id,
+                    commit_lsn: 0,
+                    error: None,
+                },
+                Err(e) => txn_ack_err(txn_id, &ServerError::from(e)),
+            },
+            SessionTxn::None => {
+                txn_ack_err(0, &ServerError::State("no transaction to abort".into()))
+            }
+        }
+    }
+
+    /// Run `f` in the current transaction: the open explicit one (resumed), or a
+    /// fresh implicit one that auto-commits. On error inside an explicit
+    /// transaction the whole transaction is aborted (Postgres-style).
+    fn in_txn<R>(&mut self, f: impl FnOnce(&TxnHandle) -> Result<R>) -> Result<R> {
+        let txns = self.db.txns();
+        // Snapshot the explicit-txn state into locals so we don't hold a borrow
+        // of `self.txn` while we later mutate it.
+        let explicit = if let SessionTxn::Explicit {
+            txn_id,
+            mode,
+            snapshot,
+            last_lsn,
+        } = &self.txn
+        {
+            Some((*txn_id, *mode, snapshot.clone(), *last_lsn))
+        } else {
+            None
+        };
+
+        match explicit {
+            Some((txn_id, mode, snapshot, last_lsn)) => {
+                let handle = txns.resume(txn_id, mode, snapshot, last_lsn);
+                let result = f(&handle);
+                let new_last = handle.last_lsn();
+                drop(handle); // transient: does not abort
+                match result {
+                    Ok(value) => {
+                        if let SessionTxn::Explicit { last_lsn, .. } = &mut self.txn {
+                            *last_lsn = new_last;
+                        }
+                        Ok(value)
+                    }
+                    Err(e) => {
+                        // A failed statement rolls back the whole transaction.
+                        let _ = txns.abort_txn(txn_id, mode, new_last);
+                        self.txn = SessionTxn::None;
+                        Err(e)
+                    }
+                }
+            }
+            None => {
+                let handle = txns.begin(TxnMode::ReadWrite);
+                match f(&handle) {
+                    Ok(value) => {
+                        handle.commit()?;
+                        Ok(value)
+                    }
+                    Err(e) => {
+                        let _ = handle.abort();
+                        Err(e)
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- SQL -----------------------------------------------------------------
+
+    fn run_sql(&mut self, sql: String, params: Vec<WireValue>) -> Message {
+        if !params.is_empty() {
+            return sql_result_err(&ServerError::Unsupported(
+                "SQL parameters are not yet supported; use literals".into(),
+            ));
+        }
+        let db = self.db.clone();
+        match self.in_txn(|txn| db.sql().execute(txn, &sql).map_err(ServerError::from)) {
+            Ok(outcome) => outcome_to_sql_result(outcome),
+            Err(e) => sql_result_err(&e),
+        }
+    }
+
+    // ---- document ------------------------------------------------------------
+
+    fn run_doc(&mut self, collection: String, command: DocCommand) -> Message {
+        let coll = self.db.collection(&collection);
+        match self.in_txn(|txn| dispatch_doc(&coll, txn, command)) {
+            Ok(out) => Message::DocResult {
+                status: 0,
+                affected: out.affected,
+                inserted_ids: out.inserted_ids,
+                docs: out.docs,
+                more_frames: false,
+                error: None,
+            },
+            Err(e) => doc_result_err(&e),
+        }
+    }
+
+    // ---- KV ------------------------------------------------------------------
+
+    fn run_kv(&mut self, namespace: String, command: KvCommand) -> Message {
+        let ns = self.db.kv_namespace(&namespace);
+        let shape = empty_kv_body(&command);
+        match self.in_txn(|txn| dispatch_kv(&ns, txn, command)) {
+            Ok(body) => Message::KvResult {
+                status: 0,
+                body,
+                error: None,
+            },
+            Err(e) => Message::KvResult {
+                status: 1,
+                body: shape,
+                error: Some(e.to_error_info()),
+            },
+        }
+    }
+}
+
+// ---- request dispatch helpers ------------------------------------------------
+
+/// What an executed document op produced.
+struct DocOutcome {
+    affected: u64,
+    inserted_ids: Vec<[u8; 12]>,
+    docs: Vec<Vec<u8>>,
+}
+
+fn dispatch_doc(coll: &DocCollection, txn: &TxnHandle, command: DocCommand) -> Result<DocOutcome> {
+    Ok(match command {
+        DocCommand::InsertOne(bytes) => {
+            let id = coll.insert_one(txn, Document::decode(&bytes)?)?;
+            DocOutcome {
+                affected: 1,
+                inserted_ids: id_bytes(&id).into_iter().collect(),
+                docs: vec![],
+            }
+        }
+        DocCommand::InsertMany(list) => {
+            let docs = list
+                .iter()
+                .map(|b| Document::decode(b))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let ids = coll.insert_many(txn, docs)?;
+            DocOutcome {
+                affected: ids.len() as u64,
+                inserted_ids: ids.iter().filter_map(id_bytes).collect(),
+                docs: vec![],
+            }
+        }
+        DocCommand::Find { query, .. } => {
+            let found = coll.find(txn, &query_to_filter(&query)?)?;
+            DocOutcome {
+                affected: found.len() as u64,
+                inserted_ids: vec![],
+                docs: encode_docs(&found)?,
+            }
+        }
+        DocCommand::FindOne { query, .. } => {
+            let found = coll.find_one(txn, &query_to_filter(&query)?)?;
+            let docs = match found {
+                Some(d) => vec![d.encode()?],
+                None => vec![],
+            };
+            DocOutcome {
+                affected: docs.len() as u64,
+                inserted_ids: vec![],
+                docs,
+            }
+        }
+        DocCommand::UpdateOne { query, update, .. } => {
+            let n = coll.update_one(txn, &query_to_filter(&query)?, &update_to_update(&update)?)?;
+            count_outcome(n)
+        }
+        DocCommand::UpdateMany { query, update, .. } => {
+            let n =
+                coll.update_many(txn, &query_to_filter(&query)?, &update_to_update(&update)?)?;
+            count_outcome(n)
+        }
+        DocCommand::DeleteOne { query, .. } => {
+            count_outcome(coll.delete_one(txn, &query_to_filter(&query)?)?)
+        }
+        DocCommand::DeleteMany { query, .. } => {
+            count_outcome(coll.delete_many(txn, &query_to_filter(&query)?)?)
+        }
+    })
+}
+
+fn count_outcome(n: u64) -> DocOutcome {
+    DocOutcome {
+        affected: n,
+        inserted_ids: vec![],
+        docs: vec![],
+    }
+}
+
+fn dispatch_kv(ns: &KvNamespace, txn: &TxnHandle, command: KvCommand) -> Result<KvResultBody> {
+    Ok(match command {
+        KvCommand::Get { key } => KvResultBody::Get {
+            value: ns.get(txn, &key)?,
+        },
+        KvCommand::Put { key, value } => {
+            ns.put(txn, &key, &value)?;
+            KvResultBody::Put
+        }
+        KvCommand::Delete { key } => {
+            ns.delete(txn, &key)?;
+            KvResultBody::Delete
+        }
+        KvCommand::Range { .. } | KvCommand::Scan { .. } => {
+            return Err(ServerError::Unsupported(
+                "range/scan is not supported on a hash namespace".into(),
+            ));
+        }
+    })
+}
+
+/// A default result body matching `command`'s op type, for error responses
+/// (which still echo the op type).
+fn empty_kv_body(command: &KvCommand) -> KvResultBody {
+    match command {
+        KvCommand::Get { .. } => KvResultBody::Get { value: None },
+        KvCommand::Put { .. } => KvResultBody::Put,
+        KvCommand::Delete { .. } => KvResultBody::Delete,
+        KvCommand::Range { .. } => KvResultBody::Range {
+            entries: vec![],
+            more_frames: false,
+        },
+        KvCommand::Scan { .. } => KvResultBody::Scan {
+            entries: vec![],
+            more_frames: false,
+        },
+    }
+}
+
+// ---- value / outcome mapping -------------------------------------------------
+
+fn outcome_to_sql_result(outcome: Outcome) -> Message {
+    let (affected_rows, columns, rows) = match outcome {
+        Outcome::CreateTable => (0, vec![], vec![]),
+        Outcome::Insert { count } => (count as u64, vec![], vec![]),
+        Outcome::Select { columns, rows } => {
+            let wire_rows: Vec<Row> = rows
+                .iter()
+                .map(|r| r.iter().map(sql_cell).collect())
+                .collect();
+            let descs = columns
+                .iter()
+                .enumerate()
+                .map(|(i, name)| ColumnDesc {
+                    name: name.clone(),
+                    type_tag: infer_column_tag(&wire_rows, i),
+                    nullable: true,
+                })
+                .collect();
+            (0, descs, wire_rows)
+        }
+    };
+    Message::SqlResult {
+        status: 0,
+        affected_rows,
+        columns,
+        rows,
+        more_frames: false,
+        error: None,
+    }
+}
+
+fn sql_cell(v: &SqlValue) -> Option<WireValue> {
+    match v {
+        SqlValue::Null => None,
+        SqlValue::Bool(b) => Some(WireValue::Bool(*b)),
+        SqlValue::Int64(n) => Some(WireValue::Int64(*n)),
+        SqlValue::Text(s) => Some(WireValue::Str(s.clone())),
+    }
+}
+
+/// The column's wire type tag, taken from the first non-null cell (all non-null
+/// cells in a SQL column share a type); 0x00 if the column is entirely null.
+fn infer_column_tag(rows: &[Row], col: usize) -> u8 {
+    rows.iter()
+        .find_map(|r| r[col].as_ref().map(WireValue::type_tag))
+        .unwrap_or(0x00)
+}
+
+fn id_bytes(id: &DocValue) -> Option<[u8; 12]> {
+    match id {
+        DocValue::ObjectId(oid) => Some(oid.0),
+        _ => None,
+    }
+}
+
+fn encode_docs(docs: &[Document]) -> Result<Vec<Vec<u8>>> {
+    docs.iter()
+        .map(|d| d.encode().map_err(ServerError::from))
+        .collect()
+}
+
+/// Compile a flat query document into an AND of field-equality filters.
+fn query_to_filter(bytes: &[u8]) -> Result<Filter> {
+    let query = Document::decode(bytes)?;
+    let subs: Vec<Filter> = query
+        .iter()
+        .map(|(k, v)| Filter::Eq(k.to_string(), v.clone()))
+        .collect();
+    Ok(if subs.is_empty() {
+        Filter::All
+    } else {
+        Filter::And(subs)
+    })
+}
+
+/// Compile a flat update document into an implicit `$set` of each field.
+fn update_to_update(bytes: &[u8]) -> Result<Update> {
+    let doc = Document::decode(bytes)?;
+    let mut update = Update::new();
+    for (k, v) in doc.iter() {
+        update = update.set(k.to_string(), v.clone());
+    }
+    Ok(update)
+}
+
+// ---- response builders for errors --------------------------------------------
+
+fn sql_result_err(e: &ServerError) -> Message {
+    Message::SqlResult {
+        status: 1,
+        affected_rows: 0,
+        columns: vec![],
+        rows: vec![],
+        more_frames: false,
+        error: Some(e.to_error_info()),
+    }
+}
+
+fn doc_result_err(e: &ServerError) -> Message {
+    Message::DocResult {
+        status: 1,
+        affected: 0,
+        inserted_ids: vec![],
+        docs: vec![],
+        more_frames: false,
+        error: Some(e.to_error_info()),
+    }
+}
+
+fn txn_ack_err(txn_id: TxnId, e: &ServerError) -> Message {
+    Message::TxnAck {
+        status: 1,
+        txn_id,
+        commit_lsn: 0,
+        error: Some(e.to_error_info()),
+    }
+}
+
+fn core_mode(mode: WireTxnMode) -> TxnMode {
+    match mode {
+        WireTxnMode::ReadWrite => TxnMode::ReadWrite,
+        WireTxnMode::ReadOnly => TxnMode::ReadOnly,
+    }
+}
+
+fn new_session_id() -> u128 {
+    // A best-effort unique id (time-based); replaced by a CSPRNG when auth lands.
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
