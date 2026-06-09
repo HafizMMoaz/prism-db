@@ -217,7 +217,7 @@ impl Session {
         match request {
             Message::Ping => Message::Pong,
             Message::Begin { mode } => self.begin(mode),
-            Message::Commit { .. } => self.commit(),
+            Message::Commit { idempotency_key } => self.commit(idempotency_key),
             Message::Abort => self.abort(),
             Message::SqlExecute {
                 sql,
@@ -265,25 +265,46 @@ impl Session {
         }
     }
 
-    fn commit(&mut self) -> Message {
-        match std::mem::replace(&mut self.txn, SessionTxn::None) {
+    fn commit(&mut self, idempotency_key: u128) -> Message {
+        let (txn_id, mode, last_lsn) = match std::mem::replace(&mut self.txn, SessionTxn::None) {
             SessionTxn::Explicit {
                 txn_id,
                 mode,
                 last_lsn,
                 ..
-            } => match self.db.txns().commit_txn(txn_id, mode, last_lsn) {
-                Ok(()) => Message::TxnAck {
+            } => (txn_id, mode, last_lsn),
+            SessionTxn::None => {
+                return txn_ack_err(0, &ServerError::State("no transaction to commit".into()));
+            }
+        };
+
+        // Idempotency: a retried commit with a key already recorded returns the
+        // original outcome and discards this transaction's (duplicate) writes.
+        if idempotency_key != 0 {
+            if let Some((orig_txn, commit_lsn)) = self.db.idempotency_lookup(idempotency_key) {
+                let _ = self.db.txns().abort_txn(txn_id, mode, last_lsn);
+                return Message::TxnAck {
+                    status: 0,
+                    txn_id: orig_txn,
+                    commit_lsn,
+                    error: None,
+                };
+            }
+        }
+
+        match self.db.txns().commit_txn(txn_id, mode, last_lsn) {
+            Ok(()) => {
+                if idempotency_key != 0 {
+                    self.db.idempotency_record(idempotency_key, txn_id, 0);
+                }
+                Message::TxnAck {
                     status: 0,
                     txn_id,
                     commit_lsn: 0, // reported as 0 this increment
                     error: None,
-                },
-                Err(e) => txn_ack_err(txn_id, &ServerError::from(e)),
-            },
-            SessionTxn::None => {
-                txn_ack_err(0, &ServerError::State("no transaction to commit".into()))
+                }
             }
+            Err(e) => txn_ack_err(txn_id, &ServerError::from(e)),
         }
     }
 

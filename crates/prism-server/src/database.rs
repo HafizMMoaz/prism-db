@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use prism_buffer::{BufferPool, Config as BufConfig};
 use prism_core::recover;
@@ -38,6 +39,17 @@ use crate::error::Result;
 const CATALOG_HEAP: HeapId = HeapId(64);
 const DOC_HEAP_BASE: u64 = 1 << 40;
 const KV_HEAP_BASE: u64 = 1 << 41;
+
+/// How long a committed transaction's idempotency record is retained.
+const IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// A recorded outcome of an idempotent commit (the `TxnAck` fields to replay).
+#[derive(Clone, Copy)]
+struct IdemRecord {
+    txn_id: u64,
+    commit_lsn: u64,
+    at: Instant,
+}
 
 /// Tuning for the storage stack a [`Database`] builds.
 #[derive(Clone, Copy, Debug)]
@@ -73,6 +85,8 @@ pub struct Database {
     kv_next: AtomicU64,
     /// SQL table names already written to the persistent catalog.
     persisted_tables: Mutex<HashSet<String>>,
+    /// idempotency_key -> the recorded commit outcome (for retry de-duplication).
+    idempotency: Mutex<HashMap<u128, IdemRecord>>,
 }
 
 impl Database {
@@ -132,6 +146,7 @@ impl Database {
             kv_namespaces: Mutex::new(HashMap::new()),
             kv_next: AtomicU64::new(KV_HEAP_BASE),
             persisted_tables: Mutex::new(HashSet::new()),
+            idempotency: Mutex::new(HashMap::new()),
             store,
             txns,
         };
@@ -139,6 +154,37 @@ impl Database {
             db.load_catalog()?;
         }
         Ok(db)
+    }
+
+    /// Look up a non-expired idempotency record by key: the `(txn_id,
+    /// commit_lsn)` of the original committed transaction, if any.
+    pub fn idempotency_lookup(&self, key: u128) -> Option<(u64, u64)> {
+        let mut map = self.idempotency.lock().expect("idempotency map poisoned");
+        match map.get(&key) {
+            Some(rec) if rec.at.elapsed() < IDEMPOTENCY_WINDOW => {
+                Some((rec.txn_id, rec.commit_lsn))
+            }
+            Some(_) => {
+                map.remove(&key); // expired
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Record a committed transaction's outcome under `key`, pruning expired
+    /// records opportunistically.
+    pub fn idempotency_record(&self, key: u128, txn_id: u64, commit_lsn: u64) {
+        let mut map = self.idempotency.lock().expect("idempotency map poisoned");
+        map.retain(|_, rec| rec.at.elapsed() < IDEMPOTENCY_WINDOW);
+        map.insert(
+            key,
+            IdemRecord {
+                txn_id,
+                commit_lsn,
+                at: Instant::now(),
+            },
+        );
     }
 
     /// Create (or replace) a user account with a password.

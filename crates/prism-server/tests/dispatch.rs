@@ -397,6 +397,51 @@ fn errors_are_reported_with_a_trailer() {
 }
 
 #[test]
+fn idempotent_commit_dedupes_and_discards_the_retry() {
+    let (db, _tmp) = database();
+    {
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE t (id BIGINT NOT NULL)"));
+    }
+    let key = 0xABCD_u128; // a non-zero idempotency key
+
+    // First transaction: insert 1, commit with the key.
+    let mut s1 = Session::new(db.clone());
+    s1.handle(Message::Begin {
+        mode: TxnMode::ReadWrite,
+    });
+    sql_affected(s1.handle(sql("INSERT INTO t VALUES (1)")));
+    let original_txn = txn_ok(s1.handle(Message::Commit {
+        idempotency_key: key,
+    }));
+
+    // A "retry": a fresh transaction does different work but commits with the
+    // SAME key. It must be de-duplicated — the original outcome is replayed and
+    // this transaction's write is discarded.
+    let mut s2 = Session::new(db.clone());
+    s2.handle(Message::Begin {
+        mode: TxnMode::ReadWrite,
+    });
+    sql_affected(s2.handle(sql("INSERT INTO t VALUES (2)")));
+    match s2.handle(Message::Commit {
+        idempotency_key: key,
+    }) {
+        Message::TxnAck {
+            status: 0, txn_id, ..
+        } => assert_eq!(txn_id, original_txn, "the original txn_id is replayed"),
+        other => panic!("expected TxnAck, got {other:?}"),
+    }
+
+    // Only row 1 survives; the duplicate retry's row 2 was rolled back.
+    let mut reader = Session::new(db);
+    assert_eq!(
+        sql_select(reader.handle(sql("SELECT id FROM t"))),
+        vec![vec![Some(WireValue::Int64(1))]],
+        "the retry's write was discarded"
+    );
+}
+
+#[test]
 fn dropping_a_session_aborts_its_open_transaction() {
     let (db, _tmp) = database();
     {
