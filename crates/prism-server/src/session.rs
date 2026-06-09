@@ -375,7 +375,16 @@ impl Session {
         }
         let db = self.db.clone();
         match self.in_txn(|txn| db.sql().execute(txn, &sql).map_err(ServerError::from)) {
-            Ok(outcome) => outcome_to_sql_result(outcome),
+            Ok(outcome) => {
+                // DDL is effective immediately; persist new tables to the catalog
+                // so the schema survives restart.
+                if matches!(outcome, Outcome::CreateTable) {
+                    if let Err(e) = db.persist_sql_tables() {
+                        return sql_result_err(&e);
+                    }
+                }
+                outcome_to_sql_result(outcome)
+            }
             Err(e) => sql_result_err(&e),
         }
     }
@@ -383,7 +392,10 @@ impl Session {
     // ---- document ------------------------------------------------------------
 
     fn run_doc(&mut self, collection: String, command: DocCommand) -> Message {
-        let coll = self.db.collection(&collection);
+        let coll = match self.db.collection(&collection) {
+            Ok(c) => c,
+            Err(e) => return doc_result_err(&e),
+        };
         match self.in_txn(|txn| dispatch_doc(&coll, txn, command)) {
             Ok(out) => Message::DocResult {
                 status: 0,
@@ -400,8 +412,17 @@ impl Session {
     // ---- KV ------------------------------------------------------------------
 
     fn run_kv(&mut self, namespace: String, command: KvCommand) -> Message {
-        let ns = self.db.kv_namespace(&namespace);
         let shape = empty_kv_body(&command);
+        let ns = match self.db.kv_namespace(&namespace) {
+            Ok(n) => n,
+            Err(e) => {
+                return Message::KvResult {
+                    status: 1,
+                    body: shape,
+                    error: Some(e.to_error_info()),
+                };
+            }
+        };
         match self.in_txn(|txn| dispatch_kv(&ns, txn, command)) {
             Ok(body) => Message::KvResult {
                 status: 0,

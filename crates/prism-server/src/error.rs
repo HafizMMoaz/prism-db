@@ -33,6 +33,15 @@ pub enum ServerError {
     /// A request used a feature this build does not yet support.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// Persistent state (e.g. a catalog record) could not be decoded.
+    #[error("corrupt: {0}")]
+    Corrupt(String),
+}
+
+impl From<prism_protocol::ProtocolError> for ServerError {
+    fn from(e: prism_protocol::ProtocolError) -> Self {
+        ServerError::Corrupt(e.to_string())
+    }
 }
 
 // Storage-layer errors only surface while opening the database; route them
@@ -65,6 +74,7 @@ impl ServerError {
             ServerError::State(_) => 0x0001,
             // 0xFF00–0xFFFF internal / unexpected (incl. not-yet-implemented).
             ServerError::Unsupported(_) => 0xFF01,
+            ServerError::Corrupt(_) => 0xFF02,
         }
     }
 

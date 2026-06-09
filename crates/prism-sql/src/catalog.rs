@@ -91,4 +91,35 @@ impl Catalog {
             .cloned()
             .ok_or_else(|| SqlError::NoSuchTable(name.to_string()))
     }
+
+    /// Install a table at a known heap (used when reloading a persisted catalog
+    /// after restart). Bumps the heap allocator past `heap` so new tables don't
+    /// collide. Errors if the name is already registered.
+    pub fn register_table(&self, name: &str, columns: Vec<Column>, heap: HeapId) -> Result<()> {
+        let mut tables = self.tables.lock().expect("catalog poisoned");
+        if tables.contains_key(name) {
+            return Err(SqlError::TableExists(name.to_string()));
+        }
+        tables.insert(
+            name.to_string(),
+            Table {
+                name: name.to_string(),
+                heap,
+                columns,
+            },
+        );
+        let mut n = self.next_heap.lock().expect("catalog poisoned");
+        *n = (*n).max(heap.0 + 1);
+        Ok(())
+    }
+
+    /// A snapshot of all tables (for persisting the catalog).
+    pub fn tables_snapshot(&self) -> Vec<Table> {
+        self.tables
+            .lock()
+            .expect("catalog poisoned")
+            .values()
+            .cloned()
+            .collect()
+    }
 }

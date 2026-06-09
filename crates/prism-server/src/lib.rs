@@ -18,6 +18,7 @@
 //! [`server`] for the deferred network features.
 
 pub mod auth;
+pub mod catalog;
 pub mod database;
 pub mod error;
 pub mod server;
