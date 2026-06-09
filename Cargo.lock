@@ -406,6 +406,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "prism-client"
+version = "0.1.0"
+dependencies = [
+ "prism-protocol",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "prism-core"
 version = "0.1.0"
 dependencies = [

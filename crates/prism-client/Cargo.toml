@@ -1,0 +1,15 @@
+[package]
+name = "prism-client"
+description = "Async client for the Prism wire protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# A leaf for applications: depends only on the protocol types and an async
+# runtime — never on the server or the engines (see module-layout.md).
+[dependencies]
+prism-protocol = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }

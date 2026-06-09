@@ -16,6 +16,7 @@ members = [
     "crates/prism-kv",
     "crates/prism-protocol",
     "crates/prism-server",
+    "crates/prism-client",
     "crates/prism-shell",
     "crates/prism-sdk-node",
     "crates/prism-fsck",
@@ -45,6 +46,7 @@ prism-doc = { path = "crates/prism-doc", version = "0.1.0" }
 prism-kv = { path = "crates/prism-kv", version = "0.1.0" }
 prism-protocol = { path = "crates/prism-protocol", version = "0.1.0" }
 prism-server = { path = "crates/prism-server", version = "0.1.0" }
+prism-client = { path = "crates/prism-client", version = "0.1.0" }
 prism-testkit = { path = "crates/prism-testkit", version = "0.1.0" }
 
 # Shared external crates are pre-staged here so versions stay consistent across
