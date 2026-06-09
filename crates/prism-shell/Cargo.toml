@@ -1,15 +1,24 @@
 [package]
 name = "prism-shell"
-description = "Interactive shell: readline REPL with per-model output formatting."
+description = "Interactive shell: REPL with per-model output formatting."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Library holds the (testable) command parser and output formatters; the binary
+# wraps them in a connect + REPL loop.
+[lib]
+name = "prism_shell"
+path = "src/lib.rs"
+
 [[bin]]
 name = "prism-shell"
 path = "src/main.rs"
 
 [dependencies]
+prism-client = { workspace = true }
 prism-protocol = { workspace = true }
+prism-doc = { workspace = true }
+tokio = { workspace = true }

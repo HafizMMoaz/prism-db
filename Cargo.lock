@@ -505,7 +505,10 @@ dependencies = [
 name = "prism-shell"
 version = "0.1.0"
 dependencies = [
+ "prism-client",
+ "prism-doc",
  "prism-protocol",
+ "tokio",
 ]
 
 [[package]]
