@@ -5,16 +5,18 @@
 //! documents. See `docs/components/sql-engine.md`.
 //!
 //! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`,
-//! `SELECT <cols|*> FROM t [WHERE <predicate>] [ORDER BY col [ASC|DESC], …]
+//! `SELECT <exprs|*> FROM t [WHERE <predicate>] [ORDER BY col [ASC|DESC], …]
 //! [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`, and `DELETE FROM t
 //! [WHERE …]` over a sequential scan (with a primary-key index seek for
 //! `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`MIN`/`MAX` with an
-//! optional `GROUP BY`, for the types `BOOL`/`BIGINT`/`TEXT`. Deferred: joins,
+//! optional `GROUP BY`, for the types `BOOL`/`BIGINT`/`TEXT`. Expressions
+//! support arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
+//! `IS [NOT] NULL`, `[NOT] IN (…)`, `[NOT] BETWEEN … AND …`, and `[NOT] LIKE`
+//! (`%`/`_`) — usable in `WHERE`, `SET`, and the select list. Deferred: joins,
 //! `AVG` (needs a floating-point type), `HAVING`, `ORDER BY` over aggregate
-//! output, arithmetic in `SET`, updating a primary-key column, the formal
-//! bind/rewrite/plan IR. The current executor interprets the parsed AST
-//! directly against the catalog; the full parse→bind→plan→execute pipeline is a
-//! follow-up.
+//! output, updating a primary-key column, the formal bind/rewrite/plan IR. The
+//! current executor interprets the parsed AST directly against the catalog; the
+//! full parse→bind→plan→execute pipeline is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -34,7 +36,7 @@ use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete,
     DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, Value as SqlValue,
+    TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -310,12 +312,11 @@ impl SqlEngine {
             );
         }
 
-        // Resolve the projection to column indices.
-        let projection: Vec<usize> = resolve_projection(&select.projection, &table)?;
-        let columns: Vec<String> = projection
-            .iter()
-            .map(|&i| table.columns[i].name.clone())
-            .collect();
+        // Resolve the projection to (output name, expression) pairs. A bare
+        // column is just an identifier expression; `*` expands to one per
+        // column; arbitrary expressions (e.g. `a + b`) are evaluated per row.
+        let projection = resolve_projection(&select.projection, &table)?;
+        let columns: Vec<String> = projection.iter().map(|p| p.name.clone()).collect();
 
         let types = table.types();
 
@@ -334,7 +335,7 @@ impl SqlEngine {
                 if let Some(rid) = tree.search(&key)? {
                     if let Some(payload) = self.store.read(txn, rid)? {
                         let full = types::decode_row(&types, &payload)?;
-                        rows.push(projection.iter().map(|&i| full[i].clone()).collect());
+                        rows.push(self.project_row(&projection, &full, &table)?);
                     }
                 }
                 return Ok(Outcome::Select { columns, rows });
@@ -374,9 +375,22 @@ impl SqlEngine {
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|full| projection.iter().map(|&i| full[i].clone()).collect())
-            .collect();
+            .map(|full| self.project_row(&projection, &full, &table))
+            .collect::<Result<_>>()?;
         Ok(Outcome::Select { columns, rows })
+    }
+
+    /// Evaluate each projection expression against `row`.
+    fn project_row(
+        &self,
+        projection: &[ProjItem],
+        row: &[Value],
+        table: &Table,
+    ) -> Result<Vec<Value>> {
+        projection
+            .iter()
+            .map(|p| self.eval(&p.expr, row, table))
+            .collect()
     }
 
     /// Execute an aggregate `SELECT`: a projection of group-key columns and/or
@@ -665,6 +679,7 @@ impl SqlEngine {
 
     /// Evaluate `expr` against `row`.
     fn eval(&self, expr: &Expr, row: &[Value], table: &Table) -> Result<Value> {
+        use BinaryOperator::*;
         match expr {
             Expr::Nested(inner) => self.eval(inner, row, table),
             Expr::Identifier(ident) => {
@@ -673,19 +688,98 @@ impl SqlEngine {
                     .ok_or_else(|| SqlError::NoSuchColumn(ident.value.clone()))?;
                 Ok(row[idx].clone())
             }
-            Expr::Value(_) | Expr::UnaryOp { .. } => literal(expr),
-            Expr::BinaryOp { left, op, right } => {
-                if matches!(op, BinaryOperator::And | BinaryOperator::Or) {
-                    let l = self.matches(left, row, table)?;
-                    let r = self.matches(right, row, table)?;
-                    return Ok(Value::Bool(match op {
-                        BinaryOperator::And => l && r,
-                        _ => l || r,
-                    }));
+            Expr::Value(_) => literal(expr),
+            Expr::UnaryOp { op, expr: inner } => match op {
+                UnaryOperator::Not => Ok(Value::Bool(!self.matches(inner, row, table)?)),
+                UnaryOperator::Minus | UnaryOperator::Plus => {
+                    match (op, self.eval(inner, row, table)?) {
+                        (_, Value::Null) => Ok(Value::Null),
+                        (UnaryOperator::Minus, Value::Int64(n)) => Ok(Value::Int64(-n)),
+                        (UnaryOperator::Plus, v @ Value::Int64(_)) => Ok(v),
+                        (_, other) => Err(SqlError::Type(format!(
+                            "cannot apply unary {op} to {other:?}"
+                        ))),
+                    }
                 }
-                let l = self.eval(left, row, table)?;
-                let r = self.eval(right, row, table)?;
-                Ok(Value::Bool(compare(op, &l, &r)))
+                other => Err(SqlError::Unsupported(format!("unary operator: {other}"))),
+            },
+            Expr::BinaryOp { left, op, right } => match op {
+                And => Ok(Value::Bool(
+                    self.matches(left, row, table)? && self.matches(right, row, table)?,
+                )),
+                Or => Ok(Value::Bool(
+                    self.matches(left, row, table)? || self.matches(right, row, table)?,
+                )),
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let l = self.eval(left, row, table)?;
+                    let r = self.eval(right, row, table)?;
+                    arith(op, &l, &r)
+                }
+                Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                    let l = self.eval(left, row, table)?;
+                    let r = self.eval(right, row, table)?;
+                    Ok(Value::Bool(compare(op, &l, &r)))
+                }
+                other => Err(SqlError::Unsupported(format!("operator: {other}"))),
+            },
+            Expr::IsNull(inner) => Ok(Value::Bool(matches!(
+                self.eval(inner, row, table)?,
+                Value::Null
+            ))),
+            Expr::IsNotNull(inner) => Ok(Value::Bool(!matches!(
+                self.eval(inner, row, table)?,
+                Value::Null
+            ))),
+            // `v [NOT] IN (a, b, …)`. A NULL probe never matches.
+            Expr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let v = self.eval(inner, row, table)?;
+                let mut found = false;
+                if !matches!(v, Value::Null) {
+                    for item in list {
+                        if self.eval(item, row, table)? == v {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                Ok(Value::Bool(found ^ negated))
+            }
+            // `v [NOT] BETWEEN lo AND hi` — inclusive; NULL operands exclude.
+            Expr::Between {
+                expr: inner,
+                negated,
+                low,
+                high,
+            } => {
+                let v = self.eval(inner, row, table)?;
+                let lo = self.eval(low, row, table)?;
+                let hi = self.eval(high, row, table)?;
+                let in_range = compare(&GtEq, &v, &lo) && compare(&LtEq, &v, &hi);
+                Ok(Value::Bool(in_range ^ negated))
+            }
+            // `s [NOT] LIKE pattern` with `%` (any run) and `_` (one char).
+            Expr::Like {
+                negated,
+                any,
+                expr: inner,
+                pattern,
+                escape_char,
+            } => {
+                if *any || escape_char.is_some() {
+                    return Err(SqlError::Unsupported("LIKE ANY / ESCAPE".into()));
+                }
+                let v = self.eval(inner, row, table)?;
+                let p = self.eval(pattern, row, table)?;
+                let hit = match (&v, &p) {
+                    (Value::Text(s), Value::Text(pat)) => like_match(s, pat),
+                    (Value::Null, _) | (_, Value::Null) => false,
+                    _ => return Err(SqlError::Type("LIKE requires text operands".into())),
+                };
+                Ok(Value::Bool(hit ^ negated))
             }
             other => Err(SqlError::Unsupported(format!("expression: {other:?}"))),
         }
@@ -716,21 +810,101 @@ fn compare(op: &BinaryOperator, l: &Value, r: &Value) -> bool {
     }
 }
 
-fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<usize>> {
+/// One output column of a (non-aggregate) `SELECT`: an expression to evaluate
+/// per row, plus the name to report for it.
+struct ProjItem {
+    name: String,
+    expr: Expr,
+}
+
+/// Resolve a select list to projected expressions. `*` expands to one item per
+/// table column; `expr AS alias` takes the alias; a bare column or expression
+/// is named after itself.
+fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<ProjItem>> {
     let mut out = Vec::new();
     for item in items {
         match item {
-            SelectItem::Wildcard(_) => out.extend(0..table.columns.len()),
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                let idx = table
-                    .column_index(&ident.value)
-                    .ok_or_else(|| SqlError::NoSuchColumn(ident.value.clone()))?;
-                out.push(idx);
+            SelectItem::Wildcard(_) => {
+                for col in &table.columns {
+                    out.push(ProjItem {
+                        name: col.name.clone(),
+                        expr: Expr::Identifier(col.name.as_str().into()),
+                    });
+                }
             }
+            SelectItem::UnnamedExpr(expr) => {
+                let name = match expr {
+                    Expr::Identifier(id) => id.value.clone(),
+                    other => other.to_string(),
+                };
+                out.push(ProjItem {
+                    name,
+                    expr: expr.clone(),
+                });
+            }
+            SelectItem::ExprWithAlias { expr, alias } => out.push(ProjItem {
+                name: alias.value.clone(),
+                expr: expr.clone(),
+            }),
             other => return Err(SqlError::Unsupported(format!("projection: {other:?}"))),
         }
     }
     Ok(out)
+}
+
+/// Apply an arithmetic operator to two integer values, propagating NULL and
+/// rejecting non-integers, division/modulo by zero, and overflow.
+fn arith(op: &BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (Value::Int64(a), Value::Int64(b)) = (l, r) else {
+        return Err(SqlError::Type(format!(
+            "arithmetic requires integers: {l:?} {op} {r:?}"
+        )));
+    };
+    let out = match op {
+        BinaryOperator::Plus => a.checked_add(*b),
+        BinaryOperator::Minus => a.checked_sub(*b),
+        BinaryOperator::Multiply => a.checked_mul(*b),
+        BinaryOperator::Divide if *b == 0 => return Err(SqlError::Type("division by zero".into())),
+        BinaryOperator::Modulo if *b == 0 => return Err(SqlError::Type("modulo by zero".into())),
+        BinaryOperator::Divide => a.checked_div(*b),
+        BinaryOperator::Modulo => a.checked_rem(*b),
+        other => return Err(SqlError::Unsupported(format!("operator: {other}"))),
+    };
+    out.map(Value::Int64)
+        .ok_or_else(|| SqlError::Type("integer overflow".into()))
+}
+
+/// SQL `LIKE` matching with `%` (any run, including empty) and `_` (exactly one
+/// character). Linear-time with greedy `%` backtracking.
+fn like_match(text: &str, pattern: &str) -> bool {
+    let t: Vec<char> = text.chars().collect();
+    let p: Vec<char> = pattern.chars().collect();
+    let (mut ti, mut pi) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+            ti += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star_pi {
+            // Backtrack: let the last `%` swallow one more character.
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Resolve `ORDER BY` items to `(column index, ascending)` pairs. Only simple
@@ -1874,5 +2048,220 @@ mod tests {
             env.engine.execute_autocommit("SELECT AVG(v) FROM t"),
             Err(SqlError::Unsupported(_))
         ));
+    }
+
+    fn seed_ops(env: &Env) {
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT, score BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "INSERT INTO t VALUES \
+                 (1,'alice',10),(2,'bob',NULL),(3,'carol',30),(4,'dave',40)",
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn arithmetic_in_projection_and_predicate() {
+        let env = env();
+        seed_ops(&env);
+
+        // Expression in the select list, with an alias.
+        let out = env
+            .engine
+            .execute_autocommit("SELECT id, id * 100 AS scaled FROM t WHERE id = 3")
+            .unwrap();
+        match out {
+            Outcome::Select { columns, rows } => {
+                assert_eq!(columns, vec!["id", "scaled"]);
+                assert_eq!(rows, vec![vec![Value::Int64(3), Value::Int64(300)]]);
+            }
+            other => panic!("{other:?}"),
+        }
+
+        // Arithmetic inside the predicate.
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE id + 1 > 3 ORDER BY id")
+                    .unwrap()
+            ),
+            vec![3, 4]
+        );
+
+        // Derived column name when there is no alias.
+        let out = env
+            .engine
+            .execute_autocommit("SELECT id % 2 FROM t WHERE id = 1")
+            .unwrap();
+        if let Outcome::Select { columns, .. } = out {
+            assert_eq!(columns.len(), 1);
+            assert!(columns[0].contains('%'), "name was {:?}", columns[0]);
+        }
+    }
+
+    #[test]
+    fn division_by_zero_is_an_error() {
+        let env = env();
+        seed_ops(&env);
+        assert!(matches!(
+            env.engine.execute_autocommit("SELECT id / 0 FROM t"),
+            Err(SqlError::Type(_))
+        ));
+    }
+
+    #[test]
+    fn update_set_supports_arithmetic() {
+        let env = env();
+        seed_ops(&env);
+        // score: 10, NULL, 30, 40 -> +5 each (NULL stays NULL).
+        env.engine
+            .execute_autocommit("UPDATE t SET score = score + 5")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT id, score FROM t ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Int64(1), Value::Int64(15)],
+                vec![Value::Int64(2), Value::Null],
+                vec![Value::Int64(3), Value::Int64(35)],
+                vec![Value::Int64(4), Value::Int64(45)],
+            ]
+        );
+    }
+
+    #[test]
+    fn is_null_and_is_not_null() {
+        let env = env();
+        seed_ops(&env);
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE score IS NULL")
+                    .unwrap()
+            ),
+            vec![2]
+        );
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE score IS NOT NULL ORDER BY id")
+                    .unwrap()
+            ),
+            vec![1, 3, 4]
+        );
+    }
+
+    #[test]
+    fn in_list_and_not_in() {
+        let env = env();
+        seed_ops(&env);
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE id IN (1, 3) ORDER BY id")
+                    .unwrap()
+            ),
+            vec![1, 3]
+        );
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id FROM t WHERE name NOT IN ('alice','bob') ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn between_and_not_between() {
+        let env = env();
+        seed_ops(&env);
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE id BETWEEN 2 AND 3 ORDER BY id")
+                    .unwrap()
+            ),
+            vec![2, 3]
+        );
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE id NOT BETWEEN 2 AND 3 ORDER BY id")
+                    .unwrap()
+            ),
+            vec![1, 4]
+        );
+    }
+
+    #[test]
+    fn like_patterns() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'alice'),(2,'alan'),(3,'bob'),(4,'al')")
+            .unwrap();
+
+        // Prefix wildcard: names starting with "al".
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE name LIKE 'al%' ORDER BY id")
+                    .unwrap()
+            ),
+            vec![1, 2, 4]
+        );
+        // `_` matches exactly one character: '___' matches only 3-char names.
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE name LIKE '___'")
+                    .unwrap()
+            ),
+            vec![3] // 'bob'
+        );
+        // Mixed: starts 'a', ends 'e'.
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE name LIKE 'a%e'")
+                    .unwrap()
+            ),
+            vec![1] // 'alice'
+        );
+        // NOT LIKE.
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE name NOT LIKE 'al%' ORDER BY id")
+                    .unwrap()
+            ),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn not_operator_negates_a_predicate() {
+        let env = env();
+        seed_ops(&env);
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE NOT (id = 2) ORDER BY id")
+                    .unwrap()
+            ),
+            vec![1, 3, 4]
+        );
     }
 }
