@@ -25,7 +25,7 @@ pub mod error;
 pub mod frame;
 pub mod message;
 
-pub use data::{ColumnDesc, DocCommand, KvCommand, KvResultBody, Row, Value};
+pub use data::{ColumnDesc, DocCommand, DocQuery, KvCommand, KvResultBody, Row, Value};
 pub use error::{ProtocolError, Result};
 pub use message::{
     AuthMechanism, ErrorInfo, Message, MessageType, NoticeSeverity, Packet, TxnMode,
@@ -477,5 +477,45 @@ mod tests {
                 len: MAX_FRAME_SIZE + 1
             })
         );
+    }
+
+    #[test]
+    fn doc_query_round_trips_through_bytes() {
+        // A nested filter exercising every variant family.
+        let q = DocQuery::And(vec![
+            DocQuery::Or(vec![
+                DocQuery::Eq("name".into(), Value::Str("alice".into())),
+                DocQuery::Gt("age".into(), Value::Int64(30)),
+            ]),
+            DocQuery::In(
+                "tier".into(),
+                vec![Value::Int32(1), Value::Int32(2), Value::Null],
+            ),
+            DocQuery::Nin("flag".into(), vec![Value::Bool(true)]),
+            DocQuery::Not(Box::new(DocQuery::Lte("score".into(), Value::Double(1.5)))),
+            DocQuery::Exists("email".into(), true),
+            DocQuery::All,
+        ]);
+        let bytes = q.to_bytes().unwrap();
+        assert_eq!(DocQuery::from_bytes(&bytes).unwrap(), q);
+    }
+
+    #[test]
+    fn doc_query_rejects_unknown_tag_and_trailing_bytes() {
+        // An unknown discriminant is a BadEnum.
+        assert!(matches!(
+            DocQuery::from_bytes(&[0xEE]),
+            Err(ProtocolError::BadEnum {
+                field: "query.tag",
+                ..
+            })
+        ));
+        // Extra bytes after a complete query are rejected.
+        let mut bytes = DocQuery::All.to_bytes().unwrap();
+        bytes.push(0x00);
+        assert!(matches!(
+            DocQuery::from_bytes(&bytes),
+            Err(ProtocolError::TrailingBytes { .. })
+        ));
     }
 }

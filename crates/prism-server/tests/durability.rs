@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use prism_doc::{DocValue, Document};
-use prism_protocol::{DocCommand, KvCommand, KvResultBody, Message, Value as WireValue};
+use prism_protocol::{DocCommand, DocQuery, KvCommand, KvResultBody, Message, Value as WireValue};
 use prism_server::{Database, Session};
 use prism_testkit::TempDir;
 
@@ -26,12 +26,30 @@ fn doc_insert(collection: &str, fields: &[(&str, DocValue)]) -> Message {
     }
 }
 
+fn to_wire(v: &DocValue) -> WireValue {
+    match v {
+        DocValue::Null => WireValue::Null,
+        DocValue::Bool(b) => WireValue::Bool(*b),
+        DocValue::Int32(n) => WireValue::Int32(*n),
+        DocValue::Int64(n) => WireValue::Int64(*n),
+        DocValue::Double(d) => WireValue::Double(*d),
+        DocValue::Str(s) => WireValue::Str(s.clone()),
+        DocValue::Timestamp(t) => WireValue::Timestamp(*t),
+        DocValue::ObjectId(id) => WireValue::ObjectId(id.0),
+    }
+}
+
 fn doc_find(collection: &str, query: &[(&str, DocValue)]) -> Message {
-    let q = Document::from_fields(query.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    let q = DocQuery::And(
+        query
+            .iter()
+            .map(|(k, v)| DocQuery::Eq((*k).to_string(), to_wire(v)))
+            .collect(),
+    );
     Message::DocOp {
         collection: collection.into(),
         command: DocCommand::Find {
-            query: q.encode().unwrap(),
+            query: q.to_bytes().unwrap(),
             options: vec![],
         },
     }
@@ -41,7 +59,7 @@ fn doc_find_all(collection: &str) -> Message {
     Message::DocOp {
         collection: collection.into(),
         command: DocCommand::Find {
-            query: Document::new().encode().unwrap(),
+            query: DocQuery::All.to_bytes().unwrap(),
             options: vec![],
         },
     }

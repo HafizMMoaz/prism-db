@@ -10,10 +10,10 @@
 //! **Documented simplifications (this increment):**
 //! - SQL parameters are not yet bound (`SqlExecute.params` must be empty; use
 //!   literals). `TxnAck.commit_lsn` is reported as 0.
-//! - Document queries are flat field-equality (`{a: 1, b: 2}` ⇒ `a = 1 AND
-//!   b = 2`; empty ⇒ match all); a flat update document is an implicit `$set` of
-//!   each field. Query operators (`$gt`, …) and update operators (`$inc`, …)
-//!   over the wire await nested-document support in `prism-doc`.
+//! - Document queries use the structured [`DocQuery`] wire filter (eq/ne/gt/lt/
+//!   gte/lte/in/nin/exists and and/or/not), mapped to the engine's `Filter`.
+//!   Updates are still a flat document treated as an implicit `$set` of each
+//!   field; wire update operators (`$inc`, `$unset`, …) are a follow-up.
 //! - KV `range`/`scan` are unsupported on the hash namespace.
 //!
 //! A network session ([`Session::new_authenticating`]) must complete the
@@ -28,8 +28,8 @@ use prism_core::txn::{Snapshot, TxnHandle, TxnMode};
 use prism_doc::{DocCollection, DocValue, Document, Filter, Update};
 use prism_kv::KvNamespace;
 use prism_protocol::{
-    ColumnDesc, DocCommand, KvCommand, KvResultBody, Message, NoticeSeverity, PROTOCOL_VERSION,
-    Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
+    ColumnDesc, DocCommand, DocQuery, KvCommand, KvResultBody, Message, NoticeSeverity,
+    PROTOCOL_VERSION, Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
 };
 use prism_sql::{Outcome, Value as SqlValue};
 use prism_wal::Lsn;
@@ -655,17 +655,56 @@ fn encode_docs(docs: &[Document]) -> Result<Vec<Vec<u8>>> {
         .collect()
 }
 
-/// Compile a flat query document into an AND of field-equality filters.
+/// Decode a wire [`DocQuery`] and map it to the engine's [`Filter`].
 fn query_to_filter(bytes: &[u8]) -> Result<Filter> {
-    let query = Document::decode(bytes)?;
-    let subs: Vec<Filter> = query
-        .iter()
-        .map(|(k, v)| Filter::Eq(k.to_string(), v.clone()))
-        .collect();
-    Ok(if subs.is_empty() {
-        Filter::All
-    } else {
-        Filter::And(subs)
+    doc_query_to_filter(DocQuery::from_bytes(bytes)?)
+}
+
+/// Map a wire [`DocQuery`] onto the document engine's [`Filter`], translating
+/// each operand from the protocol's [`WireValue`] to a [`DocValue`].
+fn doc_query_to_filter(q: DocQuery) -> Result<Filter> {
+    Ok(match q {
+        DocQuery::All => Filter::All,
+        DocQuery::Eq(f, v) => Filter::Eq(f, wire_to_doc_value(v)?),
+        DocQuery::Ne(f, v) => Filter::Ne(f, wire_to_doc_value(v)?),
+        DocQuery::Gt(f, v) => Filter::Gt(f, wire_to_doc_value(v)?),
+        DocQuery::Lt(f, v) => Filter::Lt(f, wire_to_doc_value(v)?),
+        DocQuery::Gte(f, v) => Filter::Gte(f, wire_to_doc_value(v)?),
+        DocQuery::Lte(f, v) => Filter::Lte(f, wire_to_doc_value(v)?),
+        DocQuery::In(f, set) => Filter::In(f, wire_to_doc_values(set)?),
+        DocQuery::Nin(f, set) => Filter::Nin(f, wire_to_doc_values(set)?),
+        DocQuery::Exists(f, want) => Filter::Exists(f, want),
+        DocQuery::And(subs) => Filter::And(map_subqueries(subs)?),
+        DocQuery::Or(subs) => Filter::Or(map_subqueries(subs)?),
+        DocQuery::Not(inner) => Filter::Not(Box::new(doc_query_to_filter(*inner)?)),
+    })
+}
+
+fn map_subqueries(subs: Vec<DocQuery>) -> Result<Vec<Filter>> {
+    subs.into_iter().map(doc_query_to_filter).collect()
+}
+
+fn wire_to_doc_values(values: Vec<WireValue>) -> Result<Vec<DocValue>> {
+    values.into_iter().map(wire_to_doc_value).collect()
+}
+
+/// Translate a protocol scalar to a document scalar. Binary has no document
+/// counterpart in this slice.
+fn wire_to_doc_value(v: WireValue) -> Result<DocValue> {
+    Ok(match v {
+        WireValue::Null => DocValue::Null,
+        WireValue::Bool(b) => DocValue::Bool(b),
+        WireValue::Int32(n) => DocValue::Int32(n),
+        WireValue::Int64(n) => DocValue::Int64(n),
+        WireValue::Double(d) => DocValue::Double(d),
+        WireValue::Str(s) => DocValue::Str(s),
+        WireValue::Timestamp(t) => DocValue::Timestamp(t),
+        WireValue::ObjectId(id) => DocValue::ObjectId(prism_doc::ObjectId(id)),
+        WireValue::Binary { .. } => {
+            return Err(ServerError::Unsupported(
+                "binary values are not supported in document queries".into(),
+            ));
+        }
     })
 }
 

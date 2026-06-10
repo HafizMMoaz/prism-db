@@ -376,6 +376,168 @@ impl DocCommand {
     }
 }
 
+/// A document query filter on the wire — the structured form of a `{...}`
+/// query. The server maps it to the document engine's own `Filter`; values
+/// reuse the tagged [`Value`] encoding. This is what the `query` blob of a
+/// [`DocCommand`] carries.
+#[derive(Clone, PartialEq, Debug)]
+pub enum DocQuery {
+    /// Matches every document (the empty query `{}`).
+    All,
+    /// `field == value`.
+    Eq(String, Value),
+    /// `field != value`.
+    Ne(String, Value),
+    /// `field > value`.
+    Gt(String, Value),
+    /// `field < value`.
+    Lt(String, Value),
+    /// `field >= value`.
+    Gte(String, Value),
+    /// `field <= value`.
+    Lte(String, Value),
+    /// `field` is one of the values.
+    In(String, Vec<Value>),
+    /// `field` is none of the values.
+    Nin(String, Vec<Value>),
+    /// Whether `field` is present.
+    Exists(String, bool),
+    /// All sub-queries match.
+    And(Vec<DocQuery>),
+    /// Any sub-query matches.
+    Or(Vec<DocQuery>),
+    /// The sub-query does not match.
+    Not(Box<DocQuery>),
+}
+
+impl DocQuery {
+    /// Encode to a standalone byte string (the `query` blob of a command).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut w = Writer::new();
+        self.encode(&mut w)?;
+        Ok(w.into_vec())
+    }
+
+    /// Decode from a `query` blob, requiring all bytes to be consumed.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let q = Self::decode(&mut r)?;
+        r.expect_end()?;
+        Ok(q)
+    }
+
+    fn encode(&self, w: &mut Writer) -> Result<()> {
+        match self {
+            DocQuery::All => w.put_u8(0),
+            DocQuery::Eq(f, v) => field_op(w, 1, f, v)?,
+            DocQuery::Ne(f, v) => field_op(w, 2, f, v)?,
+            DocQuery::Gt(f, v) => field_op(w, 3, f, v)?,
+            DocQuery::Lt(f, v) => field_op(w, 4, f, v)?,
+            DocQuery::Gte(f, v) => field_op(w, 5, f, v)?,
+            DocQuery::Lte(f, v) => field_op(w, 6, f, v)?,
+            DocQuery::In(f, set) => field_set(w, 7, f, set)?,
+            DocQuery::Nin(f, set) => field_set(w, 8, f, set)?,
+            DocQuery::Exists(f, want) => {
+                w.put_u8(9);
+                w.put_str_u16("query.field", f)?;
+                w.put_u8(u8::from(*want));
+            }
+            DocQuery::And(subs) => group(w, 10, subs)?,
+            DocQuery::Or(subs) => group(w, 11, subs)?,
+            DocQuery::Not(inner) => {
+                w.put_u8(12);
+                inner.encode(w)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode(r: &mut Reader) -> Result<Self> {
+        let tag = r.get_u8("query.tag")?;
+        Ok(match tag {
+            0 => DocQuery::All,
+            1 => DocQuery::Eq(read_field(r)?, Value::decode_tagged(r)?),
+            2 => DocQuery::Ne(read_field(r)?, Value::decode_tagged(r)?),
+            3 => DocQuery::Gt(read_field(r)?, Value::decode_tagged(r)?),
+            4 => DocQuery::Lt(read_field(r)?, Value::decode_tagged(r)?),
+            5 => DocQuery::Gte(read_field(r)?, Value::decode_tagged(r)?),
+            6 => DocQuery::Lte(read_field(r)?, Value::decode_tagged(r)?),
+            7 => DocQuery::In(read_field(r)?, decode_set(r)?),
+            8 => DocQuery::Nin(read_field(r)?, decode_set(r)?),
+            9 => {
+                let f = read_field(r)?;
+                DocQuery::Exists(f, r.get_u8("query.exists")? != 0)
+            }
+            10 => DocQuery::And(decode_group(r)?),
+            11 => DocQuery::Or(decode_group(r)?),
+            12 => DocQuery::Not(Box::new(DocQuery::decode(r)?)),
+            other => {
+                return Err(ProtocolError::BadEnum {
+                    field: "query.tag",
+                    value: other,
+                });
+            }
+        })
+    }
+}
+
+fn field_op(w: &mut Writer, tag: u8, field: &str, v: &Value) -> Result<()> {
+    w.put_u8(tag);
+    w.put_str_u16("query.field", field)?;
+    v.encode_tagged(w)
+}
+
+fn field_set(w: &mut Writer, tag: u8, field: &str, set: &[Value]) -> Result<()> {
+    w.put_u8(tag);
+    w.put_str_u16("query.field", field)?;
+    let count: u32 = set
+        .len()
+        .try_into()
+        .map_err(|_| ProtocolError::ValueTooLarge { field: "query.set" })?;
+    w.put_u32(count);
+    for v in set {
+        v.encode_tagged(w)?;
+    }
+    Ok(())
+}
+
+fn group(w: &mut Writer, tag: u8, subs: &[DocQuery]) -> Result<()> {
+    w.put_u8(tag);
+    let count: u32 = subs
+        .len()
+        .try_into()
+        .map_err(|_| ProtocolError::ValueTooLarge {
+            field: "query.group",
+        })?;
+    w.put_u32(count);
+    for s in subs {
+        s.encode(w)?;
+    }
+    Ok(())
+}
+
+fn read_field(r: &mut Reader) -> Result<String> {
+    r.get_str_u16("query.field")
+}
+
+fn decode_set(r: &mut Reader) -> Result<Vec<Value>> {
+    let count = r.get_u32("query.set_count")? as usize;
+    let mut out = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        out.push(Value::decode_tagged(r)?);
+    }
+    Ok(out)
+}
+
+fn decode_group(r: &mut Reader) -> Result<Vec<DocQuery>> {
+    let count = r.get_u32("query.group_count")? as usize;
+    let mut out = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        out.push(DocQuery::decode(r)?);
+    }
+    Ok(out)
+}
+
 /// The op-specific body of a [`crate::Message::KvOp`]. Keys and values are
 /// opaque byte strings.
 #[derive(Clone, PartialEq, Eq, Debug)]

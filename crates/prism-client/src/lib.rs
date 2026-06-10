@@ -290,7 +290,8 @@ impl Client {
         self.doc(collection, DocCommand::InsertOne(doc)).await
     }
 
-    /// Find documents matching `query` (a tagged-binary query document).
+    /// Find documents matching `query` — the bytes of an encoded
+    /// [`prism_protocol::DocQuery`] (`DocQuery::to_bytes`).
     pub async fn doc_find(&mut self, collection: &str, query: Vec<u8>) -> Result<DocReply> {
         self.doc(
             collection,

@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use prism_doc::{DocValue, Document};
 use prism_protocol::{
-    AuthMechanism, DocCommand, KvCommand, KvResultBody, Message, TxnMode, Value as WireValue,
+    AuthMechanism, DocCommand, DocQuery, KvCommand, KvResultBody, Message, TxnMode,
+    Value as WireValue,
 };
 use prism_server::{Database, Session};
 use prism_testkit::TempDir;
@@ -111,12 +112,41 @@ fn doc_insert(collection: &str, fields: &[(&str, DocValue)]) -> Message {
     }
 }
 
+/// Translate a document scalar to the protocol's wire scalar (for queries).
+fn to_wire(v: &DocValue) -> WireValue {
+    match v {
+        DocValue::Null => WireValue::Null,
+        DocValue::Bool(b) => WireValue::Bool(*b),
+        DocValue::Int32(n) => WireValue::Int32(*n),
+        DocValue::Int64(n) => WireValue::Int64(*n),
+        DocValue::Double(d) => WireValue::Double(*d),
+        DocValue::Str(s) => WireValue::Str(s.clone()),
+        DocValue::Timestamp(t) => WireValue::Timestamp(*t),
+        DocValue::ObjectId(id) => WireValue::ObjectId(id.0),
+    }
+}
+
+/// A flat `field = value [AND …]` query (empty ⇒ match all).
 fn doc_find(collection: &str, query: &[(&str, DocValue)]) -> Message {
-    let q = Document::from_fields(query.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    let q = if query.is_empty() {
+        DocQuery::All
+    } else {
+        DocQuery::And(
+            query
+                .iter()
+                .map(|(k, v)| DocQuery::Eq((*k).to_string(), to_wire(v)))
+                .collect(),
+        )
+    };
+    doc_query(collection, q)
+}
+
+/// A document `Find` carrying an arbitrary [`DocQuery`].
+fn doc_query(collection: &str, query: DocQuery) -> Message {
     Message::DocOp {
         collection: collection.into(),
         command: DocCommand::Find {
-            query: q.encode().unwrap(),
+            query: query.to_bytes().unwrap(),
             options: vec![],
         },
     }
@@ -313,6 +343,81 @@ fn doc_auto_commit_roundtrip() {
     // Empty query matches all.
     let all = doc_results(s.handle(doc_find("people", &[])));
     assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn doc_query_operators_over_the_wire() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    for (name, age, city) in [
+        ("alice", 30, Some("NYC")),
+        ("bob", 25, Some("LA")),
+        ("carol", 40, Some("NYC")),
+        ("dave", 35, None),
+    ] {
+        let mut fields = vec![
+            ("name", DocValue::Str(name.into())),
+            ("age", DocValue::Int64(age)),
+        ];
+        if let Some(c) = city {
+            fields.push(("city", DocValue::Str(c.into())));
+        }
+        s.handle(doc_insert("people", &fields));
+    }
+
+    let names = |msg: Message| -> Vec<String> {
+        let mut out: Vec<String> = doc_results(msg)
+            .iter()
+            .map(|d| match d.get("name") {
+                Some(DocValue::Str(s)) => s.clone(),
+                other => panic!("expected a name string, got {other:?}"),
+            })
+            .collect();
+        out.sort();
+        out
+    };
+
+    // $gt over the wire.
+    let q = DocQuery::Gt("age".into(), WireValue::Int64(30));
+    assert_eq!(
+        names(s.handle(doc_query("people", q))),
+        vec!["carol", "dave"]
+    );
+
+    // $in.
+    let q = DocQuery::In(
+        "name".into(),
+        vec![WireValue::Str("alice".into()), WireValue::Str("bob".into())],
+    );
+    assert_eq!(
+        names(s.handle(doc_query("people", q))),
+        vec!["alice", "bob"]
+    );
+
+    // Boolean composition: (age <= 30) OR (city == "NYC").
+    let q = DocQuery::Or(vec![
+        DocQuery::Lte("age".into(), WireValue::Int64(30)),
+        DocQuery::Eq("city".into(), WireValue::Str("NYC".into())),
+    ]);
+    assert_eq!(
+        names(s.handle(doc_query("people", q))),
+        vec!["alice", "bob", "carol"]
+    );
+
+    // $exists: only documents that have a "city" field.
+    let q = DocQuery::Exists("city".into(), true);
+    assert_eq!(
+        names(s.handle(doc_query("people", q))),
+        vec!["alice", "bob", "carol"]
+    );
+
+    // NOT (age > 30) keeps the 25/30 year olds.
+    let q = DocQuery::Not(Box::new(DocQuery::Gt("age".into(), WireValue::Int64(30))));
+    assert_eq!(
+        names(s.handle(doc_query("people", q))),
+        vec!["alice", "bob"]
+    );
 }
 
 #[test]

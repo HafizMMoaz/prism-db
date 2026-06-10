@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use prism_client::Client;
 use prism_doc::Document;
-use prism_protocol::DEFAULT_PORT;
+use prism_protocol::{DEFAULT_PORT, DocQuery};
 use prism_shell::{Command, help_text, hex, parse_command, render_document, render_query};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -123,7 +123,7 @@ async fn execute(client: &mut Client, command: Command) -> Result<bool, String> 
             println!("OK");
         }
         Command::DocFind { collection } => {
-            let query = Document::new().encode().map_err(stringify)?;
+            let query = DocQuery::All.to_bytes().map_err(stringify)?;
             let reply = client
                 .doc_find(&collection, query)
                 .await
