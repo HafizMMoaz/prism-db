@@ -467,6 +467,7 @@ name = "prism-fsck"
 version = "0.1.0"
 dependencies = [
  "prism-storage",
+ "prism-testkit",
  "prism-wal",
 ]
 
