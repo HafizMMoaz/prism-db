@@ -5,13 +5,14 @@
 //! documents. See `docs/components/sql-engine.md`.
 //!
 //! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`,
-//! `SELECT <cols|*> FROM t [WHERE <predicate>]`, `UPDATE t SET … [WHERE …]`,
-//! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
-//! index seek for `SELECT … WHERE pk = …`), for the types `BOOL`/`BIGINT`/
-//! `TEXT`. Deferred: joins, aggregates, `ORDER BY`, arithmetic in `SET`,
-//! updating a primary-key column, the formal bind/rewrite/plan IR. The current
-//! executor interprets the parsed AST directly against the catalog; the full
-//! parse→bind→plan→execute pipeline is a follow-up.
+//! `SELECT <cols|*> FROM t [WHERE <predicate>] [ORDER BY col [ASC|DESC], …]
+//! [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`, and `DELETE FROM t
+//! [WHERE …]` over a sequential scan (with a primary-key index seek for
+//! `SELECT … WHERE pk = …`), for the types `BOOL`/`BIGINT`/`TEXT`. Deferred:
+//! joins, aggregates, arithmetic in `SET`, updating a primary-key column, the
+//! formal bind/rewrite/plan IR. The current executor interprets the parsed AST
+//! directly against the catalog; the full parse→bind→plan→execute pipeline is a
+//! follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -29,7 +30,7 @@ use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Expr, FromTable,
-    Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
     Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
@@ -303,24 +304,31 @@ impl SqlEngine {
         let types = table.types();
 
         // Index seek: `WHERE <pk> = <literal>` resolves to a single B+tree
-        // lookup instead of a full scan.
-        if let (Some(tree), Some(key_value)) = (
-            self.pk_index(&table),
-            self.pk_equality_literal(&select.selection, &table)?,
-        ) {
-            let key = encode_index_key(&key_value)?;
-            let mut rows = Vec::new();
-            if let Some(rid) = tree.search(&key)? {
-                if let Some(payload) = self.store.read(txn, rid)? {
-                    let full = types::decode_row(&types, &payload)?;
-                    rows.push(projection.iter().map(|&i| full[i].clone()).collect());
+        // lookup instead of a full scan. Only taken when there is no ORDER BY /
+        // LIMIT / OFFSET to apply (a single row makes ordering moot, but a
+        // LIMIT/OFFSET still has to be honored — let the scan path do that).
+        let plain = query.order_by.is_none() && query.limit.is_none() && query.offset.is_none();
+        if plain {
+            if let (Some(tree), Some(key_value)) = (
+                self.pk_index(&table),
+                self.pk_equality_literal(&select.selection, &table)?,
+            ) {
+                let key = encode_index_key(&key_value)?;
+                let mut rows = Vec::new();
+                if let Some(rid) = tree.search(&key)? {
+                    if let Some(payload) = self.store.read(txn, rid)? {
+                        let full = types::decode_row(&types, &payload)?;
+                        rows.push(projection.iter().map(|&i| full[i].clone()).collect());
+                    }
                 }
+                return Ok(Outcome::Select { columns, rows });
             }
-            return Ok(Outcome::Select { columns, rows });
         }
 
         // Otherwise, a full sequential scan with the predicate applied per row.
-        let mut rows = Vec::new();
+        // Keep whole rows so an ORDER BY can sort on columns that are not in the
+        // projection; project only after ordering and LIMIT/OFFSET.
+        let mut full_rows: Vec<Vec<Value>> = Vec::new();
         for (_, payload) in self.store.scan(txn, table.heap)? {
             let full = types::decode_row(&types, &payload)?;
             if let Some(pred) = &select.selection {
@@ -328,8 +336,30 @@ impl SqlEngine {
                     continue;
                 }
             }
-            rows.push(projection.iter().map(|&i| full[i].clone()).collect());
+            full_rows.push(full);
         }
+
+        // ORDER BY <col> [ASC|DESC] [, …] — a stable sort by the key columns.
+        if let Some(order_by) = &query.order_by {
+            let keys = resolve_order_keys(&order_by.exprs, &table)?;
+            full_rows.sort_by(|a, b| order_cmp(&keys, a, b));
+        }
+
+        // OFFSET then LIMIT, both non-negative integer literals.
+        let offset = match &query.offset {
+            Some(o) => count_literal(&o.value)?,
+            None => 0,
+        };
+        let limit = match &query.limit {
+            Some(e) => count_literal(e)?,
+            None => usize::MAX,
+        };
+        let rows = full_rows
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|full| projection.iter().map(|&i| full[i].clone()).collect())
+            .collect();
         Ok(Outcome::Select { columns, rows })
     }
 
@@ -561,6 +591,67 @@ fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<usize>>
         }
     }
     Ok(out)
+}
+
+/// Resolve `ORDER BY` items to `(column index, ascending)` pairs. Only simple
+/// column references are supported (ascending by default; `DESC` flips it).
+fn resolve_order_keys(items: &[OrderByExpr], table: &Table) -> Result<Vec<(usize, bool)>> {
+    let mut keys = Vec::with_capacity(items.len());
+    for item in items {
+        let Expr::Identifier(ident) = &item.expr else {
+            return Err(SqlError::Unsupported(format!(
+                "ORDER BY expression: {:?}",
+                item.expr
+            )));
+        };
+        let idx = table
+            .column_index(&ident.value)
+            .ok_or_else(|| SqlError::NoSuchColumn(ident.value.clone()))?;
+        // `asc: None` means the default, which is ascending.
+        keys.push((idx, item.asc != Some(false)));
+    }
+    Ok(keys)
+}
+
+/// Order two rows by a list of sort keys. NULLs sort last under ascending order
+/// (and so first under descending), matching the common SQL default.
+fn order_cmp(keys: &[(usize, bool)], a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for &(idx, ascending) in keys {
+        let ord = value_cmp(&a[idx], &b[idx]);
+        let ord = if ascending { ord } else { ord.reverse() };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// A total order over values for sorting. NULL is treated as greater than any
+/// non-NULL value; mismatched types compare equal (they cannot arise within one
+/// typed column).
+fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        (Value::Null, _) => Ordering::Greater,
+        (_, Value::Null) => Ordering::Less,
+        (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    }
+}
+
+/// Evaluate a `LIMIT`/`OFFSET` expression to a non-negative row count.
+fn count_literal(expr: &Expr) -> Result<usize> {
+    match literal(expr)? {
+        Value::Int64(n) if n >= 0 => Ok(n as usize),
+        Value::Int64(n) => Err(SqlError::Type(format!("LIMIT/OFFSET must be >= 0: {n}"))),
+        other => Err(SqlError::Type(format!(
+            "LIMIT/OFFSET must be an integer: {other:?}"
+        ))),
+    }
 }
 
 /// Encode a value as an order-preserving B+tree index key. Integers use a
@@ -1115,6 +1206,147 @@ mod tests {
                 vec![Value::Int64(1), Value::Text("a".into())],
                 vec![Value::Int64(2), Value::Text("b".into())],
             ]
+        );
+    }
+
+    fn ints(outcome: Outcome) -> Vec<i64> {
+        rows(outcome)
+            .into_iter()
+            .map(|r| match r[0] {
+                Value::Int64(n) => n,
+                ref other => panic!("expected an int, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn order_by_sorts_ascending_and_descending() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (2,'b'),(1,'a'),(3,'c')")
+            .unwrap();
+
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t ORDER BY id")
+                    .unwrap()
+            ),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t ORDER BY id DESC")
+                    .unwrap()
+            ),
+            vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn order_by_can_sort_on_a_non_projected_column() {
+        // The sort key `name` is not in the projection, but ordering still works
+        // because we sort the full rows before projecting.
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'charlie'),(2,'alice'),(3,'bob')")
+            .unwrap();
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t ORDER BY name")
+                    .unwrap()
+            ),
+            vec![2, 3, 1] // alice, bob, charlie
+        );
+    }
+
+    #[test]
+    fn order_by_multiple_keys_and_nulls_sort_last() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (grp BIGINT, ord BIGINT)")
+            .unwrap();
+        // Two groups; one row has a NULL ordering value.
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,20),(1,NULL),(1,10),(2,5)")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT grp, ord FROM t ORDER BY grp ASC, ord ASC")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Int64(1), Value::Int64(10)],
+                vec![Value::Int64(1), Value::Int64(20)],
+                vec![Value::Int64(1), Value::Null], // NULL sorts last within grp 1
+                vec![Value::Int64(2), Value::Int64(5)],
+            ]
+        );
+    }
+
+    #[test]
+    fn limit_and_offset_apply_after_ordering() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (5),(3),(1),(4),(2)")
+            .unwrap();
+
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t ORDER BY id LIMIT 2")
+                    .unwrap()
+            ),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t ORDER BY id LIMIT 2 OFFSET 1")
+                    .unwrap()
+            ),
+            vec![2, 3]
+        );
+        // LIMIT past the end is clamped to what's available.
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t ORDER BY id DESC LIMIT 10")
+                    .unwrap()
+            ),
+            vec![5, 4, 3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn limit_with_where_filters_then_caps() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+            .unwrap();
+        assert_eq!(
+            ints(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE id > 2 ORDER BY id LIMIT 1")
+                    .unwrap()
+            ),
+            vec![3]
         );
     }
 }
