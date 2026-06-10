@@ -241,6 +241,21 @@ fn sql_auto_commit_roundtrip() {
             Some(WireValue::Str("alice".into()))
         ]]
     );
+
+    // UPDATE reports the affected count and the change is visible.
+    assert_eq!(
+        sql_affected(s.handle(sql("UPDATE users SET name = 'ALICE' WHERE id = 1"))),
+        1
+    );
+    let rows = sql_select(s.handle(sql("SELECT name FROM users WHERE id = 1")));
+    assert_eq!(rows, vec![vec![Some(WireValue::Str("ALICE".into()))]]);
+
+    // DELETE reports the affected count and removes the row.
+    assert_eq!(
+        sql_affected(s.handle(sql("DELETE FROM users WHERE id = 2"))),
+        1
+    );
+    assert!(sql_select(s.handle(sql("SELECT id FROM users WHERE id = 2"))).is_empty());
 }
 
 #[test]

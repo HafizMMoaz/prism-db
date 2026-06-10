@@ -613,6 +613,7 @@ fn outcome_to_sql_result(outcome: Outcome) -> Message {
                 .collect();
             (0, descs, wire_rows)
         }
+        Outcome::Update { count } | Outcome::Delete { count } => (count as u64, vec![], vec![]),
     };
     Message::SqlResult {
         status: 0,

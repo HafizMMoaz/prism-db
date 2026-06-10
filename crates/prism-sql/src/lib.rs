@@ -4,12 +4,14 @@
 //! shares MVCC, locking, recovery, and cross-model transactions with KV and
 //! documents. See `docs/components/sql-engine.md`.
 //!
-//! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`, and
-//! `SELECT <cols|*> FROM t [WHERE <predicate>]` over a sequential scan, for the
-//! types `BOOL`/`BIGINT`/`TEXT`. Deferred: joins, aggregates, `ORDER BY`,
-//! index scans, the formal bind/rewrite/plan IR, and schema persistence. The
-//! current executor interprets the parsed AST directly against the in-memory
-//! catalog; the full parse→bind→plan→execute pipeline is a follow-up.
+//! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`,
+//! `SELECT <cols|*> FROM t [WHERE <predicate>]`, `UPDATE t SET … [WHERE …]`,
+//! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
+//! index seek for `SELECT … WHERE pk = …`), for the types `BOOL`/`BIGINT`/
+//! `TEXT`. Deferred: joins, aggregates, `ORDER BY`, arithmetic in `SET`,
+//! updating a primary-key column, the formal bind/rewrite/plan IR. The current
+//! executor interprets the parsed AST directly against the catalog; the full
+//! parse→bind→plan→execute pipeline is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -26,8 +28,9 @@ use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
-    BinaryOperator, ColumnOption, DataType, Expr, Query, SelectItem, SetExpr, Statement,
-    TableFactor, TableObject, Value as SqlValue,
+    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Expr, FromTable,
+    Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
+    Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -51,6 +54,16 @@ pub enum Outcome {
         columns: Vec<String>,
         /// Result rows, each aligned with `columns`.
         rows: Vec<Vec<Value>>,
+    },
+    /// An `UPDATE` modified `count` rows.
+    Update {
+        /// Rows updated.
+        count: usize,
+    },
+    /// A `DELETE` removed `count` rows.
+    Delete {
+        /// Rows deleted.
+        count: usize,
     },
 }
 
@@ -105,6 +118,13 @@ impl SqlEngine {
             Statement::CreateTable(ct) => self.exec_create_table(ct),
             Statement::Insert(ins) => self.exec_insert(txn, ins),
             Statement::Query(q) => self.exec_select(txn, *q),
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => self.exec_update(txn, table, assignments, selection),
+            Statement::Delete(del) => self.exec_delete(txn, del),
             other => Err(SqlError::Unsupported(format!(
                 "statement: {}",
                 statement_kind(&other)
@@ -313,6 +333,132 @@ impl SqlEngine {
         Ok(Outcome::Select { columns, rows })
     }
 
+    /// Execute `UPDATE t SET col = expr, … [WHERE pred]`.
+    ///
+    /// A sequential scan applies the predicate per row; matching rows are
+    /// re-encoded and written as a new MVCC version. The primary-key index is
+    /// repointed to each new version (its key is unchanged — updating a primary
+    /// key is rejected, since that would need re-keying and a fresh uniqueness
+    /// check). Index seeks for `UPDATE … WHERE pk = …` are a later optimization.
+    fn exec_update(
+        &self,
+        txn: &TxnHandle,
+        table: TableWithJoins,
+        assignments: Vec<Assignment>,
+        selection: Option<Expr>,
+    ) -> Result<Outcome> {
+        if !table.joins.is_empty() {
+            return Err(SqlError::Unsupported("UPDATE with joins".into()));
+        }
+        let TableFactor::Table { name, .. } = &table.relation else {
+            return Err(SqlError::Unsupported(
+                "UPDATE target must be a table name".into(),
+            ));
+        };
+        let table = self.catalog.table(&object_name(name))?;
+
+        // Resolve each `SET col = expr` to a (column index, value expr) pair.
+        let mut sets: Vec<(usize, Expr)> = Vec::with_capacity(assignments.len());
+        for a in assignments {
+            let AssignmentTarget::ColumnName(col) = a.target else {
+                return Err(SqlError::Unsupported(
+                    "UPDATE SET target must be a single column".into(),
+                ));
+            };
+            let col_name = object_name(&col);
+            let idx = table
+                .column_index(&col_name)
+                .ok_or(SqlError::NoSuchColumn(col_name))?;
+            if table.primary_key == Some(idx) {
+                return Err(SqlError::Unsupported(
+                    "cannot UPDATE a PRIMARY KEY column".into(),
+                ));
+            }
+            sets.push((idx, a.value));
+        }
+
+        let types = table.types();
+        let index = self.pk_index(&table);
+        let mut count = 0;
+        // scan() materializes the visible rows up front, so writing new
+        // versions in this loop cannot disturb the iteration.
+        for (rid, payload) in self.store.scan(txn, table.heap)? {
+            let mut row = types::decode_row(&types, &payload)?;
+            if let Some(pred) = &selection {
+                if !self.matches(pred, &row, &table)? {
+                    continue;
+                }
+            }
+            // Evaluate every assignment against the *original* row, then apply,
+            // so `SET a = b, b = a` swaps rather than chaining.
+            let mut updates = Vec::with_capacity(sets.len());
+            for (idx, expr) in &sets {
+                let value = self.eval(expr, &row, &table)?;
+                if !matches!(value, Value::Null) && !value.type_matches(table.columns[*idx].ty) {
+                    return Err(SqlError::Type(format!(
+                        "value for column {} has the wrong type",
+                        table.columns[*idx].name
+                    )));
+                }
+                updates.push((*idx, value));
+            }
+            for (idx, value) in updates {
+                row[idx] = value;
+            }
+            // Enforce NOT NULL on the resulting row.
+            for (col, value) in table.columns.iter().zip(&row) {
+                if !col.nullable && matches!(value, Value::Null) {
+                    return Err(SqlError::Type(format!("column {} is NOT NULL", col.name)));
+                }
+            }
+
+            let bytes = types::encode_row(&types, &row)?;
+            let new_rid = self.store.update(txn, rid, &bytes)?;
+            // update() writes a new version at a new RecordId; repoint the
+            // primary-key index so a later seek finds the live version.
+            if let (Some(tree), Some(pk_col)) = (&index, table.primary_key) {
+                let key = encode_index_key(&row[pk_col])?;
+                tree.insert(&key, new_rid)?;
+            }
+            count += 1;
+        }
+        Ok(Outcome::Update { count })
+    }
+
+    /// Execute `DELETE FROM t [WHERE pred]`.
+    ///
+    /// A sequential scan applies the predicate and deletes each matching row's
+    /// version. Primary-key index entries are intentionally left in place: MVCC
+    /// hides the deleted version (a seek reads through to find it gone), and a
+    /// later re-insert of the same key overwrites the stale entry.
+    fn exec_delete(&self, txn: &TxnHandle, del: Delete) -> Result<Outcome> {
+        let (FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables)) = &del.from;
+        if tables.len() != 1 || !tables[0].joins.is_empty() {
+            return Err(SqlError::Unsupported(
+                "DELETE needs exactly one table, no joins".into(),
+            ));
+        }
+        let TableFactor::Table { name, .. } = &tables[0].relation else {
+            return Err(SqlError::Unsupported(
+                "DELETE target must be a table name".into(),
+            ));
+        };
+        let table = self.catalog.table(&object_name(name))?;
+        let types = table.types();
+        let mut count = 0;
+        for (rid, payload) in self.store.scan(txn, table.heap)? {
+            if let Some(pred) = &del.selection {
+                let row = types::decode_row(&types, &payload)?;
+                if !self.matches(pred, &row, &table)? {
+                    continue;
+                }
+            }
+            self.store.delete(txn, rid)?;
+            count += 1;
+        }
+        Ok(Outcome::Delete { count })
+    }
+
     /// If `selection` is exactly `<pk> = <literal>` (either operand order) on a
     /// table with a primary key whose type matches the literal, return that
     /// literal value for an index seek; otherwise `None` (fall back to a scan).
@@ -482,9 +628,9 @@ fn object_name(name: &sqlparser::ast::ObjectName) -> String {
 
 fn statement_kind(s: &Statement) -> &'static str {
     match s {
-        Statement::Update { .. } => "UPDATE",
-        Statement::Delete(_) => "DELETE",
         Statement::Drop { .. } => "DROP",
+        Statement::CreateIndex(_) => "CREATE INDEX",
+        Statement::AlterTable { .. } => "ALTER TABLE",
         _ => "this statement",
     }
 }
@@ -740,6 +886,235 @@ mod tests {
         assert_eq!(
             by_pk,
             vec![vec![Value::Int64(20), Value::Text("twenty".into())]]
+        );
+    }
+
+    fn affected(outcome: Outcome) -> usize {
+        match outcome {
+            Outcome::Update { count } | Outcome::Delete { count } | Outcome::Insert { count } => {
+                count
+            }
+            other => panic!("expected a row count, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_with_where_changes_only_matching_rows() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("UPDATE t SET name = 'X' WHERE id >= 2")
+                    .unwrap()
+            ),
+            2
+        );
+
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT id, name FROM t")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Int64(1), Value::Text("a".into())],
+                vec![Value::Int64(2), Value::Text("X".into())],
+                vec![Value::Int64(3), Value::Text("X".into())],
+            ]
+        );
+    }
+
+    #[test]
+    fn update_without_where_touches_every_row() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, flag BOOL)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,false),(2,false)")
+            .unwrap();
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("UPDATE t SET flag = true")
+                    .unwrap()
+            ),
+            2
+        );
+        let r = rows(env.engine.execute_autocommit("SELECT flag FROM t").unwrap());
+        assert!(r.iter().all(|row| row[0] == Value::Bool(true)));
+    }
+
+    #[test]
+    fn update_evaluates_assignments_against_the_original_row() {
+        // `SET a = b, b = a` must swap, not chain through the new value of `a`.
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (a TEXT, b TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES ('left','right')")
+            .unwrap();
+        env.engine
+            .execute_autocommit("UPDATE t SET a = b, b = a")
+            .unwrap();
+        let r = rows(env.engine.execute_autocommit("SELECT a, b FROM t").unwrap());
+        assert_eq!(
+            r,
+            vec![vec![
+                Value::Text("right".into()),
+                Value::Text("left".into())
+            ]]
+        );
+    }
+
+    #[test]
+    fn update_keeps_the_primary_key_index_consistent() {
+        // After an UPDATE the PK seek (index path) must still find the row, with
+        // its new column values — i.e. the index was repointed to the new
+        // version, not left dangling at the old one.
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (1,'a'),(2,'b')")
+            .unwrap();
+        env.engine
+            .execute_autocommit("UPDATE u SET name = 'updated' WHERE id = 2")
+            .unwrap();
+
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT name FROM u WHERE id = 2")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Text("updated".into())]]);
+    }
+
+    #[test]
+    fn update_rejects_changing_a_primary_key_and_not_null() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT NOT NULL)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (1,'a')")
+            .unwrap();
+        // Updating the primary-key column is not supported.
+        assert!(matches!(
+            env.engine.execute_autocommit("UPDATE u SET id = 5"),
+            Err(SqlError::Unsupported(_))
+        ));
+        // A NOT NULL column cannot be set to NULL.
+        assert!(matches!(
+            env.engine.execute_autocommit("UPDATE u SET name = NULL"),
+            Err(SqlError::Type(_))
+        ));
+    }
+
+    #[test]
+    fn delete_removes_matching_rows_and_allows_pk_reuse() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("DELETE FROM u WHERE id = 2")
+                    .unwrap()
+            ),
+            1
+        );
+
+        // The deleted row is gone from both the scan and the PK seek.
+        let r = rows(env.engine.execute_autocommit("SELECT id FROM u").unwrap());
+        assert_eq!(r, vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]);
+        assert!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM u WHERE id = 2")
+                    .unwrap()
+            )
+            .is_empty()
+        );
+
+        // The freed primary key can be inserted again.
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("INSERT INTO u VALUES (2,'fresh')")
+                    .unwrap()
+            ),
+            1
+        );
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT name FROM u WHERE id = 2")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Text("fresh".into())]]);
+    }
+
+    #[test]
+    fn delete_without_where_empties_the_table() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1),(2),(3)")
+            .unwrap();
+        assert_eq!(
+            affected(env.engine.execute_autocommit("DELETE FROM t").unwrap()),
+            3
+        );
+        assert!(rows(env.engine.execute_autocommit("SELECT * FROM t").unwrap()).is_empty());
+    }
+
+    #[test]
+    fn update_and_delete_are_atomic_within_a_txn() {
+        // Both statements run in one transaction; an abort rolls back both.
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'a'),(2,'b')")
+            .unwrap();
+
+        let txn = env.engine.txns.begin(TxnMode::ReadWrite);
+        env.engine.execute(&txn, "UPDATE t SET name = 'z'").unwrap();
+        env.engine
+            .execute(&txn, "DELETE FROM t WHERE id = 1")
+            .unwrap();
+        txn.abort().unwrap();
+
+        // After the abort the original two rows are intact and unchanged.
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT id, name FROM t")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Int64(1), Value::Text("a".into())],
+                vec![Value::Int64(2), Value::Text("b".into())],
+            ]
         );
     }
 }
