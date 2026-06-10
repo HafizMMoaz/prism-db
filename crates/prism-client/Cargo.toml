@@ -13,3 +13,5 @@ repository.workspace = true
 prism-protocol = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }

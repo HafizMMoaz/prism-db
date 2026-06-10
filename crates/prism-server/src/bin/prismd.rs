@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use prism_protocol::DEFAULT_PORT;
-use prism_server::{Database, Server};
+use prism_server::{Database, Server, ServerConfig, tls};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -24,11 +24,29 @@ async fn main() -> ExitCode {
         },
         Some("run") => match args.get(2) {
             Some(dir) => {
-                let bind = args
-                    .get(3)
-                    .cloned()
-                    .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
-                run(dir, &bind).await
+                let mut bind = format!("0.0.0.0:{DEFAULT_PORT}");
+                let mut tls_cert = None;
+                let mut tls_key = None;
+                let mut i = 3;
+                while i < args.len() {
+                    match args[i].as_str() {
+                        "--tls-cert" => {
+                            i += 1;
+                            tls_cert = args.get(i).cloned();
+                        }
+                        "--tls-key" => {
+                            i += 1;
+                            tls_key = args.get(i).cloned();
+                        }
+                        a if !a.starts_with('-') => bind = a.to_string(),
+                        other => {
+                            eprintln!("prismd: unknown flag {other}");
+                            return usage();
+                        }
+                    }
+                    i += 1;
+                }
+                run(dir, &bind, tls_cert.as_deref(), tls_key.as_deref()).await
             }
             None => usage(),
         },
@@ -53,7 +71,7 @@ fn init(dir: &str) -> ExitCode {
     }
 }
 
-async fn run(dir: &str, bind: &str) -> ExitCode {
+async fn run(dir: &str, bind: &str, tls_cert: Option<&str>, tls_key: Option<&str>) -> ExitCode {
     if let Err(e) = std::fs::create_dir_all(dir) {
         eprintln!("prismd: cannot create {dir}: {e}");
         return ExitCode::FAILURE;
@@ -65,7 +83,29 @@ async fn run(dir: &str, bind: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let server = match Server::bind(db, bind).await {
+
+    let config = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            match tls::server_config_from_pem(Path::new(cert), Path::new(key)) {
+                Ok(tls) => ServerConfig {
+                    tls: Some(tls),
+                    ..Default::default()
+                },
+                Err(e) => {
+                    eprintln!("prismd: TLS configuration failed: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        (None, None) => ServerConfig::default(),
+        _ => {
+            eprintln!("prismd: --tls-cert and --tls-key must be given together");
+            return ExitCode::FAILURE;
+        }
+    };
+    let secure = config.tls.is_some();
+
+    let server = match Server::bind_with(db, bind, config).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("prismd: bind {bind} failed: {e}");
@@ -76,7 +116,10 @@ async fn run(dir: &str, bind: &str) -> ExitCode {
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| bind.to_string());
-    eprintln!("prismd: listening on {addr}");
+    eprintln!(
+        "prismd: listening on {addr}{}",
+        if secure { " (TLS)" } else { "" }
+    );
     if let Err(e) = server.run().await {
         eprintln!("prismd: server error: {e}");
         return ExitCode::FAILURE;
@@ -85,6 +128,6 @@ async fn run(dir: &str, bind: &str) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: prismd <init|run> <dir> [bind_addr]");
+    eprintln!("usage: prismd <init|run> <dir> [bind_addr] [--tls-cert FILE --tls-key FILE]");
     ExitCode::FAILURE
 }

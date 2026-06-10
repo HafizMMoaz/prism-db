@@ -23,6 +23,7 @@ pub mod database;
 pub mod error;
 pub mod server;
 pub mod session;
+pub mod tls;
 
 pub use database::{Config, Database};
 pub use error::{Result, ServerError};

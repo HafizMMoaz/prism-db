@@ -25,8 +25,9 @@ use std::time::Duration;
 use prism_protocol::{
     DEFAULT_IDLE_TIMEOUT_SECS, Message, NoticeSeverity, Packet, ProtocolError, frame,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio_rustls::TlsAcceptor;
 
 use crate::database::Database;
 use crate::session::Session;
@@ -35,12 +36,15 @@ use crate::session::Session;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 10_000;
 
 /// Network-server tuning.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// Maximum simultaneous connections; further connects are rejected.
     pub max_connections: usize,
     /// How long a connection may be idle before the server closes it.
     pub idle_timeout: Duration,
+    /// TLS configuration. When `Some`, connections are wrapped in TLS before the
+    /// first frame; when `None`, the server speaks plaintext.
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl Default for ServerConfig {
@@ -48,6 +52,7 @@ impl Default for ServerConfig {
         Self {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS as u64),
+            tls: None,
         }
     }
 }
@@ -101,9 +106,20 @@ impl Server {
             let guard = ConnGuard(self.active.clone());
             let db = self.db.clone();
             let idle = self.config.idle_timeout;
+            let tls = self.config.tls.clone();
             tokio::spawn(async move {
                 let _guard = guard; // decrements the active count on completion
-                let _ = serve_connection(stream, db, idle).await;
+                match tls {
+                    // Wrap in TLS before the first frame, then serve.
+                    Some(cfg) => {
+                        if let Ok(tls_stream) = TlsAcceptor::from(cfg).accept(stream).await {
+                            let _ = serve_connection(tls_stream, db, idle).await;
+                        }
+                    }
+                    None => {
+                        let _ = serve_connection(stream, db, idle).await;
+                    }
+                }
             });
         }
     }
@@ -121,8 +137,8 @@ impl Drop for ConnGuard {
 /// Run one connection's request loop until EOF, a handshake close, an idle
 /// timeout, a protocol violation, or an I/O error. The session (and thus any
 /// open transaction) is dropped on return.
-async fn serve_connection(
-    mut stream: TcpStream,
+async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
     db: Arc<Database>,
     idle_timeout: Duration,
 ) -> io::Result<()> {

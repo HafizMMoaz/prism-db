@@ -11,13 +11,32 @@
 //! `prism-doc` on the application side.
 
 use std::io;
+use std::sync::Arc;
 
 use prism_protocol::{
     AuthMechanism, ColumnDesc, DocCommand, ErrorInfo, KvCommand, KvResultBody, Message,
     PROTOCOL_VERSION, Packet, ProtocolError, TxnMode, Value, frame,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, ToSocketAddrs};
+use tokio_rustls::TlsConnector;
+
+/// A byte transport the client speaks the protocol over (plaintext TCP or TLS).
+trait Transport: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> Transport for T {}
+
+/// Build a rustls client config trusting `roots` (ring crypto backend).
+pub fn tls_client_config(roots: RootCertStore) -> Arc<rustls::ClientConfig> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default protocol versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Arc::new(config)
+}
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, ClientError>;
@@ -71,17 +90,37 @@ pub struct DocReply {
     pub docs: Vec<Vec<u8>>,
 }
 
-/// A connected, authenticated (after [`Client::authenticate`]) client.
+/// A connected, authenticated (after [`Client::authenticate`]) client over
+/// either a plaintext or a TLS transport.
 pub struct Client {
-    stream: TcpStream,
+    stream: Box<dyn Transport>,
     next_id: u32,
     buf: Vec<u8>,
 }
 
 impl Client {
-    /// Connect to `addr` and complete the `Hello` handshake.
+    /// Connect to `addr` over plaintext TCP and complete the `Hello` handshake.
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        Self::with_transport(Box::new(stream)).await
+    }
+
+    /// Connect to `addr` over TLS (verifying the server's certificate against
+    /// `config`, presented for `server_name`) and complete the handshake.
+    pub async fn connect_tls(
+        addr: impl ToSocketAddrs,
+        server_name: &str,
+        config: Arc<rustls::ClientConfig>,
+    ) -> Result<Self> {
+        let tcp = TcpStream::connect(addr).await?;
+        let name = ServerName::try_from(server_name.to_string())
+            .map_err(|e| ClientError::Unexpected(format!("invalid server name: {e}")))?;
+        let tls = TlsConnector::from(config).connect(name, tcp).await?;
+        Self::with_transport(Box::new(tls)).await
+    }
+
+    /// Complete the `Hello` handshake over an established transport.
+    async fn with_transport(stream: Box<dyn Transport>) -> Result<Self> {
         let mut client = Self {
             stream,
             next_id: 1,
@@ -102,7 +141,7 @@ impl Client {
         }
     }
 
-    /// Connect and authenticate in one step.
+    /// Connect (plaintext) and authenticate in one step.
     pub async fn connect_authenticated(
         addr: impl ToSocketAddrs,
         username: &str,

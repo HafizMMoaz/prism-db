@@ -18,6 +18,8 @@ allow = [
     "Unicode-3.0",
     "Zlib",
 ]
+# ring (rustls' crypto backend) ships an ISC LICENSE file, which cargo-deny
+# detects confidently — no clarify or OpenSSL acceptance is needed.
 confidence-threshold = 0.9
 
 [bans]

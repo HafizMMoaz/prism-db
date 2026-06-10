@@ -69,6 +69,11 @@ proptest = "1"
 sqlparser = { version = "0.54", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["full"] }
 scrypt = "0.11"
+# TLS via rustls with the ring crypto backend (no aws-lc C toolchain). ring's
+# license is clarified in deny.toml.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
 
 # ── Build profiles ─────────────────────────────────────────────────────────
 # Mirrors docs/operations/build-and-dev.md.
