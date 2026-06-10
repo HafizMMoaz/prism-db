@@ -1,0 +1,31 @@
+{
+  "name": "@prismdb/client",
+  "version": "0.1.0",
+  "description": "Pure-TypeScript client for PrismDB over the binary wire protocol (no native build).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test \"dist/test/*.test.js\"",
+    "example": "tsc -p tsconfig.json && node dist/examples/quickstart.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
