@@ -8,9 +8,11 @@
 //! `SELECT <cols|*> FROM t [WHERE <predicate>] [ORDER BY col [ASC|DESC], …]
 //! [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`, and `DELETE FROM t
 //! [WHERE …]` over a sequential scan (with a primary-key index seek for
-//! `SELECT … WHERE pk = …`), for the types `BOOL`/`BIGINT`/`TEXT`. Deferred:
-//! joins, aggregates, arithmetic in `SET`, updating a primary-key column, the
-//! formal bind/rewrite/plan IR. The current executor interprets the parsed AST
+//! `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`MIN`/`MAX` with an
+//! optional `GROUP BY`, for the types `BOOL`/`BIGINT`/`TEXT`. Deferred: joins,
+//! `AVG` (needs a floating-point type), `HAVING`, `ORDER BY` over aggregate
+//! output, arithmetic in `SET`, updating a primary-key column, the formal
+//! bind/rewrite/plan IR. The current executor interprets the parsed AST
 //! directly against the catalog; the full parse→bind→plan→execute pipeline is a
 //! follow-up.
 
@@ -29,9 +31,10 @@ use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Expr, FromTable,
-    OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins,
-    Value as SqlValue,
+    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete,
+    DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
+    GroupByExpr, OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
+    TableWithJoins, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -294,6 +297,19 @@ impl SqlEngine {
         };
         let table = self.catalog.table(&object_name(name))?;
 
+        // Aggregate query: any aggregate in the projection, or a GROUP BY.
+        let group_keys = parse_group_by(&select.group_by, &table)?;
+        if !group_keys.is_empty() || projection_has_aggregate(&select.projection) {
+            return self.exec_aggregate(
+                txn,
+                &select.projection,
+                &select.selection,
+                &table,
+                group_keys,
+                &query,
+            );
+        }
+
         // Resolve the projection to column indices.
         let projection: Vec<usize> = resolve_projection(&select.projection, &table)?;
         let columns: Vec<String> = projection
@@ -360,6 +376,130 @@ impl SqlEngine {
             .take(limit)
             .map(|full| projection.iter().map(|&i| full[i].clone()).collect())
             .collect();
+        Ok(Outcome::Select { columns, rows })
+    }
+
+    /// Execute an aggregate `SELECT`: a projection of group-key columns and/or
+    /// aggregate calls (`COUNT`/`SUM`/`MIN`/`MAX`), with an optional `GROUP BY`.
+    ///
+    /// Rows passing the `WHERE` predicate are partitioned by the group-key
+    /// tuple (one implicit group covering all rows when there is no `GROUP BY`,
+    /// so `SELECT COUNT(*)` over an empty table still yields a single `0` row).
+    /// Each group produces one output row. Groups are emitted in ascending
+    /// group-key order for determinism; `LIMIT`/`OFFSET` then apply.
+    fn exec_aggregate(
+        &self,
+        txn: &TxnHandle,
+        projection: &[SelectItem],
+        selection: &Option<Expr>,
+        table: &Table,
+        group_keys: Vec<usize>,
+        query: &Query,
+    ) -> Result<Outcome> {
+        // ORDER BY over aggregate output is not supported yet (it would need to
+        // reference computed columns); LIMIT/OFFSET still apply below.
+        if query.order_by.is_some() {
+            return Err(SqlError::Unsupported(
+                "ORDER BY with aggregates or GROUP BY".into(),
+            ));
+        }
+
+        // Resolve each projection item to either a group-key column or an
+        // aggregate, along with its output column name.
+        let mut outputs: Vec<(String, OutputCol)> = Vec::with_capacity(projection.len());
+        for item in projection {
+            let (expr, alias) = match item {
+                SelectItem::UnnamedExpr(e) => (e, None),
+                SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+                other => {
+                    return Err(SqlError::Unsupported(format!(
+                        "aggregate projection item: {other:?}"
+                    )));
+                }
+            };
+            match expr {
+                Expr::Function(f) => {
+                    let agg = parse_aggregate(f, table)?;
+                    let name = alias.unwrap_or_else(|| expr.to_string());
+                    outputs.push((name, OutputCol::Aggregate(agg)));
+                }
+                Expr::Identifier(id) => {
+                    let idx = table
+                        .column_index(&id.value)
+                        .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone()))?;
+                    if !group_keys.contains(&idx) {
+                        return Err(SqlError::Unsupported(format!(
+                            "column {} must appear in GROUP BY or an aggregate",
+                            id.value
+                        )));
+                    }
+                    let name = alias.unwrap_or_else(|| id.value.clone());
+                    outputs.push((name, OutputCol::GroupKey(idx)));
+                }
+                other => {
+                    return Err(SqlError::Unsupported(format!(
+                        "aggregate projection expression: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Gather the rows passing the predicate.
+        let types = table.types();
+        let mut rows_in: Vec<Vec<Value>> = Vec::new();
+        for (_, payload) in self.store.scan(txn, table.heap)? {
+            let full = types::decode_row(&types, &payload)?;
+            if let Some(pred) = selection {
+                if !self.matches(pred, &full, table)? {
+                    continue;
+                }
+            }
+            rows_in.push(full);
+        }
+
+        // Partition into groups, preserving first-seen order then sorting by key.
+        let mut groups: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+        if group_keys.is_empty() {
+            groups.push((Vec::new(), (0..rows_in.len()).collect()));
+        } else {
+            for (i, row) in rows_in.iter().enumerate() {
+                let key: Vec<Value> = group_keys.iter().map(|&k| row[k].clone()).collect();
+                match groups.iter_mut().find(|(k, _)| *k == key) {
+                    Some(entry) => entry.1.push(i),
+                    None => groups.push((key, vec![i])),
+                }
+            }
+            groups.sort_by(|a, b| key_cmp(&a.0, &b.0));
+        }
+
+        // Compute one output row per group.
+        let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
+        for (key, members) in &groups {
+            let mut cells = Vec::with_capacity(outputs.len());
+            for (_, col) in &outputs {
+                let value = match col {
+                    OutputCol::GroupKey(idx) => {
+                        let pos = group_keys.iter().position(|k| k == idx).expect("group key");
+                        key[pos].clone()
+                    }
+                    OutputCol::Aggregate(agg) => agg.compute(members, &rows_in)?,
+                };
+                cells.push(value);
+            }
+            out_rows.push(cells);
+        }
+
+        // LIMIT / OFFSET over the grouped output.
+        let offset = match &query.offset {
+            Some(o) => count_literal(&o.value)?,
+            None => 0,
+        };
+        let limit = match &query.limit {
+            Some(e) => count_literal(e)?,
+            None => usize::MAX,
+        };
+        let rows = out_rows.into_iter().skip(offset).take(limit).collect();
+        let columns = outputs.into_iter().map(|(name, _)| name).collect();
         Ok(Outcome::Select { columns, rows })
     }
 
@@ -652,6 +792,211 @@ fn count_literal(expr: &Expr) -> Result<usize> {
             "LIMIT/OFFSET must be an integer: {other:?}"
         ))),
     }
+}
+
+/// A column in an aggregate query's output: either a `GROUP BY` key (carried
+/// through) or a computed aggregate.
+enum OutputCol {
+    GroupKey(usize),
+    Aggregate(Aggregate),
+}
+
+/// A supported aggregate function.
+#[derive(Clone, Copy)]
+enum AggFunc {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
+/// An aggregate call: a function over an optional column (`COUNT(*)` has none).
+struct Aggregate {
+    func: AggFunc,
+    col: Option<usize>,
+}
+
+impl Aggregate {
+    /// Fold this aggregate over the `members` rows (indices into `rows`).
+    fn compute(&self, members: &[usize], rows: &[Vec<Value>]) -> Result<Value> {
+        use std::cmp::Ordering;
+        match self.func {
+            // COUNT(*) counts rows; COUNT(col) counts non-NULL values.
+            AggFunc::Count => {
+                let n = match self.col {
+                    None => members.len(),
+                    Some(c) => members
+                        .iter()
+                        .filter(|&&i| !matches!(rows[i][c], Value::Null))
+                        .count(),
+                };
+                Ok(Value::Int64(n as i64))
+            }
+            // SUM over integers, skipping NULLs; an empty/all-NULL group is NULL.
+            AggFunc::Sum => {
+                let c = self.col.expect("SUM has a column");
+                let mut sum: i64 = 0;
+                let mut seen = false;
+                for &i in members {
+                    match &rows[i][c] {
+                        Value::Null => {}
+                        Value::Int64(n) => {
+                            sum += n;
+                            seen = true;
+                        }
+                        other => {
+                            return Err(SqlError::Type(format!(
+                                "SUM over a non-integer value: {other:?}"
+                            )));
+                        }
+                    }
+                }
+                Ok(if seen { Value::Int64(sum) } else { Value::Null })
+            }
+            // MIN/MAX over any comparable type, skipping NULLs; empty group NULL.
+            AggFunc::Min | AggFunc::Max => {
+                let c = self.col.expect("MIN/MAX has a column");
+                let want_min = matches!(self.func, AggFunc::Min);
+                let mut best: Option<&Value> = None;
+                for &i in members {
+                    let v = &rows[i][c];
+                    if matches!(v, Value::Null) {
+                        continue;
+                    }
+                    best = Some(match best {
+                        None => v,
+                        Some(cur) => {
+                            let ord = value_cmp(v, cur);
+                            let take = if want_min {
+                                ord == Ordering::Less
+                            } else {
+                                ord == Ordering::Greater
+                            };
+                            if take { v } else { cur }
+                        }
+                    });
+                }
+                Ok(best.cloned().unwrap_or(Value::Null))
+            }
+        }
+    }
+}
+
+/// Whether any projection item is an aggregate function call.
+fn projection_has_aggregate(items: &[SelectItem]) -> bool {
+    items.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::UnnamedExpr(Expr::Function(_))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::Function(_),
+                    ..
+                }
+        )
+    })
+}
+
+/// Parse a `GROUP BY` clause to a list of distinct key column indices. Only
+/// simple column references are supported.
+fn parse_group_by(group_by: &GroupByExpr, table: &Table) -> Result<Vec<usize>> {
+    match group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => {
+            if !modifiers.is_empty() {
+                return Err(SqlError::Unsupported("GROUP BY modifiers".into()));
+            }
+            let mut keys = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                let Expr::Identifier(id) = e else {
+                    return Err(SqlError::Unsupported(format!("GROUP BY expression: {e:?}")));
+                };
+                let idx = table
+                    .column_index(&id.value)
+                    .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone()))?;
+                if !keys.contains(&idx) {
+                    keys.push(idx);
+                }
+            }
+            Ok(keys)
+        }
+        GroupByExpr::All(_) => Err(SqlError::Unsupported("GROUP BY ALL".into())),
+    }
+}
+
+/// Parse an aggregate function call (`COUNT`/`SUM`/`MIN`/`MAX`) to an
+/// [`Aggregate`]. `AVG` is rejected for now (it needs a floating-point type).
+fn parse_aggregate(f: &Function, table: &Table) -> Result<Aggregate> {
+    if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
+        return Err(SqlError::Unsupported(
+            "window / FILTER / WITHIN GROUP aggregates".into(),
+        ));
+    }
+    let name = object_name(&f.name).to_ascii_uppercase();
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(SqlError::Unsupported(format!(
+            "{name} requires an argument"
+        )));
+    };
+    if list.duplicate_treatment == Some(DuplicateTreatment::Distinct) {
+        return Err(SqlError::Unsupported("DISTINCT aggregates".into()));
+    }
+    if list.args.len() != 1 {
+        return Err(SqlError::Unsupported(format!(
+            "{name} takes exactly one argument"
+        )));
+    }
+    let FunctionArg::Unnamed(arg) = &list.args[0] else {
+        return Err(SqlError::Unsupported("named aggregate argument".into()));
+    };
+    // Resolve a column-identifier argument to its index.
+    let col_of = |arg: &FunctionArgExpr| -> Result<usize> {
+        match arg {
+            FunctionArgExpr::Expr(Expr::Identifier(id)) => table
+                .column_index(&id.value)
+                .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone())),
+            other => Err(SqlError::Unsupported(format!(
+                "aggregate argument: {other:?}"
+            ))),
+        }
+    };
+    let func = match name.as_str() {
+        "COUNT" => {
+            let col = match arg {
+                FunctionArgExpr::Wildcard => None,
+                other => Some(col_of(other)?),
+            };
+            return Ok(Aggregate {
+                func: AggFunc::Count,
+                col,
+            });
+        }
+        "SUM" => AggFunc::Sum,
+        "MIN" => AggFunc::Min,
+        "MAX" => AggFunc::Max,
+        "AVG" => {
+            return Err(SqlError::Unsupported(
+                "AVG needs a floating-point column type (deferred)".into(),
+            ));
+        }
+        other => {
+            return Err(SqlError::Unsupported(format!("aggregate function {other}")));
+        }
+    };
+    Ok(Aggregate {
+        func,
+        col: Some(col_of(arg)?),
+    })
+}
+
+/// Compare two group-key tuples element-wise using [`value_cmp`].
+fn key_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let ord = value_cmp(x, y);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Encode a value as an order-preserving B+tree index key. Integers use a
@@ -1348,5 +1693,186 @@ mod tests {
             ),
             vec![3]
         );
+    }
+
+    fn one_row(outcome: Outcome) -> Vec<Value> {
+        let mut r = rows(outcome);
+        assert_eq!(r.len(), 1, "expected exactly one row");
+        r.pop().unwrap()
+    }
+
+    #[test]
+    fn whole_table_aggregates() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, score BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,10),(2,30),(3,NULL),(4,20)")
+            .unwrap();
+
+        let row = one_row(
+            env.engine
+                .execute_autocommit(
+                    "SELECT COUNT(*), COUNT(score), SUM(score), MIN(score), MAX(score) FROM t",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            row,
+            vec![
+                Value::Int64(4),  // COUNT(*) — all rows
+                Value::Int64(3),  // COUNT(score) — non-NULL only
+                Value::Int64(60), // SUM skips NULL
+                Value::Int64(10), // MIN skips NULL
+                Value::Int64(30), // MAX skips NULL
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_column_names_and_aliases() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1),(2)")
+            .unwrap();
+        let out = env
+            .engine
+            .execute_autocommit("SELECT COUNT(*) AS n, MAX(id) FROM t")
+            .unwrap();
+        match out {
+            Outcome::Select { columns, rows } => {
+                assert_eq!(columns, vec!["n", "MAX(id)"]);
+                assert_eq!(rows, vec![vec![Value::Int64(2), Value::Int64(2)]]);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn count_star_over_empty_table_is_zero() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        // No rows: the implicit single group still yields one output row.
+        assert_eq!(
+            one_row(
+                env.engine
+                    .execute_autocommit("SELECT COUNT(*), SUM(id) FROM t")
+                    .unwrap()
+            ),
+            vec![Value::Int64(0), Value::Null] // SUM of nothing is NULL
+        );
+    }
+
+    #[test]
+    fn aggregates_respect_the_where_clause() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1),(2),(3),(4),(5)")
+            .unwrap();
+        assert_eq!(
+            one_row(
+                env.engine
+                    .execute_autocommit("SELECT COUNT(*), SUM(id) FROM t WHERE id > 3")
+                    .unwrap()
+            ),
+            vec![Value::Int64(2), Value::Int64(9)] // ids 4,5
+        );
+    }
+
+    #[test]
+    fn group_by_buckets_rows_and_orders_by_key() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE sales (region TEXT, amount BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "INSERT INTO sales VALUES ('west',10),('east',5),('west',20),('east',7),('north',3)",
+            )
+            .unwrap();
+
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT region, COUNT(*), SUM(amount) FROM sales GROUP BY region",
+                )
+                .unwrap(),
+        );
+        // Groups emitted in ascending key order: east, north, west.
+        assert_eq!(
+            r,
+            vec![
+                vec![
+                    Value::Text("east".into()),
+                    Value::Int64(2),
+                    Value::Int64(12)
+                ],
+                vec![
+                    Value::Text("north".into()),
+                    Value::Int64(1),
+                    Value::Int64(3)
+                ],
+                vec![
+                    Value::Text("west".into()),
+                    Value::Int64(2),
+                    Value::Int64(30)
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn group_by_with_limit() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (g BIGINT, v BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (3,1),(1,1),(2,1),(1,1)")
+            .unwrap();
+        // Groups sorted by key (1,2,3); LIMIT 2 keeps the first two.
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT g, COUNT(*) FROM t GROUP BY g LIMIT 2")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(2), Value::Int64(1)],
+            ]
+        );
+    }
+
+    #[test]
+    fn aggregate_query_rejects_a_bare_non_grouped_column() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (g BIGINT, v BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,10)")
+            .unwrap();
+        // `v` is neither grouped nor aggregated.
+        assert!(matches!(
+            env.engine
+                .execute_autocommit("SELECT g, v, COUNT(*) FROM t GROUP BY g"),
+            Err(SqlError::Unsupported(_))
+        ));
+        // AVG is explicitly deferred.
+        assert!(matches!(
+            env.engine.execute_autocommit("SELECT AVG(v) FROM t"),
+            Err(SqlError::Unsupported(_))
+        ));
     }
 }

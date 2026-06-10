@@ -256,6 +256,11 @@ fn sql_auto_commit_roundtrip() {
         1
     );
     assert!(sql_select(s.handle(sql("SELECT id FROM users WHERE id = 2"))).is_empty());
+
+    // An aggregate flows back through the same result path: one row (id = 1)
+    // remains after the update + delete above.
+    let agg = sql_select(s.handle(sql("SELECT COUNT(*) FROM users")));
+    assert_eq!(agg, vec![vec![Some(WireValue::Int64(1))]]);
 }
 
 #[test]
