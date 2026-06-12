@@ -72,6 +72,18 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// A crash-durable configuration: the WAL fsyncs on commit and on segment
+    /// rotation. This is the setting a real server (`prismd`) should run with;
+    /// the default favors speed (`SyncMode::None`) for embedded and test use.
+    pub fn durable() -> Self {
+        Self {
+            wal_sync: SyncMode::Fsync,
+            ..Self::default()
+        }
+    }
+}
+
 /// An embedded PrismDB instance: the shared engine behind the wire protocol.
 pub struct Database {
     store: Arc<RecordStore>,
@@ -154,6 +166,14 @@ impl Database {
             db.load_catalog()?;
         }
         Ok(db)
+    }
+
+    /// Take a checkpoint: flush all dirty pages to disk and fsync. After this,
+    /// crash recovery can skip the flushed prefix and only replays the WAL tail
+    /// written since. Safe to call periodically or before a clean shutdown.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.store.checkpoint()?;
+        Ok(())
     }
 
     /// Look up a non-expired idempotency record by key: the `(txn_id,

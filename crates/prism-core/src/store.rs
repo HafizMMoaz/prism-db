@@ -85,6 +85,19 @@ impl RecordStore {
         self.wal.clone()
     }
 
+    /// Take a checkpoint: flush every dirty page to disk and fsync the heap.
+    ///
+    /// This advances the point on disk that crash recovery can trust — after a
+    /// checkpoint, incremental redo skips the flushed prefix and only replays
+    /// records written since. Cheap to call periodically or at clean shutdown.
+    /// (The WAL invariant means each flushed page's log records are already
+    /// durable.) Pages momentarily latched by a concurrent writer are flushed
+    /// by a later checkpoint; recovery stays correct either way.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.buffer.flush_all()?;
+        Ok(())
+    }
+
     /// Seed the heap directory from a recovery pass (the `heap -> pages` map
     /// rebuilt from the WAL's `HeapPage` records), so heaps and `scan` work after
     /// restart. Each heap's pages are given in allocation order.

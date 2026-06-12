@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use prism_doc::{DocValue, Document};
 use prism_protocol::{DocCommand, DocQuery, KvCommand, KvResultBody, Message, Value as WireValue};
-use prism_server::{Database, Session};
+use prism_server::{Config, Database, Session};
 use prism_testkit::TempDir;
 
 fn sql(s: &str) -> Message {
@@ -138,6 +138,51 @@ fn all_three_models_survive_restart() {
             ..
         } => assert_eq!(value.as_deref(), Some(&b"100"[..])),
         other => panic!("expected KvResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn checkpoint_then_more_writes_all_survive_durable_restart() {
+    // A durable database: write, checkpoint (flush to disk), write more, then
+    // reopen. Both the checkpointed and the post-checkpoint data must be there.
+    let tmp = TempDir::new("durability-ckpt").unwrap();
+    {
+        let db = Arc::new(Database::open_with(tmp.path(), Config::durable()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY, v BIGINT)"));
+        s.handle(sql("INSERT INTO t VALUES (1,10),(2,20)"));
+        db.checkpoint().unwrap(); // flush the first batch to disk
+
+        // More writes after the checkpoint (only in the WAL + dirty buffers).
+        s.handle(sql("INSERT INTO t VALUES (3,30)"));
+        s.handle(sql("UPDATE t SET v = 99 WHERE id = 1"));
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open_with(tmp.path(), Config::durable()).unwrap());
+    let mut s = Session::new(db);
+    match s.handle(sql("SELECT id, v FROM t ORDER BY id")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => {
+            assert_eq!(
+                rows.len(),
+                3,
+                "checkpointed and post-checkpoint rows survive"
+            );
+            assert_eq!(
+                rows[0][1],
+                Some(WireValue::Int64(99)),
+                "post-checkpoint UPDATE applied"
+            );
+            assert_eq!(
+                rows[2][0],
+                Some(WireValue::Int64(3)),
+                "post-checkpoint INSERT applied"
+            );
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
     }
 }
 

@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use prism_protocol::DEFAULT_PORT;
-use prism_server::{Database, Server, ServerConfig, tls};
+use prism_server::{Config, Database, Server, ServerConfig, tls};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -59,7 +59,7 @@ fn init(dir: &str) -> ExitCode {
         eprintln!("prismd: cannot create {dir}: {e}");
         return ExitCode::FAILURE;
     }
-    match Database::open(Path::new(dir)) {
+    match Database::open_with(Path::new(dir), Config::durable()) {
         Ok(_) => {
             eprintln!("prismd: initialized database at {dir}");
             ExitCode::SUCCESS
@@ -76,7 +76,7 @@ async fn run(dir: &str, bind: &str, tls_cert: Option<&str>, tls_key: Option<&str
         eprintln!("prismd: cannot create {dir}: {e}");
         return ExitCode::FAILURE;
     }
-    let db = match Database::open(Path::new(dir)) {
+    let db = match Database::open_with(Path::new(dir), Config::durable()) {
         Ok(db) => Arc::new(db),
         Err(e) => {
             eprintln!("prismd: open {dir} failed: {e}");

@@ -14,15 +14,24 @@
 //! is exactly why Postgres has no undo phase. (CLRs / the Abort-undo machinery in
 //! the WAL format remain reserved for any future *in-place* structure.)
 //!
-//! Scope (this increment): no checkpoints yet, so redo replays the entire durable
-//! WAL prefix and rebuilds every touched page from scratch — never trusting a
-//! possibly-torn on-disk page. Checkpoints + page-LSN-skipping incremental redo
-//! are a performance follow-up. The WAL replay iterator stops at the first torn
-//! record (CRC mismatch), so exactly the durable prefix is applied.
+//! Redo is **incremental** (ARIES-style): for each page it loads the on-disk
+//! image and trusts it when the page checksum validates, replaying only records
+//! whose LSN is newer than the page's stored `page_lsn`. A page that is missing
+//! or torn (checksum mismatch) is rebuilt from scratch (base LSN 0, every record
+//! applied), so a possibly-torn page is never trusted. After a [checkpoint]
+//! (`RecordStore::checkpoint`, which flushes and fsyncs all dirty pages), the
+//! prefix is already on disk and redo skips it — bounding redo work to the tail
+//! written since the last checkpoint. The analysis of commit/abort status and
+//! the heap directory still scans the full durable log (cheap: no page I/O), so
+//! visibility stays exact; WAL truncation is a follow-up that builds on this.
+//! The replay iterator stops at the first torn record (CRC mismatch), so exactly
+//! the durable prefix is considered.
+//!
+//! [checkpoint]: crate::store::RecordStore::checkpoint
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use prism_storage::{DiskManager, PAGE_SIZE, PageId, PageType, SlottedPage};
+use prism_storage::{DiskManager, PAGE_SIZE, PageId, PageType, SlottedPage, checksum};
 use prism_wal::record::RecordPayload;
 use prism_wal::segment::SEGMENT_HEADER_SIZE;
 use prism_wal::{Lsn, Wal};
@@ -37,7 +46,11 @@ pub struct RecoveryReport {
     pub next_txn_id: TxnId,
     /// WAL records replayed.
     pub records_replayed: usize,
-    /// Pages rebuilt and written back.
+    /// Data records skipped because the on-disk page already reflected them
+    /// (its `page_lsn` was at or beyond the record). High after a checkpoint.
+    pub records_skipped: usize,
+    /// Pages modified and written back (those that needed at least one record
+    /// applied on top of their on-disk image).
     pub pages_rebuilt: usize,
     /// Committed transactions and their commit LSNs.
     pub committed: Vec<(TxnId, Lsn)>,
@@ -54,7 +67,7 @@ pub struct RecoveryReport {
 /// After this returns, reopen the [`DiskManager`] for normal operation so its
 /// page allocator accounts for the rebuilt (possibly file-extending) pages.
 pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
-    let mut pages: BTreeMap<u64, Box<[u8; PAGE_SIZE]>> = BTreeMap::new();
+    let mut cache = PageCache::new(disk);
     let mut committed: HashMap<TxnId, Lsn> = HashMap::new();
     let mut aborted: HashSet<TxnId> = HashSet::new();
     let mut data_txns: HashSet<TxnId> = HashSet::new();
@@ -63,6 +76,7 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
     let mut heap_index: HashMap<u64, usize> = HashMap::new();
     let mut max_txn = BOOTSTRAP_TXN;
     let mut replayed = 0usize;
+    let mut skipped = 0usize;
 
     let from = Lsn::from_parts(0, SEGMENT_HEADER_SIZE as u32);
     for item in wal.replay(from) {
@@ -75,8 +89,15 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
                 slot_id,
                 after_image,
             } => {
-                redo_insert(&mut pages, page_id, slot_id, &after_image, lsn)?;
                 data_txns.insert(record.txn_id);
+                cache.load(page_id)?;
+                // Already reflected on the on-disk page: nothing to redo.
+                if lsn.as_u64() <= cache.base(page_id) {
+                    skipped += 1;
+                } else {
+                    redo_insert(cache.page_mut(page_id), page_id, slot_id, &after_image, lsn)?;
+                    cache.mark(page_id);
+                }
             }
             RecordPayload::Update {
                 page_id,
@@ -84,26 +105,38 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
                 after_image,
                 ..
             } => {
-                redo_overwrite(&mut pages, page_id, slot_id, &after_image, lsn)?;
                 data_txns.insert(record.txn_id);
+                cache.load(page_id)?;
+                if lsn.as_u64() <= cache.base(page_id) {
+                    skipped += 1;
+                } else {
+                    redo_overwrite(cache.page_mut(page_id), page_id, slot_id, &after_image, lsn)?;
+                    cache.mark(page_id);
+                }
             }
             RecordPayload::Delete {
                 page_id,
                 slot_id,
                 before_image,
             } => {
-                redo_delete(
-                    &mut pages,
-                    page_id,
-                    slot_id,
-                    &before_image,
-                    record.txn_id,
-                    lsn,
-                )?;
                 data_txns.insert(record.txn_id);
+                cache.load(page_id)?;
+                if lsn.as_u64() <= cache.base(page_id) {
+                    skipped += 1;
+                } else {
+                    redo_delete(
+                        cache.page_mut(page_id),
+                        page_id,
+                        slot_id,
+                        &before_image,
+                        record.txn_id,
+                        lsn,
+                    )?;
+                    cache.mark(page_id);
+                }
             }
             RecordPayload::FullPageImage { page_id, image } => {
-                let mut buf = Box::new([0u8; PAGE_SIZE]);
+                data_txns.insert(record.txn_id);
                 if image.len() != PAGE_SIZE {
                     return Err(CoreError::Recovery(format!(
                         "full-page image for page {} is {} bytes",
@@ -111,9 +144,14 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
                         image.len()
                     )));
                 }
-                buf.copy_from_slice(&image);
-                pages.insert(page_id.as_u64(), buf);
-                data_txns.insert(record.txn_id);
+                cache.load(page_id)?;
+                if lsn.as_u64() <= cache.base(page_id) {
+                    skipped += 1;
+                } else {
+                    let buf = cache.page_mut(page_id);
+                    buf.copy_from_slice(&image);
+                    cache.mark(page_id);
+                }
             }
             RecordPayload::HeapPage { heap_id, page_id } => {
                 let idx = *heap_index.entry(heap_id).or_insert_with(|| {
@@ -128,7 +166,7 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
             RecordPayload::Abort => {
                 aborted.insert(record.txn_id);
             }
-            // No physical undo under MVCC; checkpoint markers are not used yet.
+            // No physical undo under MVCC; checkpoint markers carry no redo.
             RecordPayload::Clr { .. }
             | RecordPayload::BeginCheckpoint { .. }
             | RecordPayload::CheckpointContents { .. }
@@ -136,12 +174,9 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
         }
     }
 
-    // Write rebuilt pages back (with refreshed checksums) and make them durable.
-    let pages_rebuilt = pages.len();
-    for (pidv, mut buf) in pages {
-        SlottedPage::new(&mut buf).update_checksum();
-        disk.write_page(PageId(pidv), &buf)?;
-    }
+    // Write back only the pages we actually changed (with refreshed checksums)
+    // and make them durable. Pages already current on disk are left untouched.
+    let pages_rebuilt = cache.flush_dirty()?;
     disk.sync()?;
 
     // Losers (data records but neither committed nor explicitly aborted) are
@@ -155,6 +190,7 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
     Ok(RecoveryReport {
         next_txn_id: max_txn + 1,
         records_replayed: replayed,
+        records_skipped: skipped,
         pages_rebuilt,
         committed: committed.into_iter().collect(),
         aborted: aborted.into_iter().collect(),
@@ -162,18 +198,79 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
     })
 }
 
+/// In-memory pages being recovered: each is loaded once from disk (trusted if
+/// its checksum validates, giving a base LSN), modified by redo, and written
+/// back only if it changed.
+struct PageCache<'a> {
+    disk: &'a DiskManager,
+    pages: BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
+    base: HashMap<u64, u64>,
+    dirtied: HashSet<u64>,
+}
+
+impl<'a> PageCache<'a> {
+    fn new(disk: &'a DiskManager) -> Self {
+        Self {
+            disk,
+            pages: BTreeMap::new(),
+            base: HashMap::new(),
+            dirtied: HashSet::new(),
+        }
+    }
+
+    /// Load `page_id` on first use. A valid on-disk page is trusted (its
+    /// `page_lsn` becomes the base below which records are already applied); a
+    /// missing or torn page is rebuilt from scratch (base 0, empty heap page).
+    fn load(&mut self, page_id: PageId) -> Result<&mut Box<[u8; PAGE_SIZE]>> {
+        let key = page_id.as_u64();
+        if let std::collections::btree_map::Entry::Vacant(slot) = self.pages.entry(key) {
+            let mut buf = Box::new([0u8; PAGE_SIZE]);
+            let read_ok = self.disk.read_page(page_id, &mut buf).is_ok();
+            let stored = u16::from_le_bytes([buf[8], buf[9]]);
+            let valid = read_ok && stored == checksum::page_checksum(&buf);
+            let base = if valid {
+                u64::from_le_bytes(buf[0..8].try_into().expect("8 bytes"))
+            } else {
+                // Torn or never-written: start empty and replay every record.
+                SlottedPage::init(&mut buf, PageType::Heap);
+                0
+            };
+            self.base.insert(key, base);
+            slot.insert(buf);
+        }
+        Ok(self.pages.get_mut(&key).expect("page loaded"))
+    }
+
+    fn base(&self, page_id: PageId) -> u64 {
+        self.base[&page_id.as_u64()]
+    }
+
+    fn page_mut(&mut self, page_id: PageId) -> &mut Box<[u8; PAGE_SIZE]> {
+        self.pages.get_mut(&page_id.as_u64()).expect("page loaded")
+    }
+
+    fn mark(&mut self, page_id: PageId) {
+        self.dirtied.insert(page_id.as_u64());
+    }
+
+    /// Refresh checksums on and persist every modified page; returns the count.
+    fn flush_dirty(&mut self) -> Result<usize> {
+        for &key in &self.dirtied {
+            let buf = self.pages.get_mut(&key).expect("dirtied page loaded");
+            SlottedPage::new(buf).update_checksum();
+            self.disk.write_page(PageId(key), buf)?;
+        }
+        Ok(self.dirtied.len())
+    }
+}
+
 fn redo_insert(
-    pages: &mut BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
+    buf: &mut [u8; PAGE_SIZE],
     page_id: PageId,
     slot_id: u16,
     after_image: &[u8],
     lsn: Lsn,
 ) -> Result<()> {
-    let buf = pages.entry(page_id.as_u64()).or_insert_with(|| {
-        let mut b = Box::new([0u8; PAGE_SIZE]);
-        SlottedPage::init(&mut b, PageType::Heap);
-        b
-    });
     let mut page = SlottedPage::new(buf);
     match page.insert(after_image) {
         Some(slot) if slot == slot_id => {
@@ -192,15 +289,12 @@ fn redo_insert(
 }
 
 fn redo_overwrite(
-    pages: &mut BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
+    buf: &mut [u8; PAGE_SIZE],
     page_id: PageId,
     slot_id: u16,
     after_image: &[u8],
     lsn: Lsn,
 ) -> Result<()> {
-    let buf = pages.get_mut(&page_id.as_u64()).ok_or_else(|| {
-        CoreError::Recovery(format!("redo update on missing page {}", page_id.as_u64()))
-    })?;
     let mut page = SlottedPage::new(buf);
     let dst = page.get_mut(slot_id).ok_or_else(|| {
         CoreError::Recovery(format!(
@@ -217,16 +311,13 @@ fn redo_overwrite(
 }
 
 fn redo_delete(
-    pages: &mut BTreeMap<u64, Box<[u8; PAGE_SIZE]>>,
+    buf: &mut [u8; PAGE_SIZE],
     page_id: PageId,
     slot_id: u16,
     before_image: &[u8],
     txn_id: TxnId,
     lsn: Lsn,
 ) -> Result<()> {
-    let buf = pages.get_mut(&page_id.as_u64()).ok_or_else(|| {
-        CoreError::Recovery(format!("redo delete on missing page {}", page_id.as_u64()))
-    })?;
     let mut page = SlottedPage::new(buf);
     let dst = page.get_mut(slot_id).ok_or_else(|| {
         CoreError::Recovery(format!(
@@ -354,6 +445,81 @@ mod tests {
             read(rid_ghost),
             None,
             "loser's insert is invisible after recovery"
+        );
+        reader.commit().unwrap();
+    }
+
+    #[test]
+    fn checkpoint_makes_recovery_skip_the_flushed_prefix() {
+        let tmp = TempDir::new("recover-ckpt").unwrap();
+        let heap = tmp.path().join("heap.db");
+
+        {
+            let disk = Arc::new(DiskManager::open(&heap, true).unwrap());
+            let wal = open_wal(tmp.path());
+            let buffer = Arc::new(
+                BufferPool::new(disk.clone(), wal.clone(), BufConfig { frame_count: 16 }).unwrap(),
+            );
+            let txns = Arc::new(TxnManager::new(wal.clone()));
+            let store = RecordStore::new(buffer.clone(), wal.clone(), txns.clone());
+
+            // First batch, committed and then checkpointed (flushed to disk).
+            let t1 = txns.begin(TxnMode::ReadWrite);
+            for i in 0..30u8 {
+                store.insert(&t1, HEAP, &[i; 24]).unwrap();
+            }
+            t1.commit().unwrap();
+            store.checkpoint().unwrap(); // <-- flush all pages to disk
+
+            // Second batch, committed but NOT checkpointed (still only in the WAL
+            // and the dirty buffer pool).
+            let t2 = txns.begin(TxnMode::ReadWrite);
+            for i in 30..60u8 {
+                store.insert(&t2, HEAP, &[i; 24]).unwrap();
+            }
+            t2.commit().unwrap();
+
+            // Crash: drop in-memory state without flushing the second batch.
+            drop(store);
+            drop(buffer);
+            drop(txns);
+            drop(disk);
+        }
+
+        // Recovery should skip the checkpointed first batch and only replay the
+        // second batch's records.
+        let wal = open_wal(tmp.path());
+        let report = {
+            let disk = DiskManager::open(&heap, false).unwrap();
+            let r = recover(&wal, &disk).unwrap();
+            disk.close().unwrap();
+            r
+        };
+        assert!(
+            report.records_skipped >= 30,
+            "checkpointed prefix should be skipped, skipped only {}",
+            report.records_skipped
+        );
+
+        // All 60 rows are present and visible after recovery.
+        let disk = Arc::new(DiskManager::open(&heap, false).unwrap());
+        let buffer =
+            Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 16 }).unwrap());
+        let txns = Arc::new(TxnManager::new_recovered(
+            wal.clone(),
+            report.next_txn_id,
+            &report.committed,
+            &report.aborted,
+        ));
+        let store = RecordStore::new(buffer, wal, txns.clone());
+        store.seed_heap_directory(&report.heaps);
+
+        let reader = txns.begin(TxnMode::ReadOnly);
+        let rows = store.scan(&reader, HEAP).unwrap();
+        assert_eq!(
+            rows.len(),
+            60,
+            "both batches survive (checkpointed + replayed)"
         );
         reader.commit().unwrap();
     }
