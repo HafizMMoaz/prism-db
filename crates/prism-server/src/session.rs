@@ -202,6 +202,7 @@ impl Session {
                 username, password, ..
             } => match self.db.verify_user(&username, &password) {
                 Some(user_oid) => {
+                    crate::audit::auth_success(&username, user_oid);
                     self.auth = AuthState::Authenticated { user_oid };
                     Message::AuthAck {
                         status: 0,
@@ -210,6 +211,7 @@ impl Session {
                     }
                 }
                 None => {
+                    crate::audit::auth_failure(&username);
                     self.closing = true;
                     Message::AuthAck {
                         status: AUTH_BAD_CREDENTIALS,
@@ -285,6 +287,7 @@ impl Session {
         if ok {
             Ok(())
         } else {
+            crate::audit::denied(oid, need.label());
             Err(ServerError::Unauthorized(format!(
                 "operation requires the {} privilege",
                 need.label()
@@ -496,6 +499,7 @@ impl Session {
     /// Execute an administrative statement (user/grant management). The caller
     /// has already checked the ADMIN privilege.
     fn run_admin_sql(&self, sql: &str) -> Result<Message> {
+        let oid = self.user_oid();
         let stmt = sql.trim().trim_end_matches(';');
         let upper = stmt.to_ascii_uppercase();
         if let Some(rest) = strip_kw(stmt, &upper, "CREATE USER") {
@@ -506,6 +510,7 @@ impl Session {
                 .ok_or_else(|| ServerError::State("CREATE USER needs WITH PASSWORD '…'".into()))?;
             let role = role_clause(&upper, stmt).unwrap_or(Privileges::read_write());
             self.db.create_user(name, &password, role)?;
+            crate::audit::admin(oid, "CREATE USER", name);
         } else if strip_kw(stmt, &upper, "GRANT").is_some() {
             // GRANT <role> TO <user>
             let t: Vec<&str> = stmt.split_whitespace().collect();
@@ -515,6 +520,7 @@ impl Session {
             let role = Privileges::from_role(t[1])
                 .ok_or_else(|| ServerError::State(format!("unknown role: {}", t[1])))?;
             self.db.set_user_privileges(t[3], role)?;
+            crate::audit::admin(oid, "GRANT", t[3]);
         } else if strip_kw(stmt, &upper, "REVOKE").is_some() {
             // REVOKE ALL FROM <user>  (disables the account: privileges = NONE)
             let t: Vec<&str> = stmt.split_whitespace().collect();
@@ -526,10 +532,12 @@ impl Session {
                 .get(from + 1)
                 .ok_or_else(|| ServerError::State("REVOKE needs a username".into()))?;
             self.db.set_user_privileges(user, Privileges::NONE)?;
+            crate::audit::admin(oid, "REVOKE", user);
         } else if let Some(rest) = strip_kw(stmt, &upper, "DROP USER") {
             let name = first_word(rest)
                 .ok_or_else(|| ServerError::State("DROP USER needs a username".into()))?;
             self.db.drop_user(name)?;
+            crate::audit::admin(oid, "DROP USER", name);
         } else {
             return Err(ServerError::Unsupported(format!("admin statement: {stmt}")));
         }

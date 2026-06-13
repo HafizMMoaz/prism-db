@@ -14,8 +14,18 @@ use std::sync::Arc;
 use prism_protocol::DEFAULT_PORT;
 use prism_server::{Config, Database, Server, ServerConfig, tls};
 
+/// Install the tracing subscriber. Honors `RUST_LOG` (e.g. `RUST_LOG=info` or
+/// `RUST_LOG=audit=info,prism_server=warn`); defaults to `info`. Audit events
+/// are emitted on the `audit` target.
+fn init_logging() {
+    use tracing_subscriber::{EnvFilter, fmt};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt().with_env_filter(filter).with_target(true).try_init();
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    init_logging();
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("init") => match args.get(2) {
@@ -116,12 +126,9 @@ async fn run(dir: &str, bind: &str, tls_cert: Option<&str>, tls_key: Option<&str
         .local_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| bind.to_string());
-    eprintln!(
-        "prismd: listening on {addr}{}",
-        if secure { " (TLS)" } else { "" }
-    );
+    tracing::info!(target: "prismd", %addr, tls = secure, "listening");
     if let Err(e) = server.run().await {
-        eprintln!("prismd: server error: {e}");
+        tracing::error!(target: "prismd", error = %e, "server error");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

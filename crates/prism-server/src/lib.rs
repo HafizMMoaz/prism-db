@@ -17,6 +17,7 @@
 //! are a follow-up; see [`Session`] for the per-request simplifications and
 //! [`server`] for the deferred network features.
 
+pub mod audit;
 pub mod auth;
 pub mod catalog;
 pub mod database;

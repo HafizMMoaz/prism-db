@@ -94,7 +94,7 @@ impl Server {
     /// Accept connections forever, serving each on its own task.
     pub async fn run(self) -> io::Result<()> {
         loop {
-            let (stream, _peer) = self.listener.accept().await?;
+            let (stream, peer) = self.listener.accept().await?;
 
             // Enforce the connection cap before spending resources on a task.
             if self.active.fetch_add(1, Ordering::AcqRel) >= self.config.max_connections {
@@ -107,8 +107,10 @@ impl Server {
             let db = self.db.clone();
             let idle = self.config.idle_timeout;
             let tls = self.config.tls.clone();
+            let peer = peer.to_string();
             tokio::spawn(async move {
                 let _guard = guard; // decrements the active count on completion
+                crate::audit::connection_opened(&peer);
                 match tls {
                     // Wrap in TLS before the first frame, then serve.
                     Some(cfg) => {
@@ -120,6 +122,7 @@ impl Server {
                         let _ = serve_connection(stream, db, idle).await;
                     }
                 }
+                crate::audit::connection_closed(&peer);
             });
         }
     }
