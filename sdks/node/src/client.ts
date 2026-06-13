@@ -23,6 +23,8 @@ const EMPTY = Buffer.alloc(0);
 export interface ConnectOptions extends ConnectionOptions {
   username?: string;
   password?: string;
+  /** Select this database after connecting (runs `USE <database>`). */
+  database?: string;
   clientName?: string;
   clientVersion?: string;
 }
@@ -48,6 +50,10 @@ export class Client {
     const client = new Client(conn);
     try {
       await client.handshake(opts);
+      // On a multi-database server, select the requested database up front.
+      if (opts.database) {
+        await client.sql(`USE ${opts.database}`, { returnRows: false });
+      }
     } catch (err) {
       conn.close();
       throw err;

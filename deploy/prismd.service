@@ -1,0 +1,32 @@
+[Unit]
+Description=PrismDB multi-model database server
+Documentation=https://github.com/HafizMMoaz/prism-db
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# A dedicated unprivileged account (create it: `useradd --system --no-create-home prismdb`).
+User=prismdb
+Group=prismdb
+
+# systemd creates and owns /var/lib/prismdb for the service.
+StateDirectory=prismdb
+Environment=PRISM_DATA_DIR=/var/lib/prismdb
+Environment=RUST_LOG=info
+
+# Serve on all interfaces, port 4444. Add `--tls-cert FILE --tls-key FILE` for TLS.
+ExecStart=/usr/local/bin/prismd run --bind 0.0.0.0:4444
+
+Restart=on-failure
+RestartSec=2
+
+# Hardening.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/prismdb
+
+[Install]
+WantedBy=multi-user.target

@@ -21,6 +21,7 @@ struct Config {
     addr: String,
     user: String,
     password: String,
+    database: Option<String>,
 }
 
 #[tokio::main]
@@ -41,9 +42,21 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+    if let Some(db) = &config.database {
+        if let Err(e) = client.sql(&format!("USE {db}")).await {
+            eprintln!("prism-shell: cannot select database {db}: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
     eprintln!(
-        "connected to {} as {}. \\help for commands, \\quit to exit.",
-        config.addr, config.user
+        "connected to {} as {}{}. \\help for commands, \\quit to exit.",
+        config.addr,
+        config.user,
+        config
+            .database
+            .as_deref()
+            .map(|d| format!(" (database {d})"))
+            .unwrap_or_default()
     );
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -163,6 +176,7 @@ fn parse_args() -> Result<Config, String> {
         addr: format!("127.0.0.1:{DEFAULT_PORT}"),
         user: "admin".to_string(),
         password: "admin".to_string(),
+        database: None,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -176,8 +190,15 @@ fn parse_args() -> Result<Config, String> {
                 i += 1;
                 config.password = args.get(i).ok_or("--password needs a value")?.clone();
             }
+            "--database" | "-d" => {
+                i += 1;
+                config.database = Some(args.get(i).ok_or("--database needs a value")?.clone());
+            }
             "--help" | "-h" => {
-                return Err("usage: prism-shell [host:port] [--user U] [--password P]".into());
+                return Err(
+                    "usage: prism-shell [host:port] [--user U] [--password P] [--database D]"
+                        .into(),
+                );
             }
             addr if !addr.starts_with('-') => config.addr = addr.to_string(),
             other => return Err(format!("unknown flag {other}")),

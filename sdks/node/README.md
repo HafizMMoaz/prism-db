@@ -54,10 +54,12 @@ db.close();
 
 ### `Client.connect(opts)`
 
-`{ host?, port?, username?, password?, tls?, clientName?, clientVersion? }`.
+`{ host?, port?, username?, password?, database?, tls?, clientName?, clientVersion? }`.
 Performs the `Hello`/`Auth` handshake. Omit `username` to skip authentication
 (only useful against a server that doesn't require it). Pass `tls: true` (or Node
-TLS options) for TLS.
+TLS options) for TLS. On a multi-database server, pass `database` to select it at
+connect (runs `USE <database>`); otherwise run `db.sql("USE <name>")` yourself,
+and manage databases with `CREATE DATABASE` / `DROP DATABASE` / `SHOW DATABASES`.
 
 ### SQL — `db.sql(text, { params?, returnRows? })`
 
