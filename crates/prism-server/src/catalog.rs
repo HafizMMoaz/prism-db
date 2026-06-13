@@ -119,6 +119,79 @@ impl CatalogEntry {
     }
 }
 
+/// Whether a persisted user record creates/updates an account or removes it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UserOp {
+    /// Create or update the account.
+    Upsert,
+    /// Remove the account (a tombstone).
+    Delete,
+}
+
+impl UserOp {
+    fn code(self) -> u8 {
+        match self {
+            UserOp::Upsert => 1,
+            UserOp::Delete => 2,
+        }
+    }
+    fn from_code(v: u8) -> Result<Self> {
+        match v {
+            1 => Ok(UserOp::Upsert),
+            2 => Ok(UserOp::Delete),
+            other => Err(ServerError::Corrupt(format!("bad user op {other}"))),
+        }
+    }
+}
+
+/// One persisted user account, written append-only to a reserved system heap.
+/// On open the records are replayed in order, so the last `Upsert` for a
+/// username wins and a `Delete` tombstones it — giving durable accounts and
+/// grants without in-place updates.
+#[derive(Clone, Debug)]
+pub struct UserEntry {
+    /// Create/update vs remove.
+    pub op: UserOp,
+    /// The account name.
+    pub username: String,
+    /// The account's stable OID.
+    pub oid: u64,
+    /// The privilege bitmask (see `auth::Privileges`).
+    pub privileges: u8,
+    /// The scrypt PHC hash (empty for a `Delete`).
+    pub phc: String,
+}
+
+impl UserEntry {
+    /// Encode to the user-record payload.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut w = Writer::new();
+        w.put_u8(self.op.code());
+        w.put_u64(self.oid);
+        w.put_u8(self.privileges);
+        w.put_str_u16("user.name", &self.username)?;
+        w.put_str_u16("user.phc", &self.phc)?;
+        Ok(w.into_vec())
+    }
+
+    /// Decode a user-record payload.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let op = UserOp::from_code(r.get_u8("user.op")?)?;
+        let oid = r.get_u64("user.oid")?;
+        let privileges = r.get_u8("user.privileges")?;
+        let username = r.get_str_u16("user.name")?;
+        let phc = r.get_str_u16("user.phc")?;
+        Ok(Self {
+            op,
+            username,
+            oid,
+            privileges,
+            phc,
+        })
+    }
+}
+
 fn type_code(ty: Type) -> u8 {
     match ty {
         Type::Bool => 0,

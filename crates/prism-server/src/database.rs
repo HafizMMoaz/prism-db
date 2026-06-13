@@ -11,7 +11,8 @@
 //! [`crate::catalog`]). [`Database::open`] recovers the record store from the WAL
 //! and reloads the catalog, so all three models survive restart. Catalog writes
 //! commit in their own transaction (DDL is not yet transactional with
-//! surrounding data); user accounts are not yet persisted (re-seeded each start).
+//! surrounding data). User accounts and their privileges are likewise persisted
+//! (append-only) to a reserved user heap and reloaded on open.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -30,13 +31,15 @@ use prism_storage::{DiskManager, PageId};
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
 use crate::auth::{Privileges, UserStore};
-use crate::catalog::{CatalogEntry, ObjectKind};
+use crate::catalog::{CatalogEntry, ObjectKind, UserEntry, UserOp};
 use crate::error::Result;
 
 // Heap-id ranges, kept disjoint per model so the registries never collide. The
 // catalog's system heap sits below SQL tables (1000..); documents and KV sit far
 // above.
 const CATALOG_HEAP: HeapId = HeapId(64);
+/// Reserved system heap holding append-only user-account records.
+const USER_HEAP: HeapId = HeapId(65);
 const DOC_HEAP_BASE: u64 = 1 << 40;
 const KV_HEAP_BASE: u64 = 1 << 41;
 
@@ -152,7 +155,7 @@ impl Database {
 
         let db = Self {
             sql: SqlEngine::new(store.clone(), txns.clone()),
-            users: UserStore::with_default_admin()?,
+            users: UserStore::empty(),
             doc_heaps: Mutex::new(HashMap::new()),
             doc_next: AtomicU64::new(DOC_HEAP_BASE),
             kv_namespaces: Mutex::new(HashMap::new()),
@@ -165,6 +168,9 @@ impl Database {
         if existing {
             db.load_catalog()?;
         }
+        // Load persisted accounts (or seed+persist the default admin on a fresh
+        // or pre-feature database).
+        db.load_or_seed_users()?;
         Ok(db)
     }
 
@@ -236,28 +242,119 @@ impl Database {
     /// Create (or replace) a user account with a password and READ+WRITE
     /// privileges.
     pub fn add_user(&self, username: &str, password: &str) -> Result<u64> {
-        self.users
-            .add_user(username, password, Privileges::read_write())
+        self.create_user(username, password, Privileges::read_write())
     }
 
-    /// Create (or replace) a user account with explicit privileges.
+    /// Create (or replace) a user account with explicit privileges, persisting
+    /// it so the account survives restart.
     pub fn create_user(
         &self,
         username: &str,
         password: &str,
         privileges: Privileges,
     ) -> Result<u64> {
-        self.users.add_user(username, password, privileges)
+        let (oid, phc) = self.users.add_user(username, password, privileges)?;
+        self.persist_user(&UserEntry {
+            op: UserOp::Upsert,
+            username: username.to_string(),
+            oid,
+            privileges: privileges.bits(),
+            phc,
+        })?;
+        Ok(oid)
     }
 
-    /// Set a user's privileges (the effect of `GRANT`/`REVOKE`).
+    /// Set a user's privileges (the effect of `GRANT`/`REVOKE`), persisting the
+    /// change.
     pub fn set_user_privileges(&self, username: &str, privileges: Privileges) -> Result<()> {
-        self.users.set_privileges(username, privileges)
+        self.users.set_privileges(username, privileges)?;
+        let (oid, phc, _) = self
+            .users
+            .account_record(username)
+            .ok_or_else(|| crate::error::ServerError::State(format!("no such user: {username}")))?;
+        self.persist_user(&UserEntry {
+            op: UserOp::Upsert,
+            username: username.to_string(),
+            oid,
+            privileges: privileges.bits(),
+            phc,
+        })
     }
 
-    /// Remove a user account.
+    /// Remove a user account, persisting a tombstone.
     pub fn drop_user(&self, username: &str) -> Result<()> {
-        self.users.drop_user(username)
+        self.users.drop_user(username)?;
+        self.persist_user(&UserEntry {
+            op: UserOp::Delete,
+            username: username.to_string(),
+            oid: 0,
+            privileges: 0,
+            phc: String::new(),
+        })
+    }
+
+    /// Append a user record to the reserved user heap (in its own transaction).
+    fn persist_user(&self, entry: &UserEntry) -> Result<()> {
+        let bytes = entry.encode()?;
+        let txn = self.txns.begin(TxnMode::ReadWrite);
+        match self.store.insert(&txn, USER_HEAP, &bytes) {
+            Ok(_) => {
+                txn.commit()?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = txn.abort();
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Load persisted accounts; if none exist (fresh or pre-feature database),
+    /// seed and persist the default `admin`.
+    fn load_or_seed_users(&self) -> Result<()> {
+        if self.load_users()? == 0 {
+            let (oid, phc) = self.users.add_user("admin", "admin", Privileges::admin())?;
+            self.persist_user(&UserEntry {
+                op: UserOp::Upsert,
+                username: "admin".to_string(),
+                oid,
+                privileges: Privileges::admin().bits(),
+                phc,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Replay the append-only user records into the in-memory store. Records are
+    /// scanned in insertion order (the heap is append-only), so the last
+    /// `Upsert` per username wins and a `Delete` removes it. Returns the number
+    /// of live accounts loaded.
+    fn load_users(&self) -> Result<usize> {
+        let reader = self.txns.begin(TxnMode::ReadOnly);
+        let records = self.store.scan(&reader, USER_HEAP)?;
+        let mut latest: HashMap<String, UserEntry> = HashMap::new();
+        for (_rid, payload) in &records {
+            let entry = UserEntry::decode(payload)?;
+            match entry.op {
+                UserOp::Upsert => {
+                    latest.insert(entry.username.clone(), entry);
+                }
+                UserOp::Delete => {
+                    latest.remove(&entry.username);
+                }
+            }
+        }
+        reader.commit()?;
+        let count = latest.len();
+        for (username, entry) in latest {
+            self.users.insert_loaded(
+                &username,
+                entry.oid,
+                entry.phc,
+                Privileges::from_bits(entry.privileges),
+            );
+        }
+        Ok(count)
     }
 
     /// The privileges of the account with `oid`, if any.

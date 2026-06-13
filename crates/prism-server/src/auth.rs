@@ -8,10 +8,9 @@
 //! enforces these per request; the embedded API runs as [`SYSTEM_OID`], a
 //! superuser that bypasses checks.
 //!
-//! **Scope (this increment):** an in-memory user store seeded with a default
-//! `admin`. Persisting users (and their privileges) as a catalog system table so
-//! accounts survive restart is a follow-up — the same deferral the store already
-//! had. mTLS is also deferred.
+//! The store is the in-memory cache; the [`crate::Database`] persists each
+//! account (and privilege change) to a reserved system heap, so accounts and
+//! grants survive restart. mTLS is deferred.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -76,6 +75,11 @@ impl Privileges {
         self.0
     }
 
+    /// Reconstruct a privilege set from its raw bitmask (e.g. on load).
+    pub fn from_bits(bits: u8) -> Privileges {
+        Privileges(bits & (Self::READ.0 | Self::WRITE.0 | Self::ADMIN.0))
+    }
+
     /// Parse a role name (case-insensitive) into a privilege set.
     pub fn from_role(name: &str) -> Option<Privileges> {
         match name.to_ascii_lowercase().as_str() {
@@ -102,21 +106,23 @@ pub struct UserStore {
 }
 
 impl UserStore {
-    /// A store seeded with a default `admin` account (dev default password
-    /// `admin` — real deployments configure their own accounts), which holds the
-    /// full privilege set.
-    pub fn with_default_admin() -> Result<Self> {
-        let store = Self {
+    /// An empty store (no accounts). The caller seeds or loads accounts.
+    pub fn empty() -> Self {
+        Self {
             users: Mutex::new(HashMap::new()),
             next_oid: AtomicU64::new(FIRST_USER_OID),
-        };
-        store.add_user("admin", "admin", Privileges::admin())?;
-        Ok(store)
+        }
     }
 
     /// Create (or replace) a user with the given password and privileges.
-    /// Returns the OID.
-    pub fn add_user(&self, username: &str, password: &str, privileges: Privileges) -> Result<u64> {
+    /// Returns the allocated OID and the scrypt PHC hash (so the caller can
+    /// persist the account).
+    pub fn add_user(
+        &self,
+        username: &str,
+        password: &str,
+        privileges: Privileges,
+    ) -> Result<(u64, String)> {
         let salt = SaltString::generate(&mut OsRng);
         let phc = Scrypt
             .hash_password(password.as_bytes(), &salt)
@@ -127,11 +133,46 @@ impl UserStore {
             username.to_string(),
             Account {
                 oid,
+                phc: phc.clone(),
+                privileges,
+            },
+        );
+        Ok((oid, phc))
+    }
+
+    /// Insert an account loaded from persistence (preserving its OID and hash),
+    /// advancing the OID allocator past it.
+    pub fn insert_loaded(&self, username: &str, oid: u64, phc: String, privileges: Privileges) {
+        self.users.lock().expect("user store poisoned").insert(
+            username.to_string(),
+            Account {
+                oid,
                 phc,
                 privileges,
             },
         );
-        Ok(oid)
+        // Ensure newly-allocated OIDs never collide with a loaded one.
+        let mut cur = self.next_oid.load(Ordering::Relaxed);
+        while oid >= cur {
+            match self.next_oid.compare_exchange_weak(
+                cur,
+                oid + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    /// The persistable fields of `username`: `(oid, phc, privileges)`.
+    pub fn account_record(&self, username: &str) -> Option<(u64, String, Privileges)> {
+        self.users
+            .lock()
+            .expect("user store poisoned")
+            .get(username)
+            .map(|a| (a.oid, a.phc.clone(), a.privileges))
     }
 
     /// Verify `password` for `username`. Returns the user's OID on success, or

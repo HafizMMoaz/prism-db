@@ -225,6 +225,68 @@ fn privileges_apply_to_documents_and_kv() {
 }
 
 #[test]
+fn users_and_grants_persist_across_restart() {
+    let tmp = prism_testkit::TempDir::new("authz-persist").unwrap();
+    let path = tmp.path().to_path_buf();
+
+    // Session 1: admin creates accounts, grants, then everything closes.
+    {
+        let db = Arc::new(Database::open(&path).unwrap());
+        let mut admin = login(&db, "admin", "admin");
+        assert!(sql_ok(
+            admin.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY)"))
+        ));
+        assert!(sql_ok(admin.handle(sql(
+            "CREATE USER reader WITH PASSWORD 'pw' ROLE readonly"
+        ))));
+        assert!(sql_ok(admin.handle(sql(
+            "CREATE USER writer WITH PASSWORD 'pw' ROLE readwrite"
+        ))));
+        // Promote reader to read-write; the grant must persist too.
+        assert!(sql_ok(admin.handle(sql("GRANT readwrite TO reader"))));
+        drop(admin);
+        drop(db);
+    }
+
+    // Session 2: reopen the same directory — accounts and grants survived.
+    {
+        let db = Arc::new(Database::open(&path).unwrap());
+        // reader persisted *with* the granted read-write privilege.
+        let mut reader = login(&db, "reader", "pw");
+        assert!(
+            sql_ok(reader.handle(sql("INSERT INTO t VALUES (1)"))),
+            "granted readwrite survived restart"
+        );
+        // writer persisted.
+        let mut writer = login(&db, "writer", "pw");
+        assert!(sql_ok(writer.handle(sql("INSERT INTO t VALUES (2)"))));
+
+        // Drop writer; the tombstone must persist.
+        let mut admin = login(&db, "admin", "admin");
+        assert!(sql_ok(admin.handle(sql("DROP USER writer"))));
+        drop(admin);
+        drop(reader);
+        drop(writer);
+        drop(db);
+    }
+
+    // Session 3: the dropped account can no longer authenticate.
+    let db = Arc::new(Database::open(&path).unwrap());
+    let mut s = Session::new_authenticating(db.clone());
+    assert!(matches!(
+        s.handle(hello()),
+        Message::HelloAck { status: 0, .. }
+    ));
+    assert!(
+        matches!(s.handle(auth("writer", "pw")), Message::AuthAck { status, .. } if status != 0),
+        "dropped user must not authenticate after restart"
+    );
+    // The admin account also survived (it was persisted on first open).
+    let mut admin = login(&db, "admin", "admin");
+    assert!(sql_ok(admin.handle(sql("SELECT id FROM t"))));
+}
+
+#[test]
 fn embedded_session_is_a_superuser() {
     // The in-process Session::new (SYSTEM) bypasses authorization entirely.
     let db = database();
