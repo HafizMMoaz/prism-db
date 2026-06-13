@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use prism_protocol::{AuthMechanism, Message, PROTOCOL_VERSION, Value as WireValue};
+use prism_protocol::{
+    AuthMechanism, FEATURE_CONNECT_DB, Message, PROTOCOL_VERSION, Value as WireValue,
+};
 use prism_server::{Instance, Session};
 use prism_testkit::TempDir;
 
@@ -19,7 +21,12 @@ fn hello() -> Message {
         client_name: "t".into(),
         client_version: "0".into(),
         features: 0,
+        database: String::new(),
     }
+}
+
+fn hello_db(db: &str) -> Message {
+    Message::hello(PROTOCOL_VERSION, "t", "0", db)
 }
 
 fn auth(user: &str, pw: &str) -> Message {
@@ -190,6 +197,80 @@ fn introspection_lists_tables_and_columns() {
             assert_eq!(rows[1][3], Some(WireValue::Str(String::new())));
         }
         other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn connect_time_database_binds_session_without_use() {
+    let (inst, _tmp) = instance();
+    // Create the database with an admin session first.
+    {
+        let mut admin = login(&inst, "admin", "admin");
+        assert!(ok(admin.handle(sql("CREATE DATABASE app"))));
+        assert!(ok(admin.handle(sql("USE app"))));
+        assert!(ok(
+            admin.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY)"))
+        ));
+        assert!(ok(admin.handle(sql("INSERT INTO t VALUES (1),(2),(3)"))));
+    }
+
+    // A fresh session names the database in Hello; the server echoes the
+    // negotiated feature bit and binds it once Auth succeeds.
+    let mut s = Session::for_instance(inst.clone());
+    match s.handle(hello_db("app")) {
+        Message::HelloAck {
+            status: 0,
+            features,
+            ..
+        } => assert_eq!(features & FEATURE_CONNECT_DB, FEATURE_CONNECT_DB),
+        other => panic!("expected HelloAck, got {other:?}"),
+    }
+    assert!(matches!(
+        s.handle(auth("admin", "admin")),
+        Message::AuthAck { status: 0, .. }
+    ));
+
+    // No `USE` was issued, yet the data op resolves against `app`.
+    match s.handle(sql("SELECT id FROM t ORDER BY id")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => assert_eq!(rows.len(), 3),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn connect_time_unknown_database_fails_after_auth() {
+    let (inst, _tmp) = instance();
+    let mut s = Session::for_instance(inst.clone());
+    // Hello succeeds (the name is not resolved yet)...
+    assert!(matches!(
+        s.handle(hello_db("ghost")),
+        Message::HelloAck { status: 0, .. }
+    ));
+    // ...but the bind happens after credentials are verified, so a missing
+    // database fails the handshake (status 3 = database_unavailable) and closes.
+    match s.handle(auth("admin", "admin")) {
+        Message::AuthAck { status, error, .. } => {
+            assert_eq!(status, 3, "database_unavailable");
+            assert!(error.is_some());
+        }
+        other => panic!("expected AuthAck, got {other:?}"),
+    }
+    assert!(s.is_closing(), "session must close after a failed bind");
+}
+
+#[test]
+fn hello_without_connect_db_negotiates_no_features() {
+    let (inst, _tmp) = instance();
+    let mut s = Session::for_instance(inst.clone());
+    match s.handle(hello()) {
+        Message::HelloAck {
+            status: 0,
+            features,
+            ..
+        } => assert_eq!(features, 0, "no features requested, none honored"),
+        other => panic!("expected HelloAck, got {other:?}"),
     }
 }
 

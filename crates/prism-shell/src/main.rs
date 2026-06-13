@@ -34,20 +34,21 @@ async fn main() -> ExitCode {
         }
     };
 
-    let mut client =
-        match Client::connect_authenticated(&config.addr, &config.user, &config.password).await {
-            Ok(c) => c,
-            Err(e) => {
-                eprintln!("prism-shell: cannot connect to {}: {e}", config.addr);
-                return ExitCode::FAILURE;
-            }
-        };
-    if let Some(db) = &config.database {
-        if let Err(e) = client.sql(&format!("USE {db}")).await {
-            eprintln!("prism-shell: cannot select database {db}: {e}");
+    // Bind the database at connect time (in the Hello handshake) when one is
+    // given, so no separate `USE` round-trip is needed.
+    let connected = match &config.database {
+        Some(db) => {
+            Client::connect_db_authenticated(&config.addr, db, &config.user, &config.password).await
+        }
+        None => Client::connect_authenticated(&config.addr, &config.user, &config.password).await,
+    };
+    let mut client = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("prism-shell: cannot connect to {}: {e}", config.addr);
             return ExitCode::FAILURE;
         }
-    }
+    };
     eprintln!(
         "connected to {} as {}{}. \\help for commands, \\quit to exit.",
         config.addr,

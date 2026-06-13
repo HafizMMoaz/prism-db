@@ -255,8 +255,14 @@ pub enum Message {
         client_name: String,
         /// The client implementation's version.
         client_version: String,
-        /// Reserved feature bitmask (send 0).
+        /// Feature bitmask the client requests (see [`crate::FEATURE_CONNECT_DB`];
+        /// send 0 for none).
         features: u32,
+        /// Connect-time database to bind the session to. Only travels on the wire
+        /// when [`crate::FEATURE_CONNECT_DB`] is set in `features`; empty means
+        /// "select later with `USE`". Use [`Message::hello`] to keep the two in
+        /// sync.
+        database: String,
     },
     /// `HelloAck` (0x02).
     HelloAck {
@@ -395,6 +401,30 @@ pub enum Message {
 }
 
 impl Message {
+    /// Build a `Hello`, setting [`crate::FEATURE_CONNECT_DB`] automatically when
+    /// a non-empty `database` is supplied so the field and its feature bit can
+    /// never disagree.
+    pub fn hello(
+        protocol_version: u32,
+        client_name: impl Into<String>,
+        client_version: impl Into<String>,
+        database: impl Into<String>,
+    ) -> Message {
+        let database = database.into();
+        let features = if database.is_empty() {
+            0
+        } else {
+            crate::FEATURE_CONNECT_DB
+        };
+        Message::Hello {
+            protocol_version,
+            client_name: client_name.into(),
+            client_version: client_version.into(),
+            features,
+            database,
+        }
+    }
+
     /// The message-type discriminant for this message.
     pub fn message_type(&self) -> MessageType {
         match self {
@@ -426,11 +456,17 @@ impl Message {
                 client_name,
                 client_version,
                 features,
+                database,
             } => {
                 w.put_u32(*protocol_version);
                 w.put_str_u16("hello.client_name", client_name)?;
                 w.put_str_u16("hello.client_version", client_version)?;
                 w.put_u32(*features);
+                // The database field only travels when its feature bit is set, so
+                // a peer that never sets the bit round-trips the v1 body verbatim.
+                if features & crate::FEATURE_CONNECT_DB != 0 {
+                    w.put_str_u16("hello.database", database)?;
+                }
             }
             Message::HelloAck {
                 status,
@@ -604,12 +640,24 @@ impl Message {
 
     fn decode_body(ty: MessageType, r: &mut Reader) -> Result<Message> {
         Ok(match ty {
-            MessageType::Hello => Message::Hello {
-                protocol_version: r.get_u32("hello.protocol_version")?,
-                client_name: r.get_str_u16("hello.client_name")?,
-                client_version: r.get_str_u16("hello.client_version")?,
-                features: r.get_u32("hello.features")?,
-            },
+            MessageType::Hello => {
+                let protocol_version = r.get_u32("hello.protocol_version")?;
+                let client_name = r.get_str_u16("hello.client_name")?;
+                let client_version = r.get_str_u16("hello.client_version")?;
+                let features = r.get_u32("hello.features")?;
+                let database = if features & crate::FEATURE_CONNECT_DB != 0 {
+                    r.get_str_u16("hello.database")?
+                } else {
+                    String::new()
+                };
+                Message::Hello {
+                    protocol_version,
+                    client_name,
+                    client_version,
+                    features,
+                    database,
+                }
+            }
             MessageType::HelloAck => {
                 let status = r.get_u8("hello_ack.status")?;
                 let server_version = r.get_str_u16("hello_ack.server_version")?;

@@ -8,6 +8,7 @@ import { ErrorInfo, PrismServerError, ProtocolError } from "./errors.js";
 import {
   AUTH_PASSWORD,
   ColumnDesc,
+  FEATURE_CONNECT_DB,
   ServerMessage,
   TXN_READ_ONLY,
   TXN_READ_WRITE,
@@ -23,7 +24,11 @@ const EMPTY = Buffer.alloc(0);
 export interface ConnectOptions extends ConnectionOptions {
   username?: string;
   password?: string;
-  /** Select this database after connecting (runs `USE <database>`). */
+  /**
+   * Bind the session to this database. Sent in the `Hello` handshake when the
+   * server supports it (`FEATURE_CONNECT_DB`), otherwise applied with a
+   * `USE <database>` after authenticating.
+   */
   database?: string;
   clientName?: string;
   clientVersion?: string;
@@ -49,9 +54,10 @@ export class Client {
     const conn = await Connection.connect(opts);
     const client = new Client(conn);
     try {
-      await client.handshake(opts);
-      // On a multi-database server, select the requested database up front.
-      if (opts.database) {
+      const connectDbHonored = await client.handshake(opts);
+      // Fall back to `USE` only when the server did not bind the database in the
+      // handshake (an older server that does not speak FEATURE_CONNECT_DB).
+      if (opts.database && !connectDbHonored) {
         await client.sql(`USE ${opts.database}`, { returnRows: false });
       }
     } catch (err) {
@@ -61,16 +67,21 @@ export class Client {
     return client;
   }
 
-  private async handshake(opts: ConnectOptions): Promise<void> {
+  /** Returns whether the server bound a connect-time database in the handshake. */
+  private async handshake(opts: ConnectOptions): Promise<boolean> {
+    const database = opts.database ?? "";
+    const features = database ? FEATURE_CONNECT_DB : 0;
     const helloAck = await this.conn.send({
       type: "hello",
       protocolVersion: PROTOCOL_VERSION,
       clientName: opts.clientName ?? "@prismdb/client",
       clientVersion: opts.clientVersion ?? "0.1.0",
-      features: 0,
+      features,
+      database,
     });
     if (helloAck.type !== "helloAck") throw new ProtocolError("expected HelloAck");
     if (helloAck.status !== 0) fail(helloAck.error);
+    const connectDbHonored = (helloAck.features & FEATURE_CONNECT_DB) !== 0 && database !== "";
 
     if (opts.username !== undefined) {
       const authAck = await this.conn.send({
@@ -82,6 +93,7 @@ export class Client {
       if (authAck.type !== "authAck") throw new ProtocolError("expected AuthAck");
       if (authAck.status !== 0) fail(authAck.error);
     }
+    return connectDbHonored;
   }
 
   // ---- SQL ------------------------------------------------------------------

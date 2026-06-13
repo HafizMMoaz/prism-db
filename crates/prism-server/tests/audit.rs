@@ -35,6 +35,7 @@ fn hello() -> Message {
         client_name: "t".into(),
         client_version: "0".into(),
         features: 0,
+        database: String::new(),
     }
 }
 

@@ -189,6 +189,7 @@ fn hello() -> Message {
         client_name: "test".into(),
         client_version: "0".into(),
         features: 0,
+        database: String::new(),
     }
 }
 
@@ -240,6 +241,7 @@ fn authentication_is_enforced() {
             client_name: "x".into(),
             client_version: "0".into(),
             features: 0,
+            database: String::new(),
         }),
         Message::HelloAck { status, .. } if status != 0
     ));

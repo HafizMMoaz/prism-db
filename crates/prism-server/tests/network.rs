@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use prism_doc::{DocValue, Document};
 use prism_protocol::{
-    AuthMechanism, DocCommand, KvCommand, KvResultBody, Message, PROTOCOL_VERSION, Packet, TxnMode,
-    Value as WireValue,
+    AuthMechanism, DocCommand, FEATURE_CONNECT_DB, KvCommand, KvResultBody, Message,
+    PROTOCOL_VERSION, Packet, TxnMode, Value as WireValue,
 };
 use prism_server::{Instance, Server};
 use prism_testkit::TempDir;
@@ -51,6 +51,7 @@ impl Client {
                 client_name: "itest".into(),
                 client_version: "0".into(),
                 features: 0,
+                database: String::new(),
             })
             .await,
             Message::HelloAck { status: 0, .. }
@@ -73,6 +74,31 @@ impl Client {
             })
             .await,
             Message::SqlResult { status: 0, .. }
+        ));
+    }
+
+    /// Handshake binding `database` at connect time (no `USE`); asserts the
+    /// server negotiated [`FEATURE_CONNECT_DB`] back.
+    async fn login_connect_db(&mut self, database: &str) {
+        match self
+            .request(Message::hello(PROTOCOL_VERSION, "itest", "0", database))
+            .await
+        {
+            Message::HelloAck {
+                status: 0,
+                features,
+                ..
+            } => assert_eq!(features & FEATURE_CONNECT_DB, FEATURE_CONNECT_DB),
+            other => panic!("expected HelloAck, got {other:?}"),
+        }
+        assert!(matches!(
+            self.request(Message::Auth {
+                mechanism: AuthMechanism::Password,
+                username: "admin".into(),
+                password: "admin".into(),
+            })
+            .await,
+            Message::AuthAck { status: 0, .. }
         ));
     }
 }
@@ -125,6 +151,30 @@ async fn handshake_then_sql_over_tcp() {
                 ]]
             );
         }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn connect_time_database_over_tcp() {
+    let (addr, _tmp) = start_server().await;
+    let mut c = Client::connect(addr).await;
+
+    // Bind `app` in the handshake; no `USE` is sent.
+    c.login_connect_db("app").await;
+    c.request(sql("CREATE TABLE t (id BIGINT NOT NULL)")).await;
+    match c.request(sql("INSERT INTO t VALUES (7)")).await {
+        Message::SqlResult {
+            status: 0,
+            affected_rows,
+            ..
+        } => assert_eq!(affected_rows, 1),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+    match c.request(sql("SELECT id FROM t")).await {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => assert_eq!(rows, vec![vec![Some(WireValue::Int64(7))]]),
         other => panic!("expected SqlResult, got {other:?}"),
     }
 }

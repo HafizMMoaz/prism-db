@@ -32,8 +32,9 @@ use prism_core::txn::{Snapshot, TxnHandle, TxnMode};
 use prism_doc::{DocCollection, DocValue, Document, Filter, Update};
 use prism_kv::KvNamespace;
 use prism_protocol::{
-    ColumnDesc, DocCommand, DocQuery, DocUpdate, DocUpdateOp, KvCommand, KvResultBody, Message,
-    NoticeSeverity, PROTOCOL_VERSION, Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
+    ColumnDesc, DocCommand, DocQuery, DocUpdate, DocUpdateOp, FEATURE_CONNECT_DB, KvCommand,
+    KvResultBody, Message, NoticeSeverity, PROTOCOL_VERSION, Packet, Row, SERVER_FEATURES,
+    TxnMode as WireTxnMode, Value as WireValue,
 };
 use prism_sql::{Outcome, Type, Value as SqlValue};
 use prism_wal::Lsn;
@@ -45,6 +46,9 @@ use crate::instance::Instance;
 
 // AuthAck status codes (docs/specs/wire-protocol.md).
 const AUTH_BAD_CREDENTIALS: u8 = 1;
+// Credentials were accepted but the connect-time database could not be bound
+// (status 2 is reserved for `no_such_user`; see docs/specs/wire-protocol.md).
+const AUTH_DATABASE_UNAVAILABLE: u8 = 3;
 // HelloAck status: non-zero means the server will close the connection.
 const HELLO_VERSION_MISMATCH: u8 = 1;
 
@@ -106,6 +110,10 @@ pub struct Session {
     /// The currently selected database. Always set for a single-database
     /// session; for a multi-database one it is chosen with `USE <db>`.
     current_db: Option<Arc<Database>>,
+    /// A connect-time database named in `Hello` (via
+    /// [`prism_protocol::FEATURE_CONNECT_DB`]), bound once `Auth` succeeds so an
+    /// unauthenticated client never opens a database.
+    requested_db: Option<String>,
     auth: AuthState,
     txn: SessionTxn,
     /// Set when a fatal handshake condition (version mismatch, bad credentials,
@@ -120,6 +128,7 @@ impl Session {
         Self {
             instance: None,
             current_db: Some(db),
+            requested_db: None,
             auth: AuthState::Authenticated {
                 user_oid: SYSTEM_OID,
             },
@@ -134,6 +143,7 @@ impl Session {
         Self {
             instance: None,
             current_db: Some(db),
+            requested_db: None,
             auth: AuthState::New,
             txn: SessionTxn::None,
             closing: false,
@@ -141,11 +151,12 @@ impl Session {
     }
 
     /// A network session over a multi-database [`Instance`]: authenticate, then
-    /// select a database with `USE <db>` (or create one with `CREATE DATABASE`).
+    /// select a database with `USE <db>` (or name one at connect time in `Hello`).
     pub fn for_instance(instance: Arc<Instance>) -> Self {
         Self {
             instance: Some(instance),
             current_db: None,
+            requested_db: None,
             auth: AuthState::New,
             txn: SessionTxn::None,
             closing: false,
@@ -183,7 +194,10 @@ impl Session {
     fn greet(&mut self, request: Message) -> Message {
         match request {
             Message::Hello {
-                protocol_version, ..
+                protocol_version,
+                features,
+                database,
+                ..
             } => {
                 if protocol_version != PROTOCOL_VERSION {
                     self.closing = true;
@@ -201,11 +215,18 @@ impl Session {
                         ),
                     };
                 }
+                // Remember a connect-time database; it is bound only once the
+                // client authenticates (see `authenticate`).
+                if features & FEATURE_CONNECT_DB != 0 && !database.is_empty() {
+                    self.requested_db = Some(database);
+                }
                 self.auth = AuthState::Greeted;
                 Message::HelloAck {
                     status: 0,
                     server_version: SERVER_VERSION.to_string(),
-                    features: 0,
+                    // Echo the features we actually honor so the client knows the
+                    // connect-time database will be applied.
+                    features: features & SERVER_FEATURES,
                     session_id: new_session_id(),
                     error: None,
                 }
@@ -231,6 +252,15 @@ impl Session {
                 Some(user_oid) => {
                     crate::audit::auth_success(&username, user_oid);
                     self.auth = AuthState::Authenticated { user_oid };
+                    // Bind a connect-time database now that the client is trusted.
+                    if let Err(e) = self.bind_requested_db() {
+                        self.closing = true;
+                        return Message::AuthAck {
+                            status: AUTH_DATABASE_UNAVAILABLE,
+                            user_oid,
+                            error: Some(e.to_error_info()),
+                        };
+                    }
                     Message::AuthAck {
                         status: 0,
                         user_oid,
@@ -358,6 +388,19 @@ impl Session {
             Some(inst) => inst.drop_user(name),
             None => self.require_db()?.drop_user(name),
         }
+    }
+
+    /// Bind a connect-time database named in `Hello`, once authenticated. On a
+    /// multi-database instance this resolves and selects it; a single-database
+    /// server already serves exactly one database, so the request is ignored.
+    fn bind_requested_db(&mut self) -> Result<()> {
+        let Some(name) = self.requested_db.take() else {
+            return Ok(());
+        };
+        if let Some(inst) = &self.instance {
+            self.current_db = Some(inst.database(&name)?);
+        }
+        Ok(())
     }
 
     /// The single database of a non-instance session.

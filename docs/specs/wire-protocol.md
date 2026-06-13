@@ -57,19 +57,32 @@ After TCP connect (and TLS handshake if enabled):
 protocol_version: u32     (= 1)
 client_name:      u16 length + UTF-8 bytes
 client_version:   u16 length + UTF-8 bytes
-features:         u32 bitmask  (reserved, send 0)
+features:         u32 bitmask
+[if features & FEATURE_CONNECT_DB (0x0000_0001):]
+  database:       u16 length + UTF-8 bytes   (connect-time database)
 ```
+
+`features` is a forward-compatible negotiation bitmask. A field that follows a
+feature bit appears on the wire **only when that bit is set**, so a peer that
+sends `features = 0` produces the original (feature-free) body byte-for-byte.
+Defined bits:
+
+| bit | name | meaning |
+|-----|------|---------|
+| `0x0000_0001` | `FEATURE_CONNECT_DB` | the `database` field is present; the server binds the session to it once `Auth` succeeds (no separate `USE`). |
 
 ### 2. Server → Client: `HelloAck` (0x02)
 
 ```
 status:           u8     (0 = OK, non-zero = error)
 server_version:   u16 length + UTF-8 bytes
-features:         u32 bitmask
+features:         u32 bitmask  (the subset of the client's bits the server honors)
 session_id:       u128 random  (logged for traceability)
 ```
 
 If status != 0, the server closes the connection after sending. Errors include `ProtocolVersionMismatch`, `Overloaded`.
+
+The server echoes in `features` the bits it actually honored. If the client requested `FEATURE_CONNECT_DB` but the server clears it, the client must select its database the old way (`USE <db>`) after authenticating. A connect-time database that does not exist (or is invalid) is reported on `AuthAck` with status `3` (`DatabaseUnavailable`), after credentials are verified, and the connection is closed.
 
 ### 3. Client → Server: `Auth` (0x03)
 
@@ -86,7 +99,7 @@ mechanism: u8           (1 = password, 2 = mtls)
 ### 4. Server → Client: `AuthAck` (0x04)
 
 ```
-status:   u8       (0 = OK, 1 = bad_credentials, 2 = no_such_user)
+status:   u8       (0 = OK, 1 = bad_credentials, 2 = no_such_user, 3 = database_unavailable)
 user_oid: u64      (if OK; else 0)
 ```
 

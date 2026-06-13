@@ -35,6 +35,9 @@ export const AUTH_MTLS = 2;
 export const TXN_READ_WRITE = 0;
 export const TXN_READ_ONLY = 1;
 
+/** `Hello` feature bit: the body carries a connect-time database name. */
+export const FEATURE_CONNECT_DB = 1 << 0;
+
 // ---- document / kv sub-commands ---------------------------------------------
 
 export type DocCommand =
@@ -58,7 +61,7 @@ export type KvCommand =
 // ---- outgoing (client → server) ---------------------------------------------
 
 export type ClientMessage =
-  | { type: "hello"; protocolVersion: number; clientName: string; clientVersion: string; features: number }
+  | { type: "hello"; protocolVersion: number; clientName: string; clientVersion: string; features: number; database: string }
   | { type: "auth"; mechanism: number; username: string; password: string }
   | { type: "begin"; mode: number }
   | { type: "commit"; idempotencyKey: bigint }
@@ -153,6 +156,9 @@ function encodeBody(w: Writer, m: ClientMessage): void {
       w.strU16(m.clientName);
       w.strU16(m.clientVersion);
       w.u32(m.features);
+      // The database field only travels under its feature bit (matches the Rust
+      // codec), so a no-database Hello stays byte-compatible with v1.
+      if (m.features & FEATURE_CONNECT_DB) w.strU16(m.database);
       break;
     case "auth":
       w.u8(m.mechanism);

@@ -36,6 +36,16 @@ pub use message::{
 /// The protocol version carried in `Hello` (`docs/specs/wire-protocol.md`).
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// `Hello` feature bit: the client carries a connect-time database name in its
+/// `Hello` body, binding the session to that database during the handshake
+/// instead of issuing a separate `USE <db>`. When the bit is clear the
+/// `database` field is absent from the wire, so a feature-unaware peer round
+/// trips unchanged. The server echoes the bits it honored in `HelloAck`.
+pub const FEATURE_CONNECT_DB: u32 = 1 << 0;
+
+/// The feature bits this build understands and will negotiate in `HelloAck`.
+pub const SERVER_FEATURES: u32 = FEATURE_CONNECT_DB;
+
 /// The default TCP port a Prism server listens on.
 pub const DEFAULT_PORT: u16 = 4444;
 
@@ -278,7 +288,10 @@ mod tests {
                 client_name: "prism-cli".into(),
                 client_version: "0.1.0".into(),
                 features: 0,
+                database: String::new(),
             },
+            // A connect-time database carried under its feature bit.
+            Message::hello(PROTOCOL_VERSION, "prism-cli", "0.1.0", "analytics"),
             Message::HelloAck {
                 status: 0,
                 server_version: "prism 0.1.0".into(),
@@ -398,6 +411,7 @@ mod tests {
                 client_name: "x".into(),
                 client_version: "y".into(),
                 features: 0,
+                database: String::new(),
             },
         )
         .to_payload()

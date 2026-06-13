@@ -102,7 +102,16 @@ impl Client {
     /// Connect to `addr` over plaintext TCP and complete the `Hello` handshake.
     pub async fn connect(addr: impl ToSocketAddrs) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
-        Self::with_transport(Box::new(stream)).await
+        Self::with_transport(Box::new(stream), "").await
+    }
+
+    /// Connect over plaintext TCP and bind the session to `database` during the
+    /// handshake (the connect-time database, [`prism_protocol::FEATURE_CONNECT_DB`]),
+    /// avoiding a separate `USE <db>` round-trip. An empty `database` behaves like
+    /// [`Client::connect`].
+    pub async fn connect_db(addr: impl ToSocketAddrs, database: &str) -> Result<Self> {
+        let stream = TcpStream::connect(addr).await?;
+        Self::with_transport(Box::new(stream), database).await
     }
 
     /// Connect to `addr` over TLS (verifying the server's certificate against
@@ -116,23 +125,24 @@ impl Client {
         let name = ServerName::try_from(server_name.to_string())
             .map_err(|e| ClientError::Unexpected(format!("invalid server name: {e}")))?;
         let tls = TlsConnector::from(config).connect(name, tcp).await?;
-        Self::with_transport(Box::new(tls)).await
+        Self::with_transport(Box::new(tls), "").await
     }
 
-    /// Complete the `Hello` handshake over an established transport.
-    async fn with_transport(stream: Box<dyn Transport>) -> Result<Self> {
+    /// Complete the `Hello` handshake over an established transport, optionally
+    /// binding the session to `database` at connect time.
+    async fn with_transport(stream: Box<dyn Transport>, database: &str) -> Result<Self> {
         let mut client = Self {
             stream,
             next_id: 1,
             buf: Vec::with_capacity(8192),
         };
         match client
-            .request(Message::Hello {
-                protocol_version: PROTOCOL_VERSION,
-                client_name: "prism-client".into(),
-                client_version: env!("CARGO_PKG_VERSION").into(),
-                features: 0,
-            })
+            .request(Message::hello(
+                PROTOCOL_VERSION,
+                "prism-client",
+                env!("CARGO_PKG_VERSION"),
+                database,
+            ))
             .await?
         {
             Message::HelloAck { status: 0, .. } => Ok(client),
@@ -152,6 +162,19 @@ impl Client {
         Ok(client)
     }
 
+    /// Connect binding `database` at connect time, then authenticate. An empty
+    /// `database` is equivalent to [`Client::connect_authenticated`].
+    pub async fn connect_db_authenticated(
+        addr: impl ToSocketAddrs,
+        database: &str,
+        username: &str,
+        password: &str,
+    ) -> Result<Self> {
+        let mut client = Self::connect_db(addr, database).await?;
+        client.authenticate(username, password).await?;
+        Ok(client)
+    }
+
     /// Authenticate with a username and password; returns the user OID.
     pub async fn authenticate(&mut self, username: &str, password: &str) -> Result<u64> {
         match self
@@ -167,6 +190,14 @@ impl Client {
                 user_oid,
                 ..
             } => Ok(user_oid),
+            // Credential failures (bad_credentials / no_such_user) collapse to the
+            // typed AuthFailed.
+            Message::AuthAck { status: 1 | 2, .. } => Err(ClientError::AuthFailed),
+            // Any other failure (e.g. a connect-time database that does not exist)
+            // surfaces the server's reason.
+            Message::AuthAck {
+                error: Some(info), ..
+            } => Err(server_error(Some(info))),
             Message::AuthAck { .. } => Err(ClientError::AuthFailed),
             other => Err(unexpected(&other)),
         }
