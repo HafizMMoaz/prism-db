@@ -81,6 +81,9 @@ test("e2e: documents with query operators", { skip: !addr }, async () => {
     const all = await c.doc.find(coll);
     assert.equal(all.length, 3);
 
+    assert.equal(await c.doc.count(coll), 3n);
+    assert.equal(await c.doc.count(coll, Q.gt("age", 30)), 1n);
+
     const nyAdults = await c.doc.find(coll, Q.and(Q.eq("city", "NYC"), Q.gt("age", 30)));
     assert.deepEqual(
       nyAdults.map((d) => d.name),

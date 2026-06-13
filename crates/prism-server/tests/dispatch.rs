@@ -432,6 +432,41 @@ fn doc_query_operators_over_the_wire() {
     );
 }
 
+fn doc_count(collection: &str, query: DocQuery) -> Message {
+    Message::DocOp {
+        collection: collection.into(),
+        command: DocCommand::Count {
+            query: query.to_bytes().unwrap(),
+            options: vec![],
+        },
+    }
+}
+
+#[test]
+fn doc_count_over_the_wire() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+    for age in [20i64, 30, 40, 50] {
+        s.handle(doc_insert("p", &[("age", DocValue::Int64(age))]));
+    }
+    let count = |msg: Message| match msg {
+        Message::DocResult {
+            status: 0,
+            affected,
+            ..
+        } => affected,
+        other => panic!("expected DocResult, got {other:?}"),
+    };
+    assert_eq!(count(s.handle(doc_count("p", DocQuery::All))), 4);
+    assert_eq!(
+        count(s.handle(doc_count(
+            "p",
+            DocQuery::Gt("age".into(), WireValue::Int64(25))
+        ))),
+        3
+    );
+}
+
 #[test]
 fn doc_update_operators_over_the_wire() {
     let (db, _tmp) = database();

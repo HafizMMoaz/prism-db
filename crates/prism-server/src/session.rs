@@ -11,9 +11,9 @@
 //! - SQL parameters are not yet bound (`SqlExecute.params` must be empty; use
 //!   literals). `TxnAck.commit_lsn` is reported as 0.
 //! - Document queries use the structured [`DocQuery`] wire filter (eq/ne/gt/lt/
-//!   gte/lte/in/nin/exists and and/or/not), mapped to the engine's `Filter`.
-//!   Updates are still a flat document treated as an implicit `$set` of each
-//!   field; wire update operators (`$inc`, `$unset`, …) are a follow-up.
+//!   gte/lte/in/nin/exists and and/or/not) and updates use the structured
+//!   [`DocUpdate`] ($set/$unset/$inc), both mapped to the engine. `count` is
+//!   served alongside find/update/delete.
 //! - KV `range`/`scan` are unsupported on the hash namespace.
 //!
 //! A network session ([`Session::new_authenticating`]) must complete the
@@ -670,7 +670,9 @@ fn role_clause(upper: &str, original: &str) -> Option<Privileges> {
 
 fn doc_need(command: &DocCommand) -> Need {
     match command {
-        DocCommand::Find { .. } | DocCommand::FindOne { .. } => Need::Read,
+        DocCommand::Find { .. } | DocCommand::FindOne { .. } | DocCommand::Count { .. } => {
+            Need::Read
+        }
         _ => Need::Write,
     }
 }
@@ -747,6 +749,9 @@ fn dispatch_doc(coll: &DocCollection, txn: &TxnHandle, command: DocCommand) -> R
         }
         DocCommand::DeleteMany { query, .. } => {
             count_outcome(coll.delete_many(txn, &query_to_filter(&query)?)?)
+        }
+        DocCommand::Count { query, .. } => {
+            count_outcome(coll.count(txn, &query_to_filter(&query)?)?)
         }
     })
 }

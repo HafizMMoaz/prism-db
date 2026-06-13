@@ -198,6 +198,15 @@ export class Client {
       return first ? decodeDocument(first) : null;
     },
 
+    count: async (collection: string, query: DocQuery = Q.all()): Promise<bigint> => {
+      const reply = await this.docReply({
+        type: "docOp",
+        collection,
+        command: { op: 9, query: encodeDocQuery(query), options: EMPTY },
+      });
+      return reply.affected;
+    },
+
     updateOne: async (collection: string, query: DocQuery, update: DocUpdate[]): Promise<bigint> => {
       const reply = await this.docReply({
         type: "docOp",

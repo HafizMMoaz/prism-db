@@ -273,6 +273,13 @@ pub enum DocCommand {
         /// The options document.
         options: Vec<u8>,
     },
+    /// Count matching documents (result in `DocResult.affected`).
+    Count {
+        /// The query document.
+        query: Vec<u8>,
+        /// The options document.
+        options: Vec<u8>,
+    },
 }
 
 impl DocCommand {
@@ -286,6 +293,7 @@ impl DocCommand {
             DocCommand::UpdateMany { .. } => 6,
             DocCommand::DeleteOne { .. } => 7,
             DocCommand::DeleteMany { .. } => 8,
+            DocCommand::Count { .. } => 9,
         }
     }
 
@@ -321,7 +329,8 @@ impl DocCommand {
                 w.put_bytes_u32("doc.options", options)?;
             }
             DocCommand::DeleteOne { query, options }
-            | DocCommand::DeleteMany { query, options } => {
+            | DocCommand::DeleteMany { query, options }
+            | DocCommand::Count { query, options } => {
                 w.put_bytes_u32("doc.query", query)?;
                 w.put_bytes_u32("doc.options", options)?;
             }
@@ -363,6 +372,10 @@ impl DocCommand {
                 options: get_blob_u32(r, "doc.options")?,
             },
             8 => DocCommand::DeleteMany {
+                query: get_blob_u32(r, "doc.query")?,
+                options: get_blob_u32(r, "doc.options")?,
+            },
+            9 => DocCommand::Count {
                 query: get_blob_u32(r, "doc.query")?,
                 options: get_blob_u32(r, "doc.options")?,
             },

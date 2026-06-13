@@ -45,7 +45,8 @@ export type DocCommand =
   | { op: 5; query: Buffer; update: Buffer; options: Buffer } // updateOne
   | { op: 6; query: Buffer; update: Buffer; options: Buffer } // updateMany
   | { op: 7; query: Buffer; options: Buffer } // deleteOne
-  | { op: 8; query: Buffer; options: Buffer }; // deleteMany
+  | { op: 8; query: Buffer; options: Buffer } // deleteMany
+  | { op: 9; query: Buffer; options: Buffer }; // count
 
 export type KvCommand =
   | { op: 1; key: Buffer } // get
@@ -209,6 +210,7 @@ function encodeDocBody(w: Writer, c: DocCommand): void {
       break;
     case 7:
     case 8:
+    case 9:
       w.bytesU32(c.query);
       w.bytesU32(c.options);
       break;

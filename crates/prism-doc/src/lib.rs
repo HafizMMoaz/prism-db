@@ -241,6 +241,21 @@ impl DocCollection {
         Ok(out)
     }
 
+    /// The number of documents matching `filter`, visible to `txn`. Decodes
+    /// each candidate to apply the filter but never collects them.
+    pub fn count(&self, txn: &TxnHandle, filter: &Filter) -> Result<u64> {
+        if let Some(id) = eq_id(filter) {
+            return Ok(self.seek_id(txn, id)?.is_some() as u64);
+        }
+        let mut n = 0u64;
+        for (_, payload) in self.store.scan(txn, self.heap)? {
+            if filter.matches(&Document::decode(&payload)?) {
+                n += 1;
+            }
+        }
+        Ok(n)
+    }
+
     /// The first document matching `filter`.
     pub fn find_one(&self, txn: &TxnHandle, filter: &Filter) -> Result<Option<Document>> {
         if let Some(id) = eq_id(filter) {
