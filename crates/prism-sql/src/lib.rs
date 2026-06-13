@@ -39,8 +39,8 @@ use prism_index::BTree;
 use sqlparser::ast::{
     Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Distinct,
     DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Value as SqlValue,
+    GroupByExpr, ObjectType, OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -74,6 +74,11 @@ pub enum Outcome {
     Delete {
         /// Rows deleted.
         count: usize,
+    },
+    /// A `DROP TABLE` removed the named table.
+    DropTable {
+        /// The dropped table's name (for catalog tombstoning).
+        name: String,
     },
 }
 
@@ -135,10 +140,43 @@ impl SqlEngine {
                 ..
             } => self.exec_update(txn, table, assignments, selection),
             Statement::Delete(del) => self.exec_delete(txn, del),
+            Statement::Drop {
+                object_type,
+                if_exists,
+                names,
+                ..
+            } => self.exec_drop(object_type, if_exists, names),
             other => Err(SqlError::Unsupported(format!(
                 "statement: {}",
                 statement_kind(&other)
             ))),
+        }
+    }
+
+    /// `DROP TABLE [IF EXISTS] <name>`. Other object types are unsupported. The
+    /// table is removed from the catalog; its heap and index pages are abandoned
+    /// (no in-database page reclamation yet) but become unreachable.
+    fn exec_drop(
+        &self,
+        object_type: ObjectType,
+        if_exists: bool,
+        names: Vec<sqlparser::ast::ObjectName>,
+    ) -> Result<Outcome> {
+        if object_type != ObjectType::Table {
+            return Err(SqlError::Unsupported(format!("DROP {object_type}")));
+        }
+        if names.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "DROP TABLE supports one table at a time".into(),
+            ));
+        }
+        let name = object_name(&names[0]);
+        match self.catalog.drop_table(&name) {
+            Ok(()) => Ok(Outcome::DropTable { name }),
+            // `IF EXISTS` makes a missing table a no-op (still reported so the
+            // server can persist an idempotent tombstone).
+            Err(SqlError::NoSuchTable(_)) if if_exists => Ok(Outcome::DropTable { name }),
+            Err(e) => Err(e),
         }
     }
 
@@ -1640,6 +1678,58 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn drop_table_removes_it_and_frees_the_name() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'a')")
+            .unwrap();
+
+        assert_eq!(
+            env.engine.execute_autocommit("DROP TABLE t").unwrap(),
+            Outcome::DropTable { name: "t".into() }
+        );
+        // The table is gone: queries against it fail.
+        assert!(matches!(
+            env.engine.execute_autocommit("SELECT id FROM t"),
+            Err(SqlError::NoSuchTable(_))
+        ));
+        // The name is free to reuse — with a fresh, independent schema.
+        env.engine
+            .execute_autocommit("CREATE TABLE t (other BIGINT)")
+            .unwrap();
+        assert_eq!(
+            env.engine
+                .execute_autocommit("SELECT other FROM t")
+                .unwrap(),
+            Outcome::Select {
+                columns: vec!["other".into()],
+                rows: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn drop_missing_table_errors_unless_if_exists() {
+        let env = env();
+        assert!(matches!(
+            env.engine.execute_autocommit("DROP TABLE ghost"),
+            Err(SqlError::NoSuchTable(_))
+        ));
+        // IF EXISTS makes it a no-op.
+        assert_eq!(
+            env.engine
+                .execute_autocommit("DROP TABLE IF EXISTS ghost")
+                .unwrap(),
+            Outcome::DropTable {
+                name: "ghost".into()
+            }
+        );
     }
 
     #[test]

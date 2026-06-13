@@ -233,6 +233,75 @@ fn new_objects_after_restart_do_not_collide() {
     assert_eq!(doc_count(&mut s, "c2"), 1);
 }
 
+#[test]
+fn dropped_table_stays_dropped_across_restart() {
+    let tmp = TempDir::new("durability-drop").unwrap();
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE keep (id BIGINT NOT NULL)"));
+        s.handle(sql("INSERT INTO keep VALUES (1)"));
+        s.handle(sql("CREATE TABLE gone (id BIGINT NOT NULL)"));
+        s.handle(sql("INSERT INTO gone VALUES (2)"));
+        match s.handle(sql("DROP TABLE gone")) {
+            Message::SqlResult { status: 0, .. } => {}
+            other => panic!("expected SqlResult, got {other:?}"),
+        }
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    // The tombstone replayed: `gone` does not reappear.
+    match s.handle(sql("SELECT id FROM gone")) {
+        Message::SqlResult { status, .. } => {
+            assert_ne!(status, 0, "dropped table must not reappear after restart")
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+    // The sibling table is untouched.
+    match s.handle(sql("SELECT id FROM keep")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => assert_eq!(rows, vec![vec![Some(WireValue::Int64(1))]]),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn recreated_table_after_drop_keeps_new_schema_across_restart() {
+    let tmp = TempDir::new("durability-drop-recreate").unwrap();
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE t (id BIGINT NOT NULL)"));
+        s.handle(sql("INSERT INTO t VALUES (1)"));
+        s.handle(sql("DROP TABLE t"));
+        // Reuse the name with a different schema.
+        s.handle(sql("CREATE TABLE t (label TEXT)"));
+        s.handle(sql("INSERT INTO t VALUES ('hello')"));
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    // The latest definition wins: the new column exists, the old row is gone.
+    match s.handle(sql("SELECT label FROM t")) {
+        Message::SqlResult {
+            status: 0,
+            columns,
+            rows,
+            ..
+        } => {
+            assert_eq!(columns[0].name, "label");
+            assert_eq!(rows, vec![vec![Some(WireValue::Str("hello".into()))]]);
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
 fn doc_count(s: &mut Session, collection: &str) -> usize {
     match s.handle(doc_find_all(collection)) {
         Message::DocResult {

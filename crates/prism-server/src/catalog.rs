@@ -6,8 +6,9 @@
 //! open, [`crate::Database`] scans these entries to repopulate its in-memory
 //! maps. Entries are encoded with the little-endian protocol codec.
 //!
-//! **Scope (this increment):** create-only — there is no `DROP`, so each object
-//! has exactly one entry, and catalog writes commit in their own transaction
+//! Records are append-only and replayed in order on open, so the last record
+//! per object wins: an `Upsert` installs it and a `Delete` tombstone (from
+//! `DROP TABLE`) removes it. Catalog writes commit in their own transaction
 //! (DDL is not yet transactional with surrounding data).
 
 use prism_protocol::codec::{Reader, Writer};
@@ -44,10 +45,40 @@ impl ObjectKind {
     }
 }
 
+/// Whether a catalog record creates/updates an object or removes it (a
+/// tombstone). The records are append-only and replayed in order on open, so
+/// the last record per object wins — giving `DROP` without rewriting history.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CatalogOp {
+    /// Create or update the object.
+    Upsert,
+    /// Remove the object (`DROP`).
+    Delete,
+}
+
+impl CatalogOp {
+    fn code(self) -> u8 {
+        match self {
+            CatalogOp::Upsert => 0,
+            CatalogOp::Delete => 1,
+        }
+    }
+    fn from_code(v: u8) -> Result<Self> {
+        match v {
+            0 => Ok(CatalogOp::Upsert),
+            1 => Ok(CatalogOp::Delete),
+            other => Err(ServerError::Corrupt(format!("bad catalog op {other}"))),
+        }
+    }
+}
+
 /// One catalog entry: a named object and its heap, plus a schema for tables and
 /// an index-tree root for KV namespaces.
 #[derive(Clone, Debug)]
 pub struct CatalogEntry {
+    /// Create/update vs remove. Defaults to `Upsert` when absent (records
+    /// written before `DROP` support).
+    pub op: CatalogOp,
     /// The object kind.
     pub kind: ObjectKind,
     /// The object name.
@@ -84,6 +115,9 @@ impl CatalogEntry {
             w.put_u8(type_code(col.ty));
             w.put_u8(u8::from(col.nullable));
         }
+        // The op is appended last so an `Upsert` record stays byte-identical to
+        // the original create-only format.
+        w.put_u8(self.op.code());
         Ok(w.into_vec())
     }
 
@@ -108,7 +142,14 @@ impl CatalogEntry {
                 nullable,
             });
         }
+        // Records from before `DROP` support end here and decode as `Upsert`.
+        let op = if r.is_empty() {
+            CatalogOp::Upsert
+        } else {
+            CatalogOp::from_code(r.get_u8("catalog.op")?)?
+        };
         Ok(Self {
+            op,
             kind,
             name,
             heap,
@@ -245,6 +286,7 @@ mod tests {
     #[test]
     fn entry_round_trips() {
         let table = CatalogEntry {
+            op: CatalogOp::Upsert,
             kind: ObjectKind::Table,
             name: "accounts".into(),
             heap: 1000,
@@ -264,6 +306,7 @@ mod tests {
             ],
         };
         let decoded = CatalogEntry::decode(&table.encode().unwrap()).unwrap();
+        assert_eq!(decoded.op, CatalogOp::Upsert);
         assert_eq!(decoded.kind, ObjectKind::Table);
         assert_eq!(decoded.name, "accounts");
         assert_eq!(decoded.heap, 1000);
@@ -274,6 +317,7 @@ mod tests {
         assert_eq!(decoded.columns[1].ty, Type::Text);
 
         let ns = CatalogEntry {
+            op: CatalogOp::Delete,
             kind: ObjectKind::Namespace,
             name: "sessions".into(),
             heap: 1 << 41,
@@ -282,11 +326,32 @@ mod tests {
             columns: vec![],
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
+        assert_eq!(decoded.op, CatalogOp::Delete);
         assert_eq!(decoded.kind, ObjectKind::Namespace);
         assert_eq!(decoded.heap, 1 << 41);
         assert_eq!(decoded.root_page, 77);
         assert_eq!(decoded.primary_key, None);
         assert!(decoded.columns.is_empty());
+    }
+
+    #[test]
+    fn legacy_record_without_op_decodes_as_upsert() {
+        // An old create-only record has no trailing op byte.
+        let mut bytes = CatalogEntry {
+            op: CatalogOp::Upsert,
+            kind: ObjectKind::Table,
+            name: "t".into(),
+            heap: 1000,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+        }
+        .encode()
+        .unwrap();
+        bytes.pop(); // drop the op byte to mimic the pre-feature format
+        let decoded = CatalogEntry::decode(&bytes).unwrap();
+        assert_eq!(decoded.op, CatalogOp::Upsert);
+        assert_eq!(decoded.name, "t");
     }
 
     #[test]

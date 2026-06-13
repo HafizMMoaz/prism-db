@@ -31,7 +31,7 @@ use prism_storage::{DiskManager, PageId};
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
 use crate::auth::{Privileges, UserStore};
-use crate::catalog::{CatalogEntry, ObjectKind, UserEntry, UserOp};
+use crate::catalog::{CatalogEntry, CatalogOp, ObjectKind, UserEntry, UserOp};
 use crate::error::Result;
 
 // Heap-id ranges, kept disjoint per model so the registries never collide. The
@@ -437,6 +437,7 @@ impl Database {
         let coll = DocCollection::create(self.store.clone(), heap)?;
         let root = coll.index_root();
         self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Upsert,
             kind: ObjectKind::Collection,
             name: name.to_string(),
             heap: heap.0,
@@ -464,6 +465,7 @@ impl Database {
         // namespace reopens without a rescan after restart.
         let ns = Arc::new(KvNamespace::create(self.store.clone(), heap)?);
         self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Upsert,
             kind: ObjectKind::Namespace,
             name: name.to_string(),
             heap: heap.0,
@@ -487,6 +489,7 @@ impl Database {
                 continue;
             }
             let entry = CatalogEntry {
+                op: CatalogOp::Upsert,
                 kind: ObjectKind::Table,
                 name: table.name.clone(),
                 heap: table.heap.0,
@@ -497,6 +500,26 @@ impl Database {
             self.persist_entry(&entry)?;
             persisted.insert(table.name);
         }
+        Ok(())
+    }
+
+    /// Persist a tombstone for a dropped SQL table. The relational catalog has
+    /// already removed it; this records the `DROP` so it does not reappear on
+    /// restart, and clears the persisted-name marker so the name may be reused.
+    pub fn drop_sql_table(&self, name: &str) -> Result<()> {
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Delete,
+            kind: ObjectKind::Table,
+            name: name.to_string(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+        })?;
+        self.persisted_tables
+            .lock()
+            .expect("persisted set poisoned")
+            .remove(name);
         Ok(())
     }
 
@@ -535,8 +558,25 @@ impl Database {
         let mut next_doc = DOC_HEAP_BASE;
         let mut next_kv = KV_HEAP_BASE;
 
+        // Replay the append-only catalog: the last record per (kind, name) wins,
+        // so a `Delete` tombstone removes an object dropped earlier in the log.
+        // Objects are independent, so the surviving entries can register in any
+        // order.
+        let mut latest: HashMap<(u8, String), CatalogEntry> = HashMap::new();
         for (_rid, payload) in &entries {
             let entry = CatalogEntry::decode(payload)?;
+            let key = (entry.kind as u8, entry.name.clone());
+            match entry.op {
+                CatalogOp::Upsert => {
+                    latest.insert(key, entry);
+                }
+                CatalogOp::Delete => {
+                    latest.remove(&key);
+                }
+            }
+        }
+
+        for entry in latest.into_values() {
             let heap = HeapId(entry.heap);
             match entry.kind {
                 ObjectKind::Table => {

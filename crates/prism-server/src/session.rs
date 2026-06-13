@@ -699,12 +699,15 @@ impl Session {
         };
         match self.in_txn(|txn| db.sql().execute(txn, &sql).map_err(ServerError::from)) {
             Ok(outcome) => {
-                // DDL is effective immediately; persist new tables to the catalog
-                // so the schema survives restart.
-                if matches!(outcome, Outcome::CreateTable) {
-                    if let Err(e) = db.persist_sql_tables() {
-                        return sql_result_err(&e);
-                    }
+                // DDL is effective immediately; persist the catalog change so the
+                // schema survives restart.
+                let persisted = match &outcome {
+                    Outcome::CreateTable => db.persist_sql_tables(),
+                    Outcome::DropTable { name } => db.drop_sql_table(name),
+                    _ => Ok(()),
+                };
+                if let Err(e) = persisted {
+                    return sql_result_err(&e);
                 }
                 outcome_to_sql_result(outcome)
             }
@@ -1317,7 +1320,7 @@ fn empty_kv_body(command: &KvCommand) -> KvResultBody {
 
 fn outcome_to_sql_result(outcome: Outcome) -> Message {
     let (affected_rows, columns, rows) = match outcome {
-        Outcome::CreateTable => (0, vec![], vec![]),
+        Outcome::CreateTable | Outcome::DropTable { .. } => (0, vec![], vec![]),
         Outcome::Insert { count } => (count as u64, vec![], vec![]),
         Outcome::Select { columns, rows } => {
             let wire_rows: Vec<Row> = rows

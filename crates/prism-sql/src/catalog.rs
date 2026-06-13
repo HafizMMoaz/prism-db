@@ -96,6 +96,16 @@ impl Catalog {
         Ok(table)
     }
 
+    /// Remove a table from the catalog. Errors if it does not exist. The heap
+    /// allocator is not rewound, so a dropped heap id is never reused.
+    pub fn drop_table(&self, name: &str) -> Result<()> {
+        let mut tables = self.tables.lock().expect("catalog poisoned");
+        if tables.remove(name).is_none() {
+            return Err(SqlError::NoSuchTable(name.to_string()));
+        }
+        Ok(())
+    }
+
     /// Look up a table by name.
     pub fn table(&self, name: &str) -> Result<Table> {
         self.tables
