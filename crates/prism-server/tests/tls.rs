@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use prism_client::Client;
 use prism_protocol::Value;
-use prism_server::{Database, Server, ServerConfig, tls};
+use prism_server::{Instance, Server, ServerConfig, tls};
 use prism_testkit::TempDir;
 use rustls::RootCertStore;
 use rustls::pki_types::pem::PemObject;
@@ -47,9 +47,10 @@ fn key() -> PrivateKeyDer<'static> {
 async fn tls_server() -> std::net::SocketAddr {
     let server_tls = tls::server_config(vec![cert()], key()).unwrap();
     let tmp = TempDir::new("tls").unwrap();
-    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let instance = Arc::new(Instance::open(tmp.path()).unwrap());
+    instance.create_database("app").unwrap();
     let server = Server::bind_with(
-        db,
+        instance,
         "127.0.0.1:0",
         ServerConfig {
             tls: Some(server_tls),
@@ -80,6 +81,7 @@ async fn tls_handshake_then_sql_roundtrip() {
 
     // Authenticates over TLS (the admin OID is an internal id, not asserted).
     c.authenticate("admin", "admin").await.unwrap();
+    c.sql("USE app").await.unwrap(); // select the pre-created database
     c.sql("CREATE TABLE t (id BIGINT NOT NULL, name TEXT)")
         .await
         .unwrap();

@@ -8,7 +8,7 @@ use prism_protocol::{
     AuthMechanism, DocCommand, KvCommand, KvResultBody, Message, PROTOCOL_VERSION, Packet, TxnMode,
     Value as WireValue,
 };
-use prism_server::{Database, Server};
+use prism_server::{Instance, Server};
 use prism_testkit::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -64,13 +64,24 @@ impl Client {
             .await,
             Message::AuthAck { status: 0, .. }
         ));
+        // Select the database the test server pre-created.
+        assert!(matches!(
+            self.request(Message::SqlExecute {
+                sql: "USE app".into(),
+                params: vec![],
+                options: 1,
+            })
+            .await,
+            Message::SqlResult { status: 0, .. }
+        ));
     }
 }
 
 async fn start_server() -> (std::net::SocketAddr, TempDir) {
     let tmp = TempDir::new("net").unwrap();
-    let db = Arc::new(Database::open(tmp.path()).unwrap());
-    let server = Server::bind(db, "127.0.0.1:0").await.unwrap();
+    let instance = Arc::new(Instance::open(tmp.path()).unwrap());
+    instance.create_database("app").unwrap(); // the database the tests USE
+    let server = Server::bind(instance, "127.0.0.1:0").await.unwrap();
     let addr = server.local_addr().unwrap();
     tokio::spawn(server.run());
     (addr, tmp)

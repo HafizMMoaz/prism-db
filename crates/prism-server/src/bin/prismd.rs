@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use prism_protocol::DEFAULT_PORT;
-use prism_server::{Config, Database, Server, ServerConfig, tls};
+use prism_server::{Config, Instance, Server, ServerConfig, tls};
 
 /// Install the tracing subscriber. Honors `RUST_LOG` (e.g. `RUST_LOG=info` or
 /// `RUST_LOG=audit=info,prism_server=warn`); defaults to `info`. Audit events
@@ -69,9 +69,9 @@ fn init(dir: &str) -> ExitCode {
         eprintln!("prismd: cannot create {dir}: {e}");
         return ExitCode::FAILURE;
     }
-    match Database::open_with(Path::new(dir), Config::durable()) {
+    match Instance::open_with(Path::new(dir), Config::durable()) {
         Ok(_) => {
-            eprintln!("prismd: initialized database at {dir}");
+            eprintln!("prismd: initialized data directory at {dir}");
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -86,8 +86,8 @@ async fn run(dir: &str, bind: &str, tls_cert: Option<&str>, tls_key: Option<&str
         eprintln!("prismd: cannot create {dir}: {e}");
         return ExitCode::FAILURE;
     }
-    let db = match Database::open_with(Path::new(dir), Config::durable()) {
-        Ok(db) => Arc::new(db),
+    let instance = match Instance::open_with(Path::new(dir), Config::durable()) {
+        Ok(inst) => Arc::new(inst),
         Err(e) => {
             eprintln!("prismd: open {dir} failed: {e}");
             return ExitCode::FAILURE;
@@ -115,7 +115,7 @@ async fn run(dir: &str, bind: &str, tls_cert: Option<&str>, tls_key: Option<&str
     };
     let secure = config.tls.is_some();
 
-    let server = match Server::bind_with(db, bind, config).await {
+    let server = match Server::bind_with(instance, bind, config).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("prismd: bind {bind} failed: {e}");

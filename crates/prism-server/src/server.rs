@@ -29,7 +29,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_rustls::TlsAcceptor;
 
-use crate::database::Database;
+use crate::instance::Instance;
 use crate::session::Session;
 
 /// Default maximum simultaneous connections.
@@ -57,30 +57,30 @@ impl Default for ServerConfig {
     }
 }
 
-/// A bound TCP server over a shared [`Database`].
+/// A bound TCP server over a multi-database [`Instance`].
 pub struct Server {
     listener: TcpListener,
-    db: Arc<Database>,
+    instance: Arc<Instance>,
     config: ServerConfig,
     active: Arc<AtomicUsize>,
 }
 
 impl Server {
     /// Bind to `addr` with default [`ServerConfig`].
-    pub async fn bind(db: Arc<Database>, addr: impl ToSocketAddrs) -> io::Result<Self> {
-        Self::bind_with(db, addr, ServerConfig::default()).await
+    pub async fn bind(instance: Arc<Instance>, addr: impl ToSocketAddrs) -> io::Result<Self> {
+        Self::bind_with(instance, addr, ServerConfig::default()).await
     }
 
     /// Bind to `addr` with explicit [`ServerConfig`].
     pub async fn bind_with(
-        db: Arc<Database>,
+        instance: Arc<Instance>,
         addr: impl ToSocketAddrs,
         config: ServerConfig,
     ) -> io::Result<Self> {
         let listener = TcpListener::bind(addr).await?;
         Ok(Self {
             listener,
-            db,
+            instance,
             config,
             active: Arc::new(AtomicUsize::new(0)),
         })
@@ -104,7 +104,7 @@ impl Server {
             }
 
             let guard = ConnGuard(self.active.clone());
-            let db = self.db.clone();
+            let instance = self.instance.clone();
             let idle = self.config.idle_timeout;
             let tls = self.config.tls.clone();
             let peer = peer.to_string();
@@ -115,11 +115,11 @@ impl Server {
                     // Wrap in TLS before the first frame, then serve.
                     Some(cfg) => {
                         if let Ok(tls_stream) = TlsAcceptor::from(cfg).accept(stream).await {
-                            let _ = serve_connection(tls_stream, db, idle).await;
+                            let _ = serve_connection(tls_stream, instance, idle).await;
                         }
                     }
                     None => {
-                        let _ = serve_connection(stream, db, idle).await;
+                        let _ = serve_connection(stream, instance, idle).await;
                     }
                 }
                 crate::audit::connection_closed(&peer);
@@ -142,10 +142,10 @@ impl Drop for ConnGuard {
 /// open transaction) is dropped on return.
 async fn serve_connection<S: AsyncRead + AsyncWrite + Unpin>(
     mut stream: S,
-    db: Arc<Database>,
+    instance: Arc<Instance>,
     idle_timeout: Duration,
 ) -> io::Result<()> {
-    let mut session = Session::new_authenticating(db);
+    let mut session = Session::for_instance(instance);
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
 

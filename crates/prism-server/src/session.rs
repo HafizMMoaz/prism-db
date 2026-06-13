@@ -16,9 +16,13 @@
 //!   served alongside find/update/delete.
 //! - KV `range`/`scan` are unsupported on the hash namespace.
 //!
-//! A network session ([`Session::new_authenticating`]) must complete the
+//! A network session ([`Session::new_authenticating`] for a single database, or
+//! [`Session::for_instance`] for a multi-database server) must complete the
 //! `Hello` → `Auth` handshake (scrypt-verified credentials) before any request
 //! is served; the embedded [`Session::new`] is pre-authenticated and trusted.
+//! On a multi-database server, authentication is against server-global accounts
+//! and a database is selected with `USE <db>` (managed with `CREATE DATABASE` /
+//! `DROP DATABASE` / `SHOW DATABASES`).
 
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -37,6 +41,7 @@ use prism_wal::Lsn;
 use crate::auth::{Privileges, SYSTEM_OID};
 use crate::database::Database;
 use crate::error::{Result, ServerError};
+use crate::instance::Instance;
 
 // AuthAck status codes (docs/specs/wire-protocol.md).
 const AUTH_BAD_CREDENTIALS: u8 = 1;
@@ -50,8 +55,10 @@ enum SessionTxn {
     /// No open transaction; queries auto-commit.
     None,
     /// An explicit transaction is open, driven across requests via the detached
-    /// transaction lifecycle (`begin_detached`/`resume`/`commit_txn`).
+    /// transaction lifecycle (`begin_detached`/`resume`/`commit_txn`). The
+    /// database it runs against is captured at `begin` so `USE` cannot move it.
     Explicit {
+        db: Arc<Database>,
         txn_id: TxnId,
         mode: TxnMode,
         snapshot: Snapshot,
@@ -90,9 +97,15 @@ impl Need {
     }
 }
 
-/// A client session over a shared [`Database`].
+/// A client session over a single [`Database`] or a multi-database
+/// [`Instance`].
 pub struct Session {
-    db: Arc<Database>,
+    /// The multi-database server, when serving over the network; `None` for an
+    /// embedded or single-database session.
+    instance: Option<Arc<Instance>>,
+    /// The currently selected database. Always set for a single-database
+    /// session; for a multi-database one it is chosen with `USE <db>`.
+    current_db: Option<Arc<Database>>,
     auth: AuthState,
     txn: SessionTxn,
     /// Set when a fatal handshake condition (version mismatch, bad credentials,
@@ -102,10 +115,11 @@ pub struct Session {
 
 impl Session {
     /// A trusted, already-authenticated session for the embedded API (no network
-    /// handshake). Use [`Session::new_authenticating`] for connections.
+    /// handshake), bound to a single database.
     pub fn new(db: Arc<Database>) -> Self {
         Self {
-            db,
+            instance: None,
+            current_db: Some(db),
             auth: AuthState::Authenticated {
                 user_oid: SYSTEM_OID,
             },
@@ -114,11 +128,24 @@ impl Session {
         }
     }
 
-    /// A network session that must complete the `Hello` → `Auth` handshake
-    /// before it will serve any request.
+    /// A network session over a single database that must complete the
+    /// `Hello` → `Auth` handshake before serving any request.
     pub fn new_authenticating(db: Arc<Database>) -> Self {
         Self {
-            db,
+            instance: None,
+            current_db: Some(db),
+            auth: AuthState::New,
+            txn: SessionTxn::None,
+            closing: false,
+        }
+    }
+
+    /// A network session over a multi-database [`Instance`]: authenticate, then
+    /// select a database with `USE <db>` (or create one with `CREATE DATABASE`).
+    pub fn for_instance(instance: Arc<Instance>) -> Self {
+        Self {
+            instance: Some(instance),
+            current_db: None,
             auth: AuthState::New,
             txn: SessionTxn::None,
             closing: false,
@@ -200,7 +227,7 @@ impl Session {
         match request {
             Message::Auth {
                 username, password, ..
-            } => match self.db.verify_user(&username, &password) {
+            } => match self.verify_credentials(&username, &password) {
                 Some(user_oid) => {
                     crate::audit::auth_success(&username, user_oid);
                     self.auth = AuthState::Authenticated { user_oid };
@@ -278,7 +305,7 @@ impl Session {
         if oid == SYSTEM_OID {
             return Ok(());
         }
-        let privs = self.db.privileges(oid).unwrap_or(Privileges::NONE);
+        let privs = self.privileges_of(oid).unwrap_or(Privileges::NONE);
         let ok = match need {
             Need::Read => privs.can_read(),
             Need::Write => privs.can_write(),
@@ -293,6 +320,62 @@ impl Session {
                 need.label()
             )))
         }
+    }
+
+    // ---- backend (auth source) and current-database resolution ---------------
+
+    /// Verify credentials against the auth source (instance, else the single db).
+    fn verify_credentials(&self, username: &str, password: &str) -> Option<u64> {
+        match &self.instance {
+            Some(inst) => inst.verify_user(username, password),
+            None => self.current_db.as_ref()?.verify_user(username, password),
+        }
+    }
+
+    fn privileges_of(&self, oid: u64) -> Option<Privileges> {
+        match &self.instance {
+            Some(inst) => inst.privileges(oid),
+            None => self.current_db.as_ref().and_then(|db| db.privileges(oid)),
+        }
+    }
+
+    fn create_user(&self, name: &str, pw: &str, privs: Privileges) -> Result<u64> {
+        match &self.instance {
+            Some(inst) => inst.create_user(name, pw, privs),
+            None => self.require_db()?.create_user(name, pw, privs),
+        }
+    }
+
+    fn set_user_privileges(&self, name: &str, privs: Privileges) -> Result<()> {
+        match &self.instance {
+            Some(inst) => inst.set_user_privileges(name, privs),
+            None => self.require_db()?.set_user_privileges(name, privs),
+        }
+    }
+
+    fn drop_user(&self, name: &str) -> Result<()> {
+        match &self.instance {
+            Some(inst) => inst.drop_user(name),
+            None => self.require_db()?.drop_user(name),
+        }
+    }
+
+    /// The single database of a non-instance session.
+    fn require_db(&self) -> Result<Arc<Database>> {
+        self.current_db
+            .clone()
+            .ok_or_else(|| ServerError::State("no database".into()))
+    }
+
+    /// The database that data operations act on: the open transaction's bound
+    /// database, else the currently selected one.
+    fn data_db(&self) -> Result<Arc<Database>> {
+        if let SessionTxn::Explicit { db, .. } = &self.txn {
+            return Ok(db.clone());
+        }
+        self.current_db.clone().ok_or_else(|| {
+            ServerError::State("no database selected; run `USE <database>` first".into())
+        })
     }
 
     // ---- transaction control -------------------------------------------------
@@ -312,8 +395,18 @@ impl Session {
         if let Err(e) = self.authorize(need) {
             return txn_ack_err(0, &e);
         }
-        let (txn_id, snapshot) = self.db.txns().begin_detached(mode);
+        let db = match self.current_db.clone() {
+            Some(db) => db,
+            None => {
+                return txn_ack_err(
+                    0,
+                    &ServerError::State("no database selected; run `USE <database>` first".into()),
+                );
+            }
+        };
+        let (txn_id, snapshot) = db.txns().begin_detached(mode);
         self.txn = SessionTxn::Explicit {
+            db,
             txn_id,
             mode,
             snapshot,
@@ -328,13 +421,15 @@ impl Session {
     }
 
     fn commit(&mut self, idempotency_key: u128) -> Message {
-        let (txn_id, mode, last_lsn) = match std::mem::replace(&mut self.txn, SessionTxn::None) {
+        let (db, txn_id, mode, last_lsn) = match std::mem::replace(&mut self.txn, SessionTxn::None)
+        {
             SessionTxn::Explicit {
+                db,
                 txn_id,
                 mode,
                 last_lsn,
                 ..
-            } => (txn_id, mode, last_lsn),
+            } => (db, txn_id, mode, last_lsn),
             SessionTxn::None => {
                 return txn_ack_err(0, &ServerError::State("no transaction to commit".into()));
             }
@@ -343,8 +438,8 @@ impl Session {
         // Idempotency: a retried commit with a key already recorded returns the
         // original outcome and discards this transaction's (duplicate) writes.
         if idempotency_key != 0 {
-            if let Some((orig_txn, commit_lsn)) = self.db.idempotency_lookup(idempotency_key) {
-                let _ = self.db.txns().abort_txn(txn_id, mode, last_lsn);
+            if let Some((orig_txn, commit_lsn)) = db.idempotency_lookup(idempotency_key) {
+                let _ = db.txns().abort_txn(txn_id, mode, last_lsn);
                 return Message::TxnAck {
                     status: 0,
                     txn_id: orig_txn,
@@ -354,10 +449,10 @@ impl Session {
             }
         }
 
-        match self.db.txns().commit_txn(txn_id, mode, last_lsn) {
+        match db.txns().commit_txn(txn_id, mode, last_lsn) {
             Ok(()) => {
                 if idempotency_key != 0 {
-                    self.db.idempotency_record(idempotency_key, txn_id, 0);
+                    db.idempotency_record(idempotency_key, txn_id, 0);
                 }
                 Message::TxnAck {
                     status: 0,
@@ -373,11 +468,12 @@ impl Session {
     fn abort(&mut self) -> Message {
         match std::mem::replace(&mut self.txn, SessionTxn::None) {
             SessionTxn::Explicit {
+                db,
                 txn_id,
                 mode,
                 last_lsn,
                 ..
-            } => match self.db.txns().abort_txn(txn_id, mode, last_lsn) {
+            } => match db.txns().abort_txn(txn_id, mode, last_lsn) {
                 Ok(()) => Message::TxnAck {
                     status: 0,
                     txn_id,
@@ -396,7 +492,8 @@ impl Session {
     /// fresh implicit one that auto-commits. On error inside an explicit
     /// transaction the whole transaction is aborted (Postgres-style).
     fn in_txn<R>(&mut self, f: impl FnOnce(&TxnHandle) -> Result<R>) -> Result<R> {
-        let txns = self.db.txns();
+        // The transaction's bound database (explicit), else the selected one.
+        let txns = self.data_db()?.txns();
         // Snapshot the explicit-txn state into locals so we don't hold a borrow
         // of `self.txn` while we later mutate it.
         let explicit = if let SessionTxn::Explicit {
@@ -404,6 +501,7 @@ impl Session {
             mode,
             snapshot,
             last_lsn,
+            ..
         } = &self.txn
         {
             Some((*txn_id, *mode, snapshot.clone(), *last_lsn))
@@ -457,6 +555,14 @@ impl Session {
             ));
         }
 
+        // Database management (CREATE/DROP/SHOW DATABASE, USE) is handled here.
+        if is_db_admin_sql(&sql) {
+            return match self.run_db_admin_sql(&sql) {
+                Ok(msg) => msg,
+                Err(e) => sql_result_err(&e),
+            };
+        }
+
         // Administrative statements (user/grant management) are handled here, not
         // by the relational engine, and need the ADMIN privilege.
         if is_admin_sql(&sql) {
@@ -480,7 +586,10 @@ impl Session {
             return sql_result_err(&e);
         }
 
-        let db = self.db.clone();
+        let db = match self.data_db() {
+            Ok(db) => db,
+            Err(e) => return sql_result_err(&e),
+        };
         match self.in_txn(|txn| db.sql().execute(txn, &sql).map_err(ServerError::from)) {
             Ok(outcome) => {
                 // DDL is effective immediately; persist new tables to the catalog
@@ -496,6 +605,76 @@ impl Session {
         }
     }
 
+    /// Handle `USE <db>`, `CREATE DATABASE`, `DROP DATABASE`, `SHOW DATABASES`.
+    /// These require a multi-database [`Instance`]; a single-database session
+    /// rejects them.
+    fn run_db_admin_sql(&mut self, sql: &str) -> Result<Message> {
+        let Some(inst) = self.instance.clone() else {
+            return Err(ServerError::Unsupported(
+                "this server serves a single database; database management is unavailable".into(),
+            ));
+        };
+        let stmt = sql.trim().trim_end_matches(';');
+        let upper = stmt.to_ascii_uppercase();
+        let oid = self.user_oid();
+
+        if let Some(rest) = strip_kw(stmt, &upper, "USE") {
+            let name = first_word(rest)
+                .ok_or_else(|| ServerError::State("USE needs a database name".into()))?;
+            if matches!(self.txn, SessionTxn::Explicit { .. }) {
+                return Err(ServerError::State(
+                    "cannot change database inside a transaction".into(),
+                ));
+            }
+            self.authorize(Need::Read)?;
+            self.current_db = Some(inst.database(name)?);
+            return Ok(sql_ack(0));
+        }
+        if strip_kw(stmt, &upper, "SHOW DATABASES").is_some() {
+            self.authorize(Need::Read)?;
+            let names = inst.list_databases()?;
+            // Return as a single-column "Database" result set.
+            let rows: Vec<Row> = names
+                .into_iter()
+                .map(|n| vec![Some(WireValue::Str(n))])
+                .collect();
+            return Ok(Message::SqlResult {
+                status: 0,
+                affected_rows: 0,
+                columns: vec![ColumnDesc {
+                    name: "Database".into(),
+                    type_tag: WireValue::Str(String::new()).type_tag(),
+                    nullable: false,
+                }],
+                rows,
+                more_frames: false,
+                error: None,
+            });
+        }
+        if let Some(rest) = strip_kw(stmt, &upper, "CREATE DATABASE") {
+            self.authorize(Need::Admin)?;
+            let name = first_word(rest)
+                .ok_or_else(|| ServerError::State("CREATE DATABASE needs a name".into()))?;
+            inst.create_database(name)?;
+            crate::audit::admin(oid, "CREATE DATABASE", name);
+            return Ok(sql_ack(0));
+        }
+        if let Some(rest) = strip_kw(stmt, &upper, "DROP DATABASE") {
+            self.authorize(Need::Admin)?;
+            let name = first_word(rest)
+                .ok_or_else(|| ServerError::State("DROP DATABASE needs a name".into()))?;
+            // Release our selection so this session's handle can't block removal
+            // (the client re-runs `USE` afterward).
+            self.current_db = None;
+            inst.drop_database(name)?;
+            crate::audit::admin(oid, "DROP DATABASE", name);
+            return Ok(sql_ack(0));
+        }
+        Err(ServerError::Unsupported(format!(
+            "database statement: {stmt}"
+        )))
+    }
+
     /// Execute an administrative statement (user/grant management). The caller
     /// has already checked the ADMIN privilege.
     fn run_admin_sql(&self, sql: &str) -> Result<Message> {
@@ -509,7 +688,7 @@ impl Session {
             let password = single_quoted(stmt)
                 .ok_or_else(|| ServerError::State("CREATE USER needs WITH PASSWORD '…'".into()))?;
             let role = role_clause(&upper, stmt).unwrap_or(Privileges::read_write());
-            self.db.create_user(name, &password, role)?;
+            self.create_user(name, &password, role)?;
             crate::audit::admin(oid, "CREATE USER", name);
         } else if strip_kw(stmt, &upper, "GRANT").is_some() {
             // GRANT <role> TO <user>
@@ -519,7 +698,7 @@ impl Session {
             }
             let role = Privileges::from_role(t[1])
                 .ok_or_else(|| ServerError::State(format!("unknown role: {}", t[1])))?;
-            self.db.set_user_privileges(t[3], role)?;
+            self.set_user_privileges(t[3], role)?;
             crate::audit::admin(oid, "GRANT", t[3]);
         } else if strip_kw(stmt, &upper, "REVOKE").is_some() {
             // REVOKE ALL FROM <user>  (disables the account: privileges = NONE)
@@ -531,12 +710,12 @@ impl Session {
             let user = t
                 .get(from + 1)
                 .ok_or_else(|| ServerError::State("REVOKE needs a username".into()))?;
-            self.db.set_user_privileges(user, Privileges::NONE)?;
+            self.set_user_privileges(user, Privileges::NONE)?;
             crate::audit::admin(oid, "REVOKE", user);
         } else if let Some(rest) = strip_kw(stmt, &upper, "DROP USER") {
             let name = first_word(rest)
                 .ok_or_else(|| ServerError::State("DROP USER needs a username".into()))?;
-            self.db.drop_user(name)?;
+            self.drop_user(name)?;
             crate::audit::admin(oid, "DROP USER", name);
         } else {
             return Err(ServerError::Unsupported(format!("admin statement: {stmt}")));
@@ -557,7 +736,11 @@ impl Session {
         if let Err(e) = self.authorize(doc_need(&command)) {
             return doc_result_err(&e);
         }
-        let coll = match self.db.collection(&collection) {
+        let db = match self.data_db() {
+            Ok(db) => db,
+            Err(e) => return doc_result_err(&e),
+        };
+        let coll = match db.collection(&collection) {
             Ok(c) => c,
             Err(e) => return doc_result_err(&e),
         };
@@ -585,7 +768,17 @@ impl Session {
                 error: Some(e.to_error_info()),
             };
         }
-        let ns = match self.db.kv_namespace(&namespace) {
+        let db = match self.data_db() {
+            Ok(db) => db,
+            Err(e) => {
+                return Message::KvResult {
+                    status: 1,
+                    body: shape,
+                    error: Some(e.to_error_info()),
+                };
+            }
+        };
+        let ns = match db.kv_namespace(&namespace) {
             Ok(n) => n,
             Err(e) => {
                 return Message::KvResult {
@@ -615,13 +808,14 @@ impl Drop for Session {
     /// it — so a dropped connection never leaves a transaction holding locks.
     fn drop(&mut self) {
         if let SessionTxn::Explicit {
+            db,
             txn_id,
             mode,
             last_lsn,
             ..
         } = &self.txn
         {
-            let _ = self.db.txns().abort_txn(*txn_id, *mode, *last_lsn);
+            let _ = db.txns().abort_txn(*txn_id, *mode, *last_lsn);
         }
     }
 }
@@ -638,10 +832,32 @@ fn is_admin_sql(sql: &str) -> bool {
         || u.starts_with("DROP USER")
 }
 
+/// Whether `sql` is a database-management statement (USE / CREATE/DROP/SHOW
+/// DATABASE) handled by the instance, not the relational engine.
+fn is_db_admin_sql(sql: &str) -> bool {
+    let u = sql.trim_start().to_ascii_uppercase();
+    u.starts_with("USE ")
+        || u.starts_with("CREATE DATABASE")
+        || u.starts_with("DROP DATABASE")
+        || u.starts_with("SHOW DATABASES")
+}
+
 /// Whether `sql` is a read-only query (so it needs only READ).
 fn is_read_sql(sql: &str) -> bool {
     let u = sql.trim_start().to_ascii_uppercase();
     u.starts_with("SELECT") || u.starts_with("WITH")
+}
+
+/// A successful, row-less SQL acknowledgement (for DDL/admin statements).
+fn sql_ack(affected_rows: u64) -> Message {
+    Message::SqlResult {
+        status: 0,
+        affected_rows,
+        columns: vec![],
+        rows: vec![],
+        more_frames: false,
+        error: None,
+    }
 }
 
 /// If trimmed `stmt` (uppercase `upper`) starts with keyword phrase `kw`, the
