@@ -34,7 +34,7 @@ use prism_protocol::{
 use prism_sql::{Outcome, Value as SqlValue};
 use prism_wal::Lsn;
 
-use crate::auth::SYSTEM_OID;
+use crate::auth::{Privileges, SYSTEM_OID};
 use crate::database::Database;
 use crate::error::{Result, ServerError};
 
@@ -66,7 +66,28 @@ enum AuthState {
     /// `Hello` accepted; awaiting `Auth`.
     Greeted,
     /// Authenticated as the given user OID; requests are served.
-    Authenticated { _user_oid: u64 },
+    Authenticated { user_oid: u64 },
+}
+
+/// The privilege a request requires.
+#[derive(Clone, Copy)]
+enum Need {
+    /// A query (READ).
+    Read,
+    /// A data mutation or DDL (WRITE).
+    Write,
+    /// User/grant management (ADMIN).
+    Admin,
+}
+
+impl Need {
+    fn label(self) -> &'static str {
+        match self {
+            Need::Read => "READ",
+            Need::Write => "WRITE",
+            Need::Admin => "ADMIN",
+        }
+    }
 }
 
 /// A client session over a shared [`Database`].
@@ -86,7 +107,7 @@ impl Session {
         Self {
             db,
             auth: AuthState::Authenticated {
-                _user_oid: SYSTEM_OID,
+                user_oid: SYSTEM_OID,
             },
             txn: SessionTxn::None,
             closing: false,
@@ -181,9 +202,7 @@ impl Session {
                 username, password, ..
             } => match self.db.verify_user(&username, &password) {
                 Some(user_oid) => {
-                    self.auth = AuthState::Authenticated {
-                        _user_oid: user_oid,
-                    };
+                    self.auth = AuthState::Authenticated { user_oid };
                     Message::AuthAck {
                         status: 0,
                         user_oid,
@@ -240,6 +259,39 @@ impl Session {
         }
     }
 
+    // ---- authorization -------------------------------------------------------
+
+    /// The OID this session is authenticated as.
+    fn user_oid(&self) -> u64 {
+        match self.auth {
+            AuthState::Authenticated { user_oid } => user_oid,
+            _ => 0,
+        }
+    }
+
+    /// Check that the current user holds `need`. The embedded [`SYSTEM_OID`]
+    /// session is a superuser and always passes.
+    fn authorize(&self, need: Need) -> Result<()> {
+        let oid = self.user_oid();
+        if oid == SYSTEM_OID {
+            return Ok(());
+        }
+        let privs = self.db.privileges(oid).unwrap_or(Privileges::NONE);
+        let ok = match need {
+            Need::Read => privs.can_read(),
+            Need::Write => privs.can_write(),
+            Need::Admin => privs.can_admin(),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(ServerError::Unauthorized(format!(
+                "operation requires the {} privilege",
+                need.label()
+            )))
+        }
+    }
+
     // ---- transaction control -------------------------------------------------
 
     fn begin(&mut self, mode: WireTxnMode) -> Message {
@@ -250,6 +302,13 @@ impl Session {
             );
         }
         let mode = core_mode(mode);
+        let need = match mode {
+            TxnMode::ReadWrite => Need::Write,
+            TxnMode::ReadOnly => Need::Read,
+        };
+        if let Err(e) = self.authorize(need) {
+            return txn_ack_err(0, &e);
+        }
         let (txn_id, snapshot) = self.db.txns().begin_detached(mode);
         self.txn = SessionTxn::Explicit {
             txn_id,
@@ -394,6 +453,30 @@ impl Session {
                 "SQL parameters are not yet supported; use literals".into(),
             ));
         }
+
+        // Administrative statements (user/grant management) are handled here, not
+        // by the relational engine, and need the ADMIN privilege.
+        if is_admin_sql(&sql) {
+            if let Err(e) = self.authorize(Need::Admin) {
+                return sql_result_err(&e);
+            }
+            return match self.run_admin_sql(&sql) {
+                Ok(msg) => msg,
+                Err(e) => sql_result_err(&e),
+            };
+        }
+
+        // A read (SELECT/WITH) needs READ; anything else (INSERT/UPDATE/DELETE/
+        // CREATE …) mutates and needs WRITE.
+        let need = if is_read_sql(&sql) {
+            Need::Read
+        } else {
+            Need::Write
+        };
+        if let Err(e) = self.authorize(need) {
+            return sql_result_err(&e);
+        }
+
         let db = self.db.clone();
         match self.in_txn(|txn| db.sql().execute(txn, &sql).map_err(ServerError::from)) {
             Ok(outcome) => {
@@ -410,9 +493,62 @@ impl Session {
         }
     }
 
+    /// Execute an administrative statement (user/grant management). The caller
+    /// has already checked the ADMIN privilege.
+    fn run_admin_sql(&self, sql: &str) -> Result<Message> {
+        let stmt = sql.trim().trim_end_matches(';');
+        let upper = stmt.to_ascii_uppercase();
+        if let Some(rest) = strip_kw(stmt, &upper, "CREATE USER") {
+            // CREATE USER <name> WITH PASSWORD '<pw>' [ROLE <role>]
+            let name = first_word(rest)
+                .ok_or_else(|| ServerError::State("CREATE USER needs a username".into()))?;
+            let password = single_quoted(stmt)
+                .ok_or_else(|| ServerError::State("CREATE USER needs WITH PASSWORD '…'".into()))?;
+            let role = role_clause(&upper, stmt).unwrap_or(Privileges::read_write());
+            self.db.create_user(name, &password, role)?;
+        } else if strip_kw(stmt, &upper, "GRANT").is_some() {
+            // GRANT <role> TO <user>
+            let t: Vec<&str> = stmt.split_whitespace().collect();
+            if t.len() != 4 || !t[2].eq_ignore_ascii_case("TO") {
+                return Err(ServerError::State("syntax: GRANT <role> TO <user>".into()));
+            }
+            let role = Privileges::from_role(t[1])
+                .ok_or_else(|| ServerError::State(format!("unknown role: {}", t[1])))?;
+            self.db.set_user_privileges(t[3], role)?;
+        } else if strip_kw(stmt, &upper, "REVOKE").is_some() {
+            // REVOKE ALL FROM <user>  (disables the account: privileges = NONE)
+            let t: Vec<&str> = stmt.split_whitespace().collect();
+            let from = t
+                .iter()
+                .position(|w| w.eq_ignore_ascii_case("FROM"))
+                .ok_or_else(|| ServerError::State("syntax: REVOKE ALL FROM <user>".into()))?;
+            let user = t
+                .get(from + 1)
+                .ok_or_else(|| ServerError::State("REVOKE needs a username".into()))?;
+            self.db.set_user_privileges(user, Privileges::NONE)?;
+        } else if let Some(rest) = strip_kw(stmt, &upper, "DROP USER") {
+            let name = first_word(rest)
+                .ok_or_else(|| ServerError::State("DROP USER needs a username".into()))?;
+            self.db.drop_user(name)?;
+        } else {
+            return Err(ServerError::Unsupported(format!("admin statement: {stmt}")));
+        }
+        Ok(Message::SqlResult {
+            status: 0,
+            affected_rows: 0,
+            columns: vec![],
+            rows: vec![],
+            more_frames: false,
+            error: None,
+        })
+    }
+
     // ---- document ------------------------------------------------------------
 
     fn run_doc(&mut self, collection: String, command: DocCommand) -> Message {
+        if let Err(e) = self.authorize(doc_need(&command)) {
+            return doc_result_err(&e);
+        }
         let coll = match self.db.collection(&collection) {
             Ok(c) => c,
             Err(e) => return doc_result_err(&e),
@@ -434,6 +570,13 @@ impl Session {
 
     fn run_kv(&mut self, namespace: String, command: KvCommand) -> Message {
         let shape = empty_kv_body(&command);
+        if let Err(e) = self.authorize(kv_need(&command)) {
+            return Message::KvResult {
+                status: 1,
+                body: shape,
+                error: Some(e.to_error_info()),
+            };
+        }
         let ns = match self.db.kv_namespace(&namespace) {
             Ok(n) => n,
             Err(e) => {
@@ -472,6 +615,62 @@ impl Drop for Session {
         {
             let _ = self.db.txns().abort_txn(*txn_id, *mode, *last_lsn);
         }
+    }
+}
+
+// ---- authorization helpers ---------------------------------------------------
+
+/// Whether `sql` is an administrative (user/grant) statement handled outside the
+/// relational engine.
+fn is_admin_sql(sql: &str) -> bool {
+    let u = sql.trim_start().to_ascii_uppercase();
+    u.starts_with("CREATE USER")
+        || u.starts_with("GRANT ")
+        || u.starts_with("REVOKE ")
+        || u.starts_with("DROP USER")
+}
+
+/// Whether `sql` is a read-only query (so it needs only READ).
+fn is_read_sql(sql: &str) -> bool {
+    let u = sql.trim_start().to_ascii_uppercase();
+    u.starts_with("SELECT") || u.starts_with("WITH")
+}
+
+/// If trimmed `stmt` (uppercase `upper`) starts with keyword phrase `kw`, the
+/// remainder after it.
+fn strip_kw<'a>(stmt: &'a str, upper: &str, kw: &str) -> Option<&'a str> {
+    upper.starts_with(kw).then(|| stmt[kw.len()..].trim_start())
+}
+
+fn first_word(s: &str) -> Option<&str> {
+    s.split_whitespace().next()
+}
+
+/// The contents of the first single-quoted string in `s` (a password literal).
+fn single_quoted(s: &str) -> Option<String> {
+    let a = s.find('\'')?;
+    let b = s[a + 1..].find('\'')? + a + 1;
+    Some(s[a + 1..b].to_string())
+}
+
+/// Parse an optional `ROLE <role>` clause (used by `CREATE USER`).
+fn role_clause(upper: &str, original: &str) -> Option<Privileges> {
+    let idx = upper.find(" ROLE ")?;
+    let after = original[idx + " ROLE ".len()..].split_whitespace().next()?;
+    Privileges::from_role(after)
+}
+
+fn doc_need(command: &DocCommand) -> Need {
+    match command {
+        DocCommand::Find { .. } | DocCommand::FindOne { .. } => Need::Read,
+        _ => Need::Write,
+    }
+}
+
+fn kv_need(command: &KvCommand) -> Need {
+    match command {
+        KvCommand::Get { .. } | KvCommand::Range { .. } | KvCommand::Scan { .. } => Need::Read,
+        KvCommand::Put { .. } | KvCommand::Delete { .. } => Need::Write,
     }
 }
 

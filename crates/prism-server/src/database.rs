@@ -29,7 +29,7 @@ use prism_sql::SqlEngine;
 use prism_storage::{DiskManager, PageId};
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
-use crate::auth::UserStore;
+use crate::auth::{Privileges, UserStore};
 use crate::catalog::{CatalogEntry, ObjectKind};
 use crate::error::Result;
 
@@ -233,9 +233,36 @@ impl Database {
         );
     }
 
-    /// Create (or replace) a user account with a password.
+    /// Create (or replace) a user account with a password and READ+WRITE
+    /// privileges.
     pub fn add_user(&self, username: &str, password: &str) -> Result<u64> {
-        self.users.add_user(username, password)
+        self.users
+            .add_user(username, password, Privileges::read_write())
+    }
+
+    /// Create (or replace) a user account with explicit privileges.
+    pub fn create_user(
+        &self,
+        username: &str,
+        password: &str,
+        privileges: Privileges,
+    ) -> Result<u64> {
+        self.users.add_user(username, password, privileges)
+    }
+
+    /// Set a user's privileges (the effect of `GRANT`/`REVOKE`).
+    pub fn set_user_privileges(&self, username: &str, privileges: Privileges) -> Result<()> {
+        self.users.set_privileges(username, privileges)
+    }
+
+    /// Remove a user account.
+    pub fn drop_user(&self, username: &str) -> Result<()> {
+        self.users.drop_user(username)
+    }
+
+    /// The privileges of the account with `oid`, if any.
+    pub fn privileges(&self, oid: u64) -> Option<Privileges> {
+        self.users.privileges_of(oid)
     }
 
     /// Verify a username/password, returning the user's OID on success.

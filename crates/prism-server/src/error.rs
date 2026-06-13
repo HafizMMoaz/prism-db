@@ -33,6 +33,9 @@ pub enum ServerError {
     /// A request used a feature this build does not yet support.
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// The authenticated user lacks the privilege the request requires.
+    #[error("permission denied: {0}")]
+    Unauthorized(String),
     /// Persistent state (e.g. a catalog record) could not be decoded.
     #[error("corrupt: {0}")]
     Corrupt(String),
@@ -72,6 +75,8 @@ impl ServerError {
             ServerError::Core(_) => 0x0200,
             // 0x0001–0x00FF protocol errors.
             ServerError::State(_) => 0x0001,
+            // 0x0100–0x01FF authentication / authorization.
+            ServerError::Unauthorized(_) => 0x0101,
             // 0xFF00–0xFFFF internal / unexpected (incl. not-yet-implemented).
             ServerError::Unsupported(_) => 0xFF01,
             ServerError::Corrupt(_) => 0xFF02,
