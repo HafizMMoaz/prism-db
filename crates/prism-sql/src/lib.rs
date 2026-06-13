@@ -12,8 +12,11 @@
 //! `MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
 //! `BOOL`/`BIGINT`/`TEXT`. Expressions support arithmetic (`+ - * / %`),
 //! comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)`,
-//! `[NOT] BETWEEN … AND …`, and `[NOT] LIKE` (`%`/`_`) — usable in `WHERE`,
-//! `SET`, the select list, and `HAVING`. Deferred: joins, `AVG` (needs a
+//! `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`), and scalar functions —
+//! date/time (`NOW`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND` over Unix
+//! epoch seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`),
+//! and numeric (`ABS`/`MOD`/`COALESCE`) — usable in `WHERE`, `SET`, the select
+//! list, and `HAVING`. Deferred: joins, `AVG` (needs a
 //! floating-point type), `ORDER BY` over aggregate output, updating a
 //! primary-key column, the formal bind/rewrite/plan IR. The current executor
 //! interprets the parsed AST directly against the catalog; the full
@@ -869,7 +872,131 @@ impl SqlEngine {
                 };
                 Ok(Value::Bool(hit ^ negated))
             }
+            Expr::Function(f) => self.eval_function(f, row, table),
+            // `TRIM(x)` parses to its own node (not a function call).
+            Expr::Trim {
+                expr: inner,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => {
+                if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+                    return Err(SqlError::Unsupported(
+                        "TRIM with LEADING/TRAILING or trim characters".into(),
+                    ));
+                }
+                str_map(self.eval(inner, row, table)?, |s| s.trim().to_string())
+            }
             other => Err(SqlError::Unsupported(format!("expression: {other:?}"))),
+        }
+    }
+
+    /// Evaluate a scalar function call (date/time, string, numeric helpers).
+    /// Aggregate names are rejected here — they are handled by the aggregate
+    /// path, not per-row evaluation.
+    fn eval_function(&self, f: &Function, row: &[Value], table: &Table) -> Result<Value> {
+        let name = object_name(&f.name).to_ascii_uppercase();
+        if is_aggregate_name(&name) {
+            return Err(SqlError::Unsupported(format!(
+                "aggregate {name} is not allowed here"
+            )));
+        }
+        let arg_exprs = scalar_args(f)?;
+        let arg = |i: usize| -> Result<Value> {
+            let e = arg_exprs
+                .get(i)
+                .ok_or_else(|| SqlError::Type(format!("{name} is missing an argument")))?;
+            self.eval(e, row, table)
+        };
+        let nargs = arg_exprs.len();
+        match name.as_str() {
+            // ── date / time (BIGINT operands and results are Unix epoch seconds) ──
+            "NOW" | "CURRENT_TIMESTAMP" => Ok(Value::Int64(now_epoch_secs())),
+            "YEAR" => date_part(arg(0)?, DatePart::Year),
+            "MONTH" => date_part(arg(0)?, DatePart::Month),
+            "DAY" => date_part(arg(0)?, DatePart::Day),
+            "HOUR" => date_part(arg(0)?, DatePart::Hour),
+            "MINUTE" => date_part(arg(0)?, DatePart::Minute),
+            "SECOND" => date_part(arg(0)?, DatePart::Second),
+            // ── numeric ──
+            "ABS" => match arg(0)? {
+                Value::Int64(n) => Ok(Value::Int64(n.abs())),
+                Value::Null => Ok(Value::Null),
+                other => Err(SqlError::Type(format!(
+                    "ABS expects an integer, got {other:?}"
+                ))),
+            },
+            "MOD" => arith(&BinaryOperator::Modulo, &arg(0)?, &arg(1)?),
+            // ── string ──
+            "LENGTH" | "CHAR_LENGTH" => match arg(0)? {
+                Value::Text(s) => Ok(Value::Int64(s.chars().count() as i64)),
+                Value::Null => Ok(Value::Null),
+                other => Err(SqlError::Type(format!(
+                    "LENGTH expects text, got {other:?}"
+                ))),
+            },
+            "UPPER" => str_map(arg(0)?, |s| s.to_uppercase()),
+            "LOWER" => str_map(arg(0)?, |s| s.to_lowercase()),
+            "TRIM" => str_map(arg(0)?, |s| s.trim().to_string()),
+            "CONCAT" => {
+                let mut out = String::new();
+                for i in 0..nargs {
+                    match arg(i)? {
+                        Value::Null => {}
+                        Value::Text(s) => out.push_str(&s),
+                        Value::Int64(n) => out.push_str(&n.to_string()),
+                        Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+                    }
+                }
+                Ok(Value::Text(out))
+            }
+            "SUBSTR" | "SUBSTRING" => {
+                let s = match arg(0)? {
+                    Value::Text(s) => s,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(SqlError::Type(format!(
+                            "SUBSTR expects text, got {other:?}"
+                        )));
+                    }
+                };
+                let chars: Vec<char> = s.chars().collect();
+                // 1-indexed start (SQL convention); clamp to bounds.
+                let start = match arg(1)? {
+                    Value::Int64(n) => n,
+                    other => {
+                        return Err(SqlError::Type(format!(
+                            "SUBSTR start must be an integer, got {other:?}"
+                        )));
+                    }
+                };
+                let begin = (start.max(1) - 1).min(chars.len() as i64) as usize;
+                let end = if nargs >= 3 {
+                    match arg(2)? {
+                        Value::Int64(len) => {
+                            (begin as i64 + len.max(0)).min(chars.len() as i64) as usize
+                        }
+                        other => {
+                            return Err(SqlError::Type(format!(
+                                "SUBSTR length must be an integer, got {other:?}"
+                            )));
+                        }
+                    }
+                } else {
+                    chars.len()
+                };
+                Ok(Value::Text(chars[begin..end].iter().collect()))
+            }
+            "COALESCE" => {
+                for i in 0..nargs {
+                    let v = arg(i)?;
+                    if !matches!(v, Value::Null) {
+                        return Ok(v);
+                    }
+                }
+                Ok(Value::Null)
+            }
+            other => Err(SqlError::Unsupported(format!("function {other}"))),
         }
     }
 }
@@ -944,6 +1071,101 @@ fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<ProjIte
 fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
     let mut seen = std::collections::HashSet::new();
     rows.retain(|row| seen.insert(row.clone()));
+}
+
+/// Extract a scalar function's positional argument expressions.
+fn scalar_args(f: &Function) -> Result<Vec<&Expr>> {
+    match &f.args {
+        FunctionArguments::None => Ok(Vec::new()),
+        FunctionArguments::List(list) => {
+            let mut out = Vec::with_capacity(list.args.len());
+            for a in &list.args {
+                match a {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => out.push(e),
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "function argument: {other:?}"
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+        other => Err(SqlError::Unsupported(format!(
+            "function arguments: {other:?}"
+        ))),
+    }
+}
+
+/// Apply `f` to a text value, propagating NULL and rejecting non-text.
+fn str_map(v: Value, f: impl FnOnce(&str) -> String) -> Result<Value> {
+    match v {
+        Value::Text(s) => Ok(Value::Text(f(&s))),
+        Value::Null => Ok(Value::Null),
+        other => Err(SqlError::Type(format!("expected text, got {other:?}"))),
+    }
+}
+
+/// Current Unix time in whole seconds.
+fn now_epoch_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// A date/time component to extract.
+#[derive(Clone, Copy)]
+enum DatePart {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+    Second,
+}
+
+/// Extract a date/time component from a Unix-epoch-seconds BIGINT (UTC).
+fn date_part(v: Value, part: DatePart) -> Result<Value> {
+    let secs = match v {
+        Value::Int64(n) => n,
+        Value::Null => return Ok(Value::Null),
+        other => {
+            return Err(SqlError::Type(format!(
+                "date function expects an epoch-seconds integer, got {other:?}"
+            )));
+        }
+    };
+    let (y, mo, d, h, mi, s) = civil_from_epoch_secs(secs);
+    Ok(Value::Int64(match part {
+        DatePart::Year => y,
+        DatePart::Month => mo,
+        DatePart::Day => d,
+        DatePart::Hour => h,
+        DatePart::Minute => mi,
+        DatePart::Second => s,
+    }))
+}
+
+/// Convert Unix epoch seconds (UTC) to `(year, month, day, hour, minute,
+/// second)` using Howard Hinnant's civil-from-days algorithm.
+fn civil_from_epoch_secs(secs: i64) -> (i64, i64, i64, i64, i64, i64) {
+    let days = secs.div_euclid(86_400);
+    let sod = secs.rem_euclid(86_400);
+    let hour = sod / 3600;
+    let minute = (sod % 3600) / 60;
+    let second = sod % 60;
+    let z = days + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day, hour, minute, second)
 }
 
 /// Apply an arithmetic operator to two integer values, propagating NULL and
@@ -1150,17 +1372,22 @@ impl Aggregate {
     }
 }
 
-/// Whether any projection item is an aggregate function call.
+/// Whether `name` (case-insensitive) is an aggregate function.
+fn is_aggregate_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "COUNT" | "SUM" | "MIN" | "MAX" | "AVG"
+    )
+}
+
+/// Whether any projection item is an *aggregate* function call (scalar
+/// functions like `YEAR`/`UPPER` are evaluated per row, not aggregated).
 fn projection_has_aggregate(items: &[SelectItem]) -> bool {
-    items.iter().any(|item| {
-        matches!(
-            item,
-            SelectItem::UnnamedExpr(Expr::Function(_))
-                | SelectItem::ExprWithAlias {
-                    expr: Expr::Function(_),
-                    ..
-                }
-        )
+    let is_agg =
+        |e: &Expr| matches!(e, Expr::Function(f) if is_aggregate_name(&object_name(&f.name)));
+    items.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => is_agg(e),
+        _ => false,
     })
 }
 
@@ -2469,5 +2696,93 @@ mod tests {
                 .unwrap(),
         );
         assert!(r.is_empty());
+    }
+
+    #[test]
+    fn date_functions_extract_components() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, ts BIGINT)")
+            .unwrap();
+        // 1609462930 = 2021-01-01 01:02:10 UTC.
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1, 1609462930)")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT YEAR(ts), MONTH(ts), DAY(ts), HOUR(ts), MINUTE(ts), SECOND(ts) FROM t",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r[0],
+            vec![
+                Value::Int64(2021),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(1),
+                Value::Int64(2),
+                Value::Int64(10),
+            ]
+        );
+    }
+
+    #[test]
+    fn date_functions_usable_in_where_and_with_now() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, ts BIGINT)")
+            .unwrap();
+        // 2021-06-15, 2022-01-01, 2021-12-31 (approx epochs).
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,1623715200),(2,1640995200),(3,1640908800)")
+            .unwrap();
+        let r = ints(
+            env.engine
+                .execute_autocommit("SELECT id FROM t WHERE YEAR(ts) = 2021 ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![1, 3]);
+
+        // NOW() is a recent epoch (after 2020-01-01).
+        let now = ints(
+            env.engine
+                .execute_autocommit("SELECT NOW() FROM t")
+                .unwrap(),
+        );
+        assert!(now[0] > 1_577_836_800, "NOW() should be after 2020");
+    }
+
+    #[test]
+    fn string_and_numeric_functions() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1, '  Héllo  ')")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT UPPER(name), LOWER('AB'), LENGTH(TRIM(name)), SUBSTR('hello',2,3), \
+                     CONCAT('a','b',id), ABS(0-7), MOD(10,3), COALESCE(NULL, 'x') FROM t",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r[0],
+            vec![
+                Value::Text("  HÉLLO  ".into()),
+                Value::Text("ab".into()),
+                Value::Int64(5), // "Héllo" is 5 chars
+                Value::Text("ell".into()),
+                Value::Text("ab1".into()),
+                Value::Int64(7),
+                Value::Int64(1),
+                Value::Text("x".into()),
+            ]
+        );
     }
 }
