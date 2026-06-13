@@ -66,6 +66,22 @@ fn errored(msg: Message) -> bool {
     matches!(msg, Message::SqlResult { status, .. } if status != 0)
 }
 
+/// The string cells of a single-row-per-record result (for `SHOW GRANTS`).
+fn grant_rows(msg: Message) -> Vec<(String, String)> {
+    match msg {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => rows
+            .iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Some(WireValue::Str(db)), Some(WireValue::Str(p))) => (db.clone(), p.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect(),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
 #[test]
 fn create_use_show_and_isolation() {
     let (inst, _tmp) = instance();
@@ -272,6 +288,118 @@ fn hello_without_connect_db_negotiates_no_features() {
         } => assert_eq!(features, 0, "no features requested, none honored"),
         other => panic!("expected HelloAck, got {other:?}"),
     }
+}
+
+#[test]
+fn per_database_grant_scopes_data_access() {
+    let (inst, _tmp) = instance();
+    {
+        let mut admin = login(&inst, "admin", "admin");
+        assert!(ok(admin.handle(sql("CREATE DATABASE app"))));
+        assert!(ok(admin.handle(sql("CREATE DATABASE secret"))));
+        // alice has no global access; she is granted readwrite only on `app`.
+        assert!(ok(
+            admin.handle(sql("CREATE USER alice WITH PASSWORD 'pw' ROLE none"))
+        ));
+        assert!(ok(admin.handle(sql("GRANT readwrite ON app TO alice"))));
+    }
+
+    let mut alice = login(&inst, "alice", "pw");
+    // She can use and write to `app`.
+    assert!(ok(alice.handle(sql("USE app"))));
+    assert!(ok(
+        alice.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY)"))
+    ));
+    assert!(ok(alice.handle(sql("INSERT INTO t VALUES (1)"))));
+    // But `secret`, with no grant, is closed to her — even `USE` is denied.
+    assert!(
+        errored(alice.handle(sql("USE secret"))),
+        "no grant on secret => USE denied"
+    );
+}
+
+#[test]
+fn per_database_deny_overrides_global_access() {
+    let (inst, _tmp) = instance();
+    {
+        let mut admin = login(&inst, "admin", "admin");
+        assert!(ok(admin.handle(sql("CREATE DATABASE app"))));
+        assert!(ok(admin.handle(sql("CREATE DATABASE secret"))));
+        // bob has global readwrite, but is denied on `secret` specifically.
+        assert!(ok(admin.handle(sql(
+            "CREATE USER bob WITH PASSWORD 'pw' ROLE readwrite"
+        ))));
+        assert!(ok(admin.handle(sql("REVOKE ALL ON secret FROM bob"))));
+    }
+
+    let mut bob = login(&inst, "bob", "pw");
+    assert!(
+        ok(bob.handle(sql("USE app"))),
+        "global readwrite covers app"
+    );
+    assert!(
+        errored(bob.handle(sql("USE secret"))),
+        "explicit deny on secret beats global readwrite"
+    );
+}
+
+#[test]
+fn grant_on_unknown_database_is_rejected() {
+    let (inst, _tmp) = instance();
+    let mut admin = login(&inst, "admin", "admin");
+    assert!(ok(
+        admin.handle(sql("CREATE USER carol WITH PASSWORD 'pw' ROLE none"))
+    ));
+    assert!(
+        errored(admin.handle(sql("GRANT readwrite ON ghost TO carol"))),
+        "granting on a nonexistent database must error"
+    );
+}
+
+#[test]
+fn show_grants_lists_global_and_overrides() {
+    let (inst, _tmp) = instance();
+    let mut admin = login(&inst, "admin", "admin");
+    assert!(ok(admin.handle(sql("CREATE DATABASE app"))));
+    assert!(ok(admin.handle(sql("CREATE DATABASE secret"))));
+    assert!(ok(admin.handle(sql(
+        "CREATE USER dave WITH PASSWORD 'pw' ROLE readonly"
+    ))));
+    assert!(ok(admin.handle(sql("GRANT readwrite ON app TO dave"))));
+    assert!(ok(admin.handle(sql("REVOKE ALL ON secret FROM dave"))));
+
+    let rows = grant_rows(admin.handle(sql("SHOW GRANTS FOR dave")));
+    assert_eq!(
+        rows,
+        vec![
+            ("*".to_string(), "readonly".to_string()),
+            ("app".to_string(), "readwrite".to_string()),
+            ("secret".to_string(), "none".to_string()),
+        ]
+    );
+}
+
+#[test]
+fn per_database_grants_persist_across_restart() {
+    let tmp = TempDir::new("grant-persist").unwrap();
+    {
+        let inst = Arc::new(Instance::open(tmp.path()).unwrap());
+        let mut admin = login(&inst, "admin", "admin");
+        assert!(ok(admin.handle(sql("CREATE DATABASE app"))));
+        assert!(ok(admin.handle(sql("CREATE DATABASE secret"))));
+        assert!(ok(
+            admin.handle(sql("CREATE USER erin WITH PASSWORD 'pw' ROLE none"))
+        ));
+        assert!(ok(admin.handle(sql("GRANT readwrite ON app TO erin"))));
+    }
+    // Reopen the instance from disk: erin's per-database grant survived.
+    let inst = Arc::new(Instance::open(tmp.path()).unwrap());
+    let mut erin = login(&inst, "erin", "pw");
+    assert!(ok(erin.handle(sql("USE app"))), "grant on app persisted");
+    assert!(
+        errored(erin.handle(sql("USE secret"))),
+        "no grant on secret persisted"
+    );
 }
 
 #[test]

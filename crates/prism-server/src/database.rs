@@ -266,32 +266,28 @@ impl Database {
         password: &str,
         privileges: Privileges,
     ) -> Result<u64> {
-        let (oid, phc) = self.users.add_user(username, password, privileges)?;
-        self.persist_user(&UserEntry {
-            op: UserOp::Upsert,
-            username: username.to_string(),
-            oid,
-            privileges: privileges.bits(),
-            phc,
-        })?;
+        let (oid, _phc) = self.users.add_user(username, password, privileges)?;
+        self.persist_user_snapshot(username)?;
         Ok(oid)
     }
 
-    /// Set a user's privileges (the effect of `GRANT`/`REVOKE`), persisting the
-    /// change.
+    /// Set a user's global privileges (`GRANT`/`REVOKE` with no database scope),
+    /// persisting the change.
     pub fn set_user_privileges(&self, username: &str, privileges: Privileges) -> Result<()> {
         self.users.set_privileges(username, privileges)?;
-        let (oid, phc, _) = self
-            .users
-            .account_record(username)
-            .ok_or_else(|| crate::error::ServerError::State(format!("no such user: {username}")))?;
-        self.persist_user(&UserEntry {
-            op: UserOp::Upsert,
-            username: username.to_string(),
-            oid,
-            privileges: privileges.bits(),
-            phc,
-        })
+        self.persist_user_snapshot(username)
+    }
+
+    /// Set a user's privileges for a single database (`GRANT`/`REVOKE … ON <db>`),
+    /// persisting the change.
+    pub fn set_db_privileges(
+        &self,
+        username: &str,
+        db: &str,
+        privileges: Privileges,
+    ) -> Result<()> {
+        self.users.set_db_privileges(username, db, privileges)?;
+        self.persist_user_snapshot(username)
     }
 
     /// Remove a user account, persisting a tombstone.
@@ -303,6 +299,28 @@ impl Database {
             oid: 0,
             privileges: 0,
             phc: String::new(),
+            db_grants: Vec::new(),
+        })
+    }
+
+    /// Persist the full current state of `username` (global privileges + every
+    /// per-database grant) as one append-only `Upsert` record.
+    fn persist_user_snapshot(&self, username: &str) -> Result<()> {
+        let (oid, phc, privileges, grants) = self
+            .users
+            .account_snapshot(username)
+            .ok_or_else(|| crate::error::ServerError::State(format!("no such user: {username}")))?;
+        let db_grants = grants
+            .into_iter()
+            .map(|(db, p)| (db, p.bits()))
+            .collect::<Vec<_>>();
+        self.persist_user(&UserEntry {
+            op: UserOp::Upsert,
+            username: username.to_string(),
+            oid,
+            privileges: privileges.bits(),
+            phc,
+            db_grants,
         })
     }
 
@@ -326,14 +344,8 @@ impl Database {
     /// seed and persist the default `admin`.
     fn load_or_seed_users(&self) -> Result<()> {
         if self.load_users()? == 0 {
-            let (oid, phc) = self.users.add_user("admin", "admin", Privileges::admin())?;
-            self.persist_user(&UserEntry {
-                op: UserOp::Upsert,
-                username: "admin".to_string(),
-                oid,
-                privileges: Privileges::admin().bits(),
-                phc,
-            })?;
+            self.users.add_user("admin", "admin", Privileges::admin())?;
+            self.persist_user_snapshot("admin")?;
         }
         Ok(())
     }
@@ -360,19 +372,38 @@ impl Database {
         reader.commit()?;
         let count = latest.len();
         for (username, entry) in latest {
+            let grants = entry
+                .db_grants
+                .iter()
+                .map(|(db, bits)| (db.clone(), Privileges::from_bits(*bits)))
+                .collect();
             self.users.insert_loaded(
                 &username,
                 entry.oid,
                 entry.phc,
                 Privileges::from_bits(entry.privileges),
+                grants,
             );
         }
         Ok(count)
     }
 
-    /// The privileges of the account with `oid`, if any.
+    /// The global privileges of the account with `oid`, if any.
     pub fn privileges(&self, oid: u64) -> Option<Privileges> {
         self.users.privileges_of(oid)
+    }
+
+    /// The effective privileges of the account with `oid` for database `db`
+    /// (a per-database override if present, else the global set).
+    pub fn effective_privileges(&self, oid: u64, db: Option<&str>) -> Option<Privileges> {
+        self.users.effective_privileges(oid, db)
+    }
+
+    /// A user's global privileges and per-database grants (for `SHOW GRANTS`).
+    pub fn user_grants(&self, username: &str) -> Option<(Privileges, HashMap<String, Privileges>)> {
+        self.users
+            .account_snapshot(username)
+            .map(|(_, _, privileges, grants)| (privileges, grants))
     }
 
     /// Verify a username/password, returning the user's OID on success.

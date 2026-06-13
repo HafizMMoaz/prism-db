@@ -40,6 +40,19 @@ In a session: `SHOW DATABASES;`, `CREATE DATABASE sales;`, `USE sales;`, then
 ordinary SQL / document / KV operations. `CREATE USER`, `GRANT`, `REVOKE` manage
 accounts; TLS is enabled with `--tls-cert`/`--tls-key`.
 
+Privileges are server-global by default but can be scoped to one database:
+
+```sql
+CREATE USER analyst WITH PASSWORD 'pw' ROLE none;  -- no access yet
+GRANT readonly ON sales TO analyst;                -- read just `sales`
+REVOKE ALL ON payroll FROM analyst;                -- deny `payroll` explicitly
+SHOW GRANTS FOR analyst;                            -- global (*) + per-database
+```
+
+A per-database grant overrides the user's global role for that database (it can
+widen *or*, as `REVOKE ALL ON <db>`, deny). User and grant management still
+requires the `admin` role, as does `CREATE`/`DROP DATABASE`.
+
 ## Linux — systemd service
 
 ```bash

@@ -90,13 +90,31 @@ impl Privileges {
             _ => None,
         }
     }
+
+    /// The canonical role name for this set (for display, e.g. `SHOW GRANTS`).
+    pub fn role_name(self) -> &'static str {
+        if self.can_admin() {
+            "admin"
+        } else if self.can_write() {
+            "readwrite"
+        } else if self.can_read() {
+            "readonly"
+        } else {
+            "none"
+        }
+    }
 }
 
 struct Account {
     oid: u64,
     /// scrypt PHC hash string.
     phc: String,
+    /// The global privilege set: the default for any database without a
+    /// per-database override below.
     privileges: Privileges,
+    /// Per-database overrides keyed by database name. An entry shadows
+    /// `privileges` for that database (it may grant more or — as `NONE` — deny).
+    db_grants: HashMap<String, Privileges>,
 }
 
 /// An in-memory store of user accounts keyed by username.
@@ -135,20 +153,29 @@ impl UserStore {
                 oid,
                 phc: phc.clone(),
                 privileges,
+                db_grants: HashMap::new(),
             },
         );
         Ok((oid, phc))
     }
 
-    /// Insert an account loaded from persistence (preserving its OID and hash),
-    /// advancing the OID allocator past it.
-    pub fn insert_loaded(&self, username: &str, oid: u64, phc: String, privileges: Privileges) {
+    /// Insert an account loaded from persistence (preserving its OID, hash, and
+    /// per-database grants), advancing the OID allocator past it.
+    pub fn insert_loaded(
+        &self,
+        username: &str,
+        oid: u64,
+        phc: String,
+        privileges: Privileges,
+        db_grants: HashMap<String, Privileges>,
+    ) {
         self.users.lock().expect("user store poisoned").insert(
             username.to_string(),
             Account {
                 oid,
                 phc,
                 privileges,
+                db_grants,
             },
         );
         // Ensure newly-allocated OIDs never collide with a loaded one.
@@ -166,13 +193,27 @@ impl UserStore {
         }
     }
 
-    /// The persistable fields of `username`: `(oid, phc, privileges)`.
-    pub fn account_record(&self, username: &str) -> Option<(u64, String, Privileges)> {
+    /// The full persistable snapshot of `username`: `(oid, phc, global
+    /// privileges, per-database grants)`. Writing the whole snapshot keeps the
+    /// append-only user heap correct (the last record per user wins).
+    pub fn account_snapshot(
+        &self,
+        username: &str,
+    ) -> Option<(u64, String, Privileges, HashMap<String, Privileges>)> {
         self.users
             .lock()
             .expect("user store poisoned")
             .get(username)
-            .map(|a| (a.oid, a.phc.clone(), a.privileges))
+            .map(|a| (a.oid, a.phc.clone(), a.privileges, a.db_grants.clone()))
+    }
+
+    /// The per-database grants of `username` (for `SHOW GRANTS`).
+    pub fn db_grants_of(&self, username: &str) -> Option<HashMap<String, Privileges>> {
+        self.users
+            .lock()
+            .expect("user store poisoned")
+            .get(username)
+            .map(|a| a.db_grants.clone())
     }
 
     /// Verify `password` for `username`. Returns the user's OID on success, or
@@ -188,7 +229,7 @@ impl UserStore {
             .map(|_| account.oid)
     }
 
-    /// The privileges of the account with `oid`, if any.
+    /// The global privileges of the account with `oid`, if any.
     pub fn privileges_of(&self, oid: u64) -> Option<Privileges> {
         self.users
             .lock()
@@ -198,13 +239,46 @@ impl UserStore {
             .map(|a| a.privileges)
     }
 
-    /// Set `username`'s privileges (used by `GRANT`/`REVOKE`).
+    /// The effective privileges of the account with `oid` for database `db`: a
+    /// per-database override if one exists, else the account's global set.
+    /// `db = None` (or a database without an override) yields the global set.
+    pub fn effective_privileges(&self, oid: u64, db: Option<&str>) -> Option<Privileges> {
+        self.users
+            .lock()
+            .expect("user store poisoned")
+            .values()
+            .find(|a| a.oid == oid)
+            .map(|a| {
+                db.and_then(|name| a.db_grants.get(name).copied())
+                    .unwrap_or(a.privileges)
+            })
+    }
+
+    /// Set `username`'s global privileges (used by `GRANT`/`REVOKE` without a
+    /// database scope).
     pub fn set_privileges(&self, username: &str, privileges: Privileges) -> Result<()> {
         let mut users = self.users.lock().expect("user store poisoned");
         let account = users
             .get_mut(username)
             .ok_or_else(|| ServerError::State(format!("no such user: {username}")))?;
         account.privileges = privileges;
+        Ok(())
+    }
+
+    /// Set `username`'s privileges for a single database (the effect of
+    /// `GRANT … ON <db>` / `REVOKE ALL ON <db>`). `NONE` denies that database
+    /// even when the global set would allow it.
+    pub fn set_db_privileges(
+        &self,
+        username: &str,
+        db: &str,
+        privileges: Privileges,
+    ) -> Result<()> {
+        let mut users = self.users.lock().expect("user store poisoned");
+        let account = users
+            .get_mut(username)
+            .ok_or_else(|| ServerError::State(format!("no such user: {username}")))?;
+        account.db_grants.insert(db.to_string(), privileges);
         Ok(())
     }
 

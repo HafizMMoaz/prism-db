@@ -24,6 +24,7 @@
 //! and a database is selected with `USE <db>` (managed with `CREATE DATABASE` /
 //! `DROP DATABASE` / `SHOW DATABASES`).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -110,6 +111,9 @@ pub struct Session {
     /// The currently selected database. Always set for a single-database
     /// session; for a multi-database one it is chosen with `USE <db>`.
     current_db: Option<Arc<Database>>,
+    /// The name of [`Self::current_db`] on a multi-database instance, used to
+    /// resolve per-database grants. `None` for a single-database session.
+    current_db_name: Option<String>,
     /// A connect-time database named in `Hello` (via
     /// [`prism_protocol::FEATURE_CONNECT_DB`]), bound once `Auth` succeeds so an
     /// unauthenticated client never opens a database.
@@ -128,6 +132,7 @@ impl Session {
         Self {
             instance: None,
             current_db: Some(db),
+            current_db_name: None,
             requested_db: None,
             auth: AuthState::Authenticated {
                 user_oid: SYSTEM_OID,
@@ -143,6 +148,7 @@ impl Session {
         Self {
             instance: None,
             current_db: Some(db),
+            current_db_name: None,
             requested_db: None,
             auth: AuthState::New,
             txn: SessionTxn::None,
@@ -156,6 +162,7 @@ impl Session {
         Self {
             instance: Some(instance),
             current_db: None,
+            current_db_name: None,
             requested_db: None,
             auth: AuthState::New,
             txn: SessionTxn::None,
@@ -328,14 +335,27 @@ impl Session {
         }
     }
 
-    /// Check that the current user holds `need`. The embedded [`SYSTEM_OID`]
-    /// session is a superuser and always passes.
+    /// Check that the current user holds `need`. Data needs (READ/WRITE) are
+    /// evaluated against the session's current database (per-database grants);
+    /// ADMIN is an instance-global check (user / database management). The
+    /// embedded [`SYSTEM_OID`] session is a superuser and always passes.
     fn authorize(&self, need: Need) -> Result<()> {
+        let db = match need {
+            // User/database administration is instance-global, never per-database.
+            Need::Admin => None,
+            Need::Read | Need::Write => self.current_db_name.as_deref(),
+        };
+        self.authorize_on(need, db)
+    }
+
+    /// Like [`Self::authorize`] but checks against an explicit database (used by
+    /// `USE`, which must authorize the database being switched *to*).
+    fn authorize_on(&self, need: Need, db: Option<&str>) -> Result<()> {
         let oid = self.user_oid();
         if oid == SYSTEM_OID {
             return Ok(());
         }
-        let privs = self.privileges_of(oid).unwrap_or(Privileges::NONE);
+        let privs = self.effective_privileges(db);
         let ok = match need {
             Need::Read => privs.can_read(),
             Need::Write => privs.can_write(),
@@ -362,11 +382,16 @@ impl Session {
         }
     }
 
-    fn privileges_of(&self, oid: u64) -> Option<Privileges> {
-        match &self.instance {
-            Some(inst) => inst.privileges(oid),
-            None => self.current_db.as_ref().and_then(|db| db.privileges(oid)),
-        }
+    /// The current user's effective privileges for database `db` (a per-database
+    /// override if present, else the global set). A single-database session has
+    /// no instance, so it always uses the database's global set.
+    fn effective_privileges(&self, db: Option<&str>) -> Privileges {
+        let oid = self.user_oid();
+        let privs = match &self.instance {
+            Some(inst) => inst.effective_privileges(oid, db),
+            None => self.current_db.as_ref().and_then(|d| d.privileges(oid)),
+        };
+        privs.unwrap_or(Privileges::NONE)
     }
 
     fn create_user(&self, name: &str, pw: &str, privs: Privileges) -> Result<u64> {
@@ -380,6 +405,28 @@ impl Session {
         match &self.instance {
             Some(inst) => inst.set_user_privileges(name, privs),
             None => self.require_db()?.set_user_privileges(name, privs),
+        }
+    }
+
+    /// Set a user's privileges for a single database. Requires a multi-database
+    /// instance (a single-database server has no other database to scope to).
+    fn set_db_privileges(&self, name: &str, db: &str, privs: Privileges) -> Result<()> {
+        let inst = self.instance.as_ref().ok_or_else(|| {
+            ServerError::Unsupported(
+                "database-scoped grants require a multi-database server".into(),
+            )
+        })?;
+        if !inst.has_database(db) {
+            return Err(ServerError::State(format!("no such database: `{db}`")));
+        }
+        inst.set_db_privileges(name, db, privs)
+    }
+
+    /// A user's global privileges and per-database grants (for `SHOW GRANTS`).
+    fn user_grants(&self, name: &str) -> Option<(Privileges, HashMap<String, Privileges>)> {
+        match &self.instance {
+            Some(inst) => inst.user_grants(name),
+            None => self.current_db.as_ref().and_then(|db| db.user_grants(name)),
         }
     }
 
@@ -398,7 +445,15 @@ impl Session {
             return Ok(());
         };
         if let Some(inst) = &self.instance {
+            // A connect-time database must clear the per-database access check
+            // too, mirroring `USE` (the bind itself proves the user authenticated).
+            if !self.effective_privileges(Some(&name)).can_read() {
+                return Err(ServerError::Unauthorized(format!(
+                    "no access to database `{name}`"
+                )));
+            }
             self.current_db = Some(inst.database(&name)?);
+            self.current_db_name = Some(name);
         }
         Ok(())
     }
@@ -678,12 +733,15 @@ impl Session {
                     "cannot change database inside a transaction".into(),
                 ));
             }
-            self.authorize(Need::Read)?;
+            // Authorize against the database being switched to, not the current one.
+            self.authorize_on(Need::Read, Some(name))?;
             self.current_db = Some(inst.database(name)?);
+            self.current_db_name = Some(name.to_string());
             return Ok(sql_ack(0));
         }
         if strip_kw(stmt, &upper, "SHOW DATABASES").is_some() {
-            self.authorize(Need::Read)?;
+            // Instance-level metadata: a global read check, not per-database.
+            self.authorize_on(Need::Read, None)?;
             let names = inst.list_databases()?;
             // Return as a single-column "Database" result set.
             let rows: Vec<Row> = names
@@ -718,6 +776,7 @@ impl Session {
             // Release our selection so this session's handle can't block removal
             // (the client re-runs `USE` afterward).
             self.current_db = None;
+            self.current_db_name = None;
             inst.drop_database(name)?;
             crate::audit::admin(oid, "DROP DATABASE", name);
             return Ok(sql_ack(0));
@@ -794,6 +853,12 @@ impl Session {
         let oid = self.user_oid();
         let stmt = sql.trim().trim_end_matches(';');
         let upper = stmt.to_ascii_uppercase();
+        if let Some(rest) = strip_kw(stmt, &upper, "SHOW GRANTS FOR") {
+            // SHOW GRANTS FOR <user>: the global default plus per-database grants.
+            let user = first_word(rest)
+                .ok_or_else(|| ServerError::State("SHOW GRANTS FOR needs a username".into()))?;
+            return self.show_grants(user);
+        }
         if let Some(rest) = strip_kw(stmt, &upper, "CREATE USER") {
             // CREATE USER <name> WITH PASSWORD '<pw>' [ROLE <role>]
             let name = first_word(rest)
@@ -804,27 +869,58 @@ impl Session {
             self.create_user(name, &password, role)?;
             crate::audit::admin(oid, "CREATE USER", name);
         } else if strip_kw(stmt, &upper, "GRANT").is_some() {
-            // GRANT <role> TO <user>
+            // GRANT <role> TO <user>  |  GRANT <role> ON <db> TO <user>
             let t: Vec<&str> = stmt.split_whitespace().collect();
-            if t.len() != 4 || !t[2].eq_ignore_ascii_case("TO") {
-                return Err(ServerError::State("syntax: GRANT <role> TO <user>".into()));
+            let role = t
+                .get(1)
+                .and_then(|w| Privileges::from_role(w))
+                .ok_or_else(|| {
+                    ServerError::State("syntax: GRANT <role> [ON <db>] TO <user>".into())
+                })?;
+            let to = t
+                .iter()
+                .position(|w| w.eq_ignore_ascii_case("TO"))
+                .ok_or_else(|| {
+                    ServerError::State("syntax: GRANT <role> [ON <db>] TO <user>".into())
+                })?;
+            let user = t
+                .get(to + 1)
+                .ok_or_else(|| ServerError::State("GRANT needs a username".into()))?;
+            if let Some(on) = t.iter().position(|w| w.eq_ignore_ascii_case("ON")) {
+                let db = t
+                    .get(on + 1)
+                    .filter(|_| on + 1 < to)
+                    .ok_or_else(|| ServerError::State("GRANT … ON needs a database".into()))?;
+                self.set_db_privileges(user, db, role)?;
+                crate::audit::admin(oid, "GRANT ON", &format!("{db}:{user}"));
+            } else {
+                self.set_user_privileges(user, role)?;
+                crate::audit::admin(oid, "GRANT", user);
             }
-            let role = Privileges::from_role(t[1])
-                .ok_or_else(|| ServerError::State(format!("unknown role: {}", t[1])))?;
-            self.set_user_privileges(t[3], role)?;
-            crate::audit::admin(oid, "GRANT", t[3]);
         } else if strip_kw(stmt, &upper, "REVOKE").is_some() {
-            // REVOKE ALL FROM <user>  (disables the account: privileges = NONE)
+            // REVOKE ALL FROM <user>            disables the account (global NONE)
+            // REVOKE ALL ON <db> FROM <user>    denies just that database
             let t: Vec<&str> = stmt.split_whitespace().collect();
             let from = t
                 .iter()
                 .position(|w| w.eq_ignore_ascii_case("FROM"))
-                .ok_or_else(|| ServerError::State("syntax: REVOKE ALL FROM <user>".into()))?;
+                .ok_or_else(|| {
+                    ServerError::State("syntax: REVOKE ALL [ON <db>] FROM <user>".into())
+                })?;
             let user = t
                 .get(from + 1)
                 .ok_or_else(|| ServerError::State("REVOKE needs a username".into()))?;
-            self.set_user_privileges(user, Privileges::NONE)?;
-            crate::audit::admin(oid, "REVOKE", user);
+            if let Some(on) = t.iter().position(|w| w.eq_ignore_ascii_case("ON")) {
+                let db = t
+                    .get(on + 1)
+                    .filter(|_| on + 1 < from)
+                    .ok_or_else(|| ServerError::State("REVOKE … ON needs a database".into()))?;
+                self.set_db_privileges(user, db, Privileges::NONE)?;
+                crate::audit::admin(oid, "REVOKE ON", &format!("{db}:{user}"));
+            } else {
+                self.set_user_privileges(user, Privileges::NONE)?;
+                crate::audit::admin(oid, "REVOKE", user);
+            }
         } else if let Some(rest) = strip_kw(stmt, &upper, "DROP USER") {
             let name = first_word(rest)
                 .ok_or_else(|| ServerError::State("DROP USER needs a username".into()))?;
@@ -838,6 +934,43 @@ impl Session {
             affected_rows: 0,
             columns: vec![],
             rows: vec![],
+            more_frames: false,
+            error: None,
+        })
+    }
+
+    /// `SHOW GRANTS FOR <user>`: a two-column (Database / Privilege) result. The
+    /// global default is shown as database `*`; per-database overrides follow,
+    /// sorted by database name.
+    fn show_grants(&self, user: &str) -> Result<Message> {
+        let (global, db_grants) = self
+            .user_grants(user)
+            .ok_or_else(|| ServerError::State(format!("no such user: {user}")))?;
+        let mut rows: Vec<Row> = vec![vec![
+            Some(WireValue::Str("*".into())),
+            Some(WireValue::Str(global.role_name().into())),
+        ]];
+        let mut scoped: Vec<(String, Privileges)> = db_grants.into_iter().collect();
+        scoped.sort_by(|a, b| a.0.cmp(&b.0));
+        for (db, privs) in scoped {
+            rows.push(vec![
+                Some(WireValue::Str(db)),
+                Some(WireValue::Str(privs.role_name().into())),
+            ]);
+        }
+        let columns = ["Database", "Privilege"]
+            .into_iter()
+            .map(|name| ColumnDesc {
+                name: name.into(),
+                type_tag: WireValue::Str(String::new()).type_tag(),
+                nullable: false,
+            })
+            .collect();
+        Ok(Message::SqlResult {
+            status: 0,
+            affected_rows: 0,
+            columns,
+            rows,
             more_frames: false,
             error: None,
         })
@@ -943,6 +1076,7 @@ fn is_admin_sql(sql: &str) -> bool {
         || u.starts_with("GRANT ")
         || u.starts_with("REVOKE ")
         || u.starts_with("DROP USER")
+        || u.starts_with("SHOW GRANTS")
 }
 
 /// Whether `sql` is a database-management statement (USE / CREATE/DROP/SHOW

@@ -156,14 +156,19 @@ pub struct UserEntry {
     pub username: String,
     /// The account's stable OID.
     pub oid: u64,
-    /// The privilege bitmask (see `auth::Privileges`).
+    /// The global privilege bitmask (see `auth::Privileges`).
     pub privileges: u8,
     /// The scrypt PHC hash (empty for a `Delete`).
     pub phc: String,
+    /// Per-database privilege overrides: `(database, bitmask)`. A full snapshot
+    /// is written on every change. Absent in records from before the feature,
+    /// which decode as an empty list.
+    pub db_grants: Vec<(String, u8)>,
 }
 
 impl UserEntry {
-    /// Encode to the user-record payload.
+    /// Encode to the user-record payload. The per-database grants are appended
+    /// last so a record without them is byte-identical to the original format.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let mut w = Writer::new();
         w.put_u8(self.op.code());
@@ -171,10 +176,21 @@ impl UserEntry {
         w.put_u8(self.privileges);
         w.put_str_u16("user.name", &self.username)?;
         w.put_str_u16("user.phc", &self.phc)?;
+        let count: u16 = self
+            .db_grants
+            .len()
+            .try_into()
+            .map_err(|_| ServerError::Corrupt("too many database grants".into()))?;
+        w.put_u16(count);
+        for (db, bits) in &self.db_grants {
+            w.put_str_u16("user.grant.db", db)?;
+            w.put_u8(*bits);
+        }
         Ok(w.into_vec())
     }
 
-    /// Decode a user-record payload.
+    /// Decode a user-record payload. Records written before per-database grants
+    /// end after the PHC; their grant list is empty.
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut r = Reader::new(bytes);
         let op = UserOp::from_code(r.get_u8("user.op")?)?;
@@ -182,12 +198,25 @@ impl UserEntry {
         let privileges = r.get_u8("user.privileges")?;
         let username = r.get_str_u16("user.name")?;
         let phc = r.get_str_u16("user.phc")?;
+        let db_grants = if r.is_empty() {
+            Vec::new()
+        } else {
+            let count = r.get_u16("user.grant.count")?;
+            let mut grants = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let db = r.get_str_u16("user.grant.db")?;
+                let bits = r.get_u8("user.grant.bits")?;
+                grants.push((db, bits));
+            }
+            grants
+        };
         Ok(Self {
             op,
             username,
             oid,
             privileges,
             phc,
+            db_grants,
         })
     }
 }

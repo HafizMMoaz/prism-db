@@ -180,9 +180,20 @@ impl Instance {
         self.system.create_user(username, password, privileges)
     }
 
-    /// Set a server-global user's privileges.
+    /// Set a server-global user's global privileges.
     pub fn set_user_privileges(&self, username: &str, privileges: Privileges) -> Result<()> {
         self.system.set_user_privileges(username, privileges)
+    }
+
+    /// Set a server-global user's privileges for a single database
+    /// (`GRANT`/`REVOKE … ON <db>`).
+    pub fn set_db_privileges(
+        &self,
+        username: &str,
+        db: &str,
+        privileges: Privileges,
+    ) -> Result<()> {
+        self.system.set_db_privileges(username, db, privileges)
     }
 
     /// Drop a server-global user.
@@ -190,9 +201,28 @@ impl Instance {
         self.system.drop_user(username)
     }
 
-    /// The privileges of the account with `oid`.
+    /// The global privileges of the account with `oid`.
     pub fn privileges(&self, oid: u64) -> Option<Privileges> {
         self.system.privileges(oid)
+    }
+
+    /// The effective privileges of `oid` for database `db` (a per-database
+    /// override if present, else the account's global set).
+    pub fn effective_privileges(&self, oid: u64, db: Option<&str>) -> Option<Privileges> {
+        self.system.effective_privileges(oid, db)
+    }
+
+    /// A user's global privileges and per-database grants (for `SHOW GRANTS`).
+    pub fn user_grants(
+        &self,
+        username: &str,
+    ) -> Option<(Privileges, std::collections::HashMap<String, Privileges>)> {
+        self.system.user_grants(username)
+    }
+
+    /// Whether a data database with `name` exists (used to validate `GRANT … ON`).
+    pub fn has_database(&self, name: &str) -> bool {
+        self.exists_on_disk(name)
     }
 }
 
