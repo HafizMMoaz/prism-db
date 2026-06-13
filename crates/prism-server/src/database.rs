@@ -176,6 +176,32 @@ impl Database {
         Ok(())
     }
 
+    /// Names of all document collections, sorted (for enumeration / export).
+    pub fn collection_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .doc_heaps
+            .lock()
+            .expect("doc heap map poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Names of all key–value namespaces, sorted (for enumeration / export).
+    pub fn kv_namespace_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .kv_namespaces
+            .lock()
+            .expect("kv namespace map poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Look up a non-expired idempotency record by key: the `(txn_id,
     /// commit_lsn)` of the original committed transaction, if any.
     pub fn idempotency_lookup(&self, key: u128) -> Option<(u64, u64)> {

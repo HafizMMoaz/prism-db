@@ -101,6 +101,23 @@ impl KvNamespace {
         self.index.root_page()
     }
 
+    /// Every `(key, value)` pair visible to `txn`, by scanning the heap. Used
+    /// for export/backup; order is unspecified. MVCC hides deleted/superseded
+    /// versions, so each live key appears once.
+    pub fn entries(&self, txn: &TxnHandle) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for (_, payload) in self.store.scan(txn, self.heap)? {
+            if payload.len() < 2 {
+                continue;
+            }
+            let key_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+            let key = payload.get(2..2 + key_len).unwrap_or(&[]).to_vec();
+            let value = payload.get(2 + key_len..).unwrap_or(&[]).to_vec();
+            out.push((key, value));
+        }
+        Ok(out)
+    }
+
     fn lookup(&self, key: &[u8]) -> Result<Option<RecordId>> {
         Ok(self.index.search(key)?)
     }

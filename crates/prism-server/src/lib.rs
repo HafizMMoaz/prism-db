@@ -20,12 +20,14 @@
 pub mod auth;
 pub mod catalog;
 pub mod database;
+pub mod dump;
 pub mod error;
 pub mod server;
 pub mod session;
 pub mod tls;
 
 pub use database::{Config, Database};
+pub use dump::{ImportStats, export_to_string, import};
 pub use error::{Result, ServerError};
 pub use server::{Server, ServerConfig};
 pub use session::Session;

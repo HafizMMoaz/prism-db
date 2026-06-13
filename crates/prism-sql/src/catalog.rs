@@ -106,6 +106,19 @@ impl Catalog {
             .ok_or_else(|| SqlError::NoSuchTable(name.to_string()))
     }
 
+    /// All table names, sorted (for deterministic enumeration, e.g. dumps).
+    pub fn table_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tables
+            .lock()
+            .expect("catalog poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Install a table at a known heap (used when reloading a persisted catalog
     /// after restart). Bumps the heap allocator past `heap` so new tables don't
     /// collide. Errors if the name is already registered.
