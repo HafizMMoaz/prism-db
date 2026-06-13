@@ -139,6 +139,61 @@ fn database_management_requires_admin() {
 }
 
 #[test]
+fn introspection_lists_tables_and_columns() {
+    let (inst, _tmp) = instance();
+    let mut s = login(&inst, "admin", "admin");
+    assert!(ok(s.handle(sql("CREATE DATABASE app"))));
+    assert!(ok(s.handle(sql("USE app"))));
+    assert!(ok(s.handle(sql(
+        "CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)"
+    ))));
+    assert!(ok(
+        s.handle(sql("CREATE TABLE orders (id BIGINT PRIMARY KEY)"))
+    ));
+
+    // SHOW TABLES lists the database's tables (sorted).
+    match s.handle(sql("SHOW TABLES")) {
+        Message::SqlResult {
+            status: 0,
+            columns,
+            rows,
+            ..
+        } => {
+            assert_eq!(columns[0].name, "Tables");
+            let names: Vec<_> = rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Some(WireValue::Str(s)) => s.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(names, vec!["orders", "users"]);
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+
+    // DESCRIBE reports each column's Field / Type / Key.
+    match s.handle(sql("DESCRIBE users")) {
+        Message::SqlResult {
+            status: 0,
+            columns,
+            rows,
+            ..
+        } => {
+            assert_eq!(columns[0].name, "Field");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Some(WireValue::Str("id".into())));
+            assert_eq!(rows[0][1], Some(WireValue::Str("BIGINT".into())));
+            assert_eq!(rows[0][3], Some(WireValue::Str("PRI".into())));
+            assert_eq!(rows[1][0], Some(WireValue::Str("name".into())));
+            assert_eq!(rows[1][1], Some(WireValue::Str("TEXT".into())));
+            assert_eq!(rows[1][3], Some(WireValue::Str(String::new())));
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn drop_database_removes_it() {
     let (inst, _tmp) = instance();
     let mut s = login(&inst, "admin", "admin");

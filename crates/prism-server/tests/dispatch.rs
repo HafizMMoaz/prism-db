@@ -443,6 +443,29 @@ fn doc_count(collection: &str, query: DocQuery) -> Message {
 }
 
 #[test]
+fn show_tables_works_on_an_embedded_session() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+    s.handle(sql("CREATE TABLE a (id BIGINT PRIMARY KEY)"));
+    s.handle(sql("CREATE TABLE b (id BIGINT PRIMARY KEY)"));
+    match s.handle(sql("SHOW TABLES")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => {
+            let names: Vec<_> = rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Some(WireValue::Str(s)) => s.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(names, vec!["a", "b"]);
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn doc_count_over_the_wire() {
     let (db, _tmp) = database();
     let mut s = Session::new(db);

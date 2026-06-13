@@ -35,7 +35,7 @@ use prism_protocol::{
     ColumnDesc, DocCommand, DocQuery, DocUpdate, DocUpdateOp, KvCommand, KvResultBody, Message,
     NoticeSeverity, PROTOCOL_VERSION, Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
 };
-use prism_sql::{Outcome, Value as SqlValue};
+use prism_sql::{Outcome, Type, Value as SqlValue};
 use prism_wal::Lsn;
 
 use crate::auth::{Privileges, SYSTEM_OID};
@@ -563,6 +563,15 @@ impl Session {
             };
         }
 
+        // Introspection (SHOW TABLES/COLLECTIONS/NAMESPACES, DESCRIBE) over the
+        // current database.
+        if is_introspect_sql(&sql) {
+            return match self.run_introspect_sql(&sql) {
+                Ok(msg) => msg,
+                Err(e) => sql_result_err(&e),
+            };
+        }
+
         // Administrative statements (user/grant management) are handled here, not
         // by the relational engine, and need the ADMIN privilege.
         if is_admin_sql(&sql) {
@@ -673,6 +682,67 @@ impl Session {
         Err(ServerError::Unsupported(format!(
             "database statement: {stmt}"
         )))
+    }
+
+    /// Handle introspection over the current database: `SHOW TABLES`,
+    /// `SHOW COLLECTIONS`, `SHOW NAMESPACES`, and `DESCRIBE <table>` /
+    /// `SHOW COLUMNS FROM <table>`.
+    fn run_introspect_sql(&mut self, sql: &str) -> Result<Message> {
+        self.authorize(Need::Read)?;
+        let db = self.data_db()?;
+        let stmt = sql.trim().trim_end_matches(';');
+        let upper = stmt.to_ascii_uppercase();
+
+        if upper.starts_with("SHOW TABLES") {
+            return Ok(one_column("Tables", db.sql().catalog().table_names()));
+        }
+        if upper.starts_with("SHOW COLLECTIONS") {
+            return Ok(one_column("Collections", db.collection_names()));
+        }
+        if upper.starts_with("SHOW NAMESPACES") {
+            return Ok(one_column("Namespaces", db.kv_namespace_names()));
+        }
+
+        // DESCRIBE <table> | DESC <table> | SHOW COLUMNS FROM <table>
+        let name = describe_target(stmt, &upper)
+            .ok_or_else(|| ServerError::State("expected a table name".into()))?;
+        let table = db.sql().catalog().table(name)?;
+        let columns = ["Field", "Type", "Null", "Key"]
+            .into_iter()
+            .map(|n| ColumnDesc {
+                name: n.into(),
+                type_tag: WireValue::Str(String::new()).type_tag(),
+                nullable: false,
+            })
+            .collect();
+        let rows: Vec<Row> = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                vec![
+                    Some(WireValue::Str(c.name.clone())),
+                    Some(WireValue::Str(sql_type_name(c.ty).into())),
+                    Some(WireValue::Str(if c.nullable { "YES" } else { "NO" }.into())),
+                    Some(WireValue::Str(
+                        if table.primary_key == Some(i) {
+                            "PRI"
+                        } else {
+                            ""
+                        }
+                        .into(),
+                    )),
+                ]
+            })
+            .collect();
+        Ok(Message::SqlResult {
+            status: 0,
+            affected_rows: 0,
+            columns,
+            rows,
+            more_frames: false,
+            error: None,
+        })
     }
 
     /// Execute an administrative statement (user/grant management). The caller
@@ -840,6 +910,53 @@ fn is_db_admin_sql(sql: &str) -> bool {
         || u.starts_with("CREATE DATABASE")
         || u.starts_with("DROP DATABASE")
         || u.starts_with("SHOW DATABASES")
+}
+
+/// Whether `sql` is an introspection statement over the current database.
+fn is_introspect_sql(sql: &str) -> bool {
+    let u = sql.trim_start().to_ascii_uppercase();
+    u.starts_with("SHOW TABLES")
+        || u.starts_with("SHOW COLLECTIONS")
+        || u.starts_with("SHOW NAMESPACES")
+        || u.starts_with("SHOW COLUMNS")
+        || u.starts_with("DESCRIBE ")
+        || u.starts_with("DESC ")
+}
+
+/// Extract the table name from `DESCRIBE t` / `DESC t` / `SHOW COLUMNS FROM t`.
+fn describe_target<'a>(stmt: &'a str, upper: &str) -> Option<&'a str> {
+    strip_kw(stmt, upper, "DESCRIBE")
+        .or_else(|| strip_kw(stmt, upper, "DESC"))
+        .or_else(|| strip_kw(stmt, upper, "SHOW COLUMNS FROM"))
+        .and_then(first_word)
+}
+
+/// A single-column string result set (for the `SHOW …` listings).
+fn one_column(col: &str, values: Vec<String>) -> Message {
+    Message::SqlResult {
+        status: 0,
+        affected_rows: 0,
+        columns: vec![ColumnDesc {
+            name: col.to_string(),
+            type_tag: WireValue::Str(String::new()).type_tag(),
+            nullable: false,
+        }],
+        rows: values
+            .into_iter()
+            .map(|v| vec![Some(WireValue::Str(v))])
+            .collect(),
+        more_frames: false,
+        error: None,
+    }
+}
+
+/// The SQL type keyword for a column type.
+fn sql_type_name(ty: Type) -> &'static str {
+    match ty {
+        Type::Int64 => "BIGINT",
+        Type::Text => "TEXT",
+        Type::Bool => "BOOL",
+    }
 }
 
 /// Whether `sql` is a read-only query (so it needs only READ).
