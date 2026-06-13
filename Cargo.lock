@@ -572,7 +572,6 @@ dependencies = [
  "prism-client",
  "prism-doc",
  "prism-protocol",
- "tokio",
 ]
 
 [[package]]
@@ -616,6 +615,21 @@ dependencies = [
  "prism-storage",
  "proptest",
  "thiserror",
+]
+
+[[package]]
+name = "prismdb"
+version = "0.1.0"
+dependencies = [
+ "prism-client",
+ "prism-doc",
+ "prism-fsck",
+ "prism-protocol",
+ "prism-server",
+ "prism-shell",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

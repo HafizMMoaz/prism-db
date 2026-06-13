@@ -18,6 +18,7 @@ members = [
     "crates/prism-server",
     "crates/prism-client",
     "crates/prism-shell",
+    "crates/prism-cli",
     "crates/prism-sdk-node",
     "crates/prism-fsck",
     "crates/prism-bench",
@@ -29,7 +30,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/prism-db/prism"
+repository = "https://github.com/HafizMMoaz/prism-db"
+homepage = "https://github.com/HafizMMoaz/prism-db"
 authors = ["The Prism authors"]
 
 # Internal crates — referenced by members via `{ workspace = true }`. Each carries
@@ -47,6 +49,8 @@ prism-kv = { path = "crates/prism-kv", version = "0.1.0" }
 prism-protocol = { path = "crates/prism-protocol", version = "0.1.0" }
 prism-server = { path = "crates/prism-server", version = "0.1.0" }
 prism-client = { path = "crates/prism-client", version = "0.1.0" }
+prism-shell = { path = "crates/prism-shell", version = "0.1.0" }
+prism-fsck = { path = "crates/prism-fsck", version = "0.1.0" }
 prism-testkit = { path = "crates/prism-testkit", version = "0.1.0" }
 
 # Shared external crates are pre-staged here so versions stay consistent across
@@ -116,3 +120,8 @@ debug = true
 inherits = "release"
 debug-assertions = true
 overflow-checks = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

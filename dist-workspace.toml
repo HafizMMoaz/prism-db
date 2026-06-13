@@ -1,0 +1,28 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist': how PrismDB's binaries are built and packaged for release.
+# A version tag (e.g. `v0.1.0`) pushed to GitHub triggers .github/workflows/release.yml,
+# which builds for every target below, generates the installers, and publishes a
+# GitHub Release. See docs/operations/releasing.md.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app:
+#   shell      — curl ... | sh   (Linux/macOS)
+#   powershell — irm ... | iex   (Windows)
+#   homebrew   — `brew install` via the tap below (macOS/Linux)
+#   msi        — a Windows .msi installer
+installers = ["shell", "powershell", "homebrew", "msi"]
+# The GitHub repo holding the Homebrew formula (created separately; dist pushes to it).
+tap = "HafizMMoaz/homebrew-prism"
+# Publish the Homebrew formula as part of a release.
+publish-jobs = ["homebrew"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Path the shell/powershell installers add binaries to.
+install-path = "CARGO_HOME"
+# Run dist in 'plan' mode on pull requests (validate without building everything).
+pr-run-mode = "plan"

@@ -10,7 +10,10 @@
 //! (`%ProgramData%\PrismDB\data` on Windows, `/var/lib/prismdb` on Linux when it
 //! exists, else `~/.prismdb`). Bind defaults to `0.0.0.0:4444`.
 //!
-//! See `docs/operations/install.md`.
+//! Command-line flags take priority, but the bind address and TLS certificate
+//! paths also fall back to the environment (`PRISM_BIND`, `PRISM_TLS_CERT`,
+//! `PRISM_TLS_KEY`), so a service manager can configure the server entirely
+//! through an environment file. See `docs/operations/install.md`.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -18,6 +21,11 @@ use std::sync::Arc;
 
 use prism_protocol::DEFAULT_PORT;
 use prism_server::{Config, Instance, Server, ServerConfig, tls};
+
+/// An environment variable's value if it is set and non-empty.
+fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|v| !v.is_empty())
+}
 
 /// The data directory: `$PRISM_DATA_DIR`, else a platform default.
 fn default_data_dir() -> PathBuf {
@@ -107,9 +115,14 @@ async fn main() -> ExitCode {
                 .map(PathBuf::from)
                 .or_else(|| positionals.first().map(PathBuf::from))
                 .unwrap_or_else(default_data_dir);
+            // Resolution order: CLI flag, then legacy positional, then the
+            // environment (set by the service unit / config file), then default.
             let bind = bind
                 .or_else(|| positionals.get(1).map(|s| s.to_string()))
+                .or_else(|| env_nonempty("PRISM_BIND"))
                 .unwrap_or_else(|| format!("0.0.0.0:{DEFAULT_PORT}"));
+            let tls_cert = tls_cert.or_else(|| env_nonempty("PRISM_TLS_CERT"));
+            let tls_key = tls_key.or_else(|| env_nonempty("PRISM_TLS_KEY"));
             run(&data_dir, &bind, tls_cert.as_deref(), tls_key.as_deref()).await
         }
         _ => usage(),

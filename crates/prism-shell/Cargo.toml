@@ -6,19 +6,16 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
 
-# Library holds the (testable) command parser and output formatters; the binary
-# wraps them in a connect + REPL loop.
+# Library holds the (testable) command parser and output formatters; the
+# `prism-shell` binary (in the `prismdb` crate) wraps them in a connect + REPL loop.
 [lib]
 name = "prism_shell"
 path = "src/lib.rs"
-
-[[bin]]
-name = "prism-shell"
-path = "src/main.rs"
 
 [dependencies]
 prism-client = { workspace = true }
 prism-protocol = { workspace = true }
 prism-doc = { workspace = true }
-tokio = { workspace = true }

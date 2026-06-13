@@ -7,6 +7,10 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# A developer tool — not shipped in releases/installers.
+[package.metadata.dist]
+dist = false
+
 # Library holds the (testable) workloads + statistics; the binary parses args and
 # prints the report.
 [lib]

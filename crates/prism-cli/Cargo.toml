@@ -1,0 +1,33 @@
+[package]
+name = "prismdb"
+description = "PrismDB command-line tools: the prismd server, the prism-shell client, and the fsck/dump utilities — one install, all binaries."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[package.metadata.wix]
+upgrade-guid = "7B6769E9-E3D1-4E44-974B-4BCDC047488C"
+path-guid = "F152BCFE-1C3D-4ACC-98CF-F8B31EBFC098"
+license = false
+eula = false
+
+# This crate is the single shippable package: it owns every user-facing binary
+# (prismd, prism-shell, prism-fsck, prism-dump), each a thin entrypoint over a
+# library crate. Bundling them in one package means a release produces one
+# installer / Homebrew formula / MSI that installs the whole toolset. Binaries
+# are auto-discovered from src/bin/.
+
+[dependencies]
+prism-server = { workspace = true }
+prism-client = { workspace = true }
+prism-shell = { workspace = true }
+prism-fsck = { workspace = true }
+prism-protocol = { workspace = true }
+prism-doc = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
