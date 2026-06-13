@@ -37,10 +37,11 @@ use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Distinct,
-    DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
-    GroupByExpr, ObjectType, OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Value as SqlValue,
+    AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption,
+    DataType, Delete, Distinct, DuplicateTreatment, Expr, FromTable, Function, FunctionArg,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectName, ObjectType, OrderByExpr, Query,
+    SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator,
+    Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -79,6 +80,14 @@ pub enum Outcome {
     DropTable {
         /// The dropped table's name (for catalog tombstoning).
         name: String,
+    },
+    /// An `ALTER TABLE` changed a table's schema.
+    AlterTable {
+        /// The table's (possibly new) name.
+        table: String,
+        /// The previous name when the operation was `RENAME TO`; `None` for an
+        /// in-place schema change. Lets the catalog tombstone the old name.
+        renamed_from: Option<String>,
     },
 }
 
@@ -146,6 +155,9 @@ impl SqlEngine {
                 names,
                 ..
             } => self.exec_drop(object_type, if_exists, names),
+            Statement::AlterTable {
+                name, operations, ..
+            } => self.exec_alter(txn, name, operations),
             other => Err(SqlError::Unsupported(format!(
                 "statement: {}",
                 statement_kind(&other)
@@ -178,6 +190,185 @@ impl SqlEngine {
             Err(SqlError::NoSuchTable(_)) if if_exists => Ok(Outcome::DropTable { name }),
             Err(e) => Err(e),
         }
+    }
+
+    /// `ALTER TABLE <name> <op>`: one operation per statement. ADD/DROP COLUMN
+    /// rewrite every row (the relational payload is positional, so an existing
+    /// row encoded under the old schema must be re-encoded under the new one);
+    /// RENAME COLUMN / RENAME TO are metadata-only.
+    ///
+    /// Like the rest of DDL, this is not safe to run concurrently with other
+    /// access to the table (no online schema change).
+    fn exec_alter(
+        &self,
+        txn: &TxnHandle,
+        name: ObjectName,
+        operations: Vec<AlterTableOperation>,
+    ) -> Result<Outcome> {
+        let table = self.catalog.table(&object_name(&name))?;
+        if operations.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "one operation per ALTER TABLE".into(),
+            ));
+        }
+        match operations.into_iter().next().expect("one operation") {
+            AlterTableOperation::AddColumn { column_def, .. } => {
+                self.alter_add_column(txn, &table, column_def)
+            }
+            AlterTableOperation::DropColumn {
+                column_name,
+                if_exists,
+                ..
+            } => self.alter_drop_column(txn, &table, &column_name.value, if_exists),
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => self.alter_rename_column(&table, &old_column_name.value, &new_column_name.value),
+            AlterTableOperation::RenameTable { table_name } => {
+                let new = object_name(&table_name);
+                self.catalog.rename_table(&table.name, &new)?;
+                Ok(Outcome::AlterTable {
+                    table: new,
+                    renamed_from: Some(table.name),
+                })
+            }
+            other => Err(SqlError::Unsupported(format!("ALTER TABLE {other}"))),
+        }
+    }
+
+    /// `ALTER TABLE … ADD COLUMN`: append a column, defaulting existing rows to
+    /// NULL. A `NOT NULL` column is rejected on a non-empty table (no default).
+    fn alter_add_column(&self, txn: &TxnHandle, table: &Table, def: ColumnDef) -> Result<Outcome> {
+        let col_name = def.name.value.clone();
+        if table.column_index(&col_name).is_some() {
+            return Err(SqlError::Constraint(format!(
+                "column {col_name} already exists"
+            )));
+        }
+        if def.options.iter().any(|o| {
+            matches!(
+                o.option,
+                ColumnOption::Unique {
+                    is_primary: true,
+                    ..
+                }
+            )
+        }) {
+            return Err(SqlError::Unsupported(
+                "ADD COLUMN cannot add a PRIMARY KEY".into(),
+            ));
+        }
+        let ty = map_data_type(&def.data_type)?;
+        let not_null = def
+            .options
+            .iter()
+            .any(|o| matches!(o.option, ColumnOption::NotNull));
+
+        let old_types = table.types();
+        let mut new_columns = table.columns.clone();
+        new_columns.push(Column {
+            name: col_name.clone(),
+            ty,
+            nullable: !not_null,
+        });
+        let new_types: Vec<Type> = new_columns.iter().map(|c| c.ty).collect();
+
+        let rows = self.store.scan(txn, table.heap)?;
+        if not_null && !rows.is_empty() {
+            return Err(SqlError::Constraint(format!(
+                "ADD COLUMN {col_name} NOT NULL requires an empty table (no default)"
+            )));
+        }
+        let index = self.pk_index(table);
+        for (rid, payload) in rows {
+            let mut row = types::decode_row(&old_types, &payload)?;
+            row.push(Value::Null);
+            let bytes = types::encode_row(&new_types, &row)?;
+            let new_rid = self.store.update(txn, rid, &bytes)?;
+            if let (Some(tree), Some(pk_col)) = (&index, table.primary_key) {
+                tree.insert(&encode_index_key(&row[pk_col])?, new_rid)?;
+            }
+        }
+        self.catalog
+            .redefine_table(&table.name, new_columns, table.primary_key)?;
+        Ok(Outcome::AlterTable {
+            table: table.name.clone(),
+            renamed_from: None,
+        })
+    }
+
+    /// `ALTER TABLE … DROP COLUMN`: remove a column and re-encode every row. The
+    /// PRIMARY KEY column and the last remaining column cannot be dropped.
+    fn alter_drop_column(
+        &self,
+        txn: &TxnHandle,
+        table: &Table,
+        col: &str,
+        if_exists: bool,
+    ) -> Result<Outcome> {
+        let idx = match table.column_index(col) {
+            Some(i) => i,
+            None if if_exists => {
+                return Ok(Outcome::AlterTable {
+                    table: table.name.clone(),
+                    renamed_from: None,
+                });
+            }
+            None => return Err(SqlError::NoSuchColumn(col.to_string())),
+        };
+        if table.primary_key == Some(idx) {
+            return Err(SqlError::Unsupported(
+                "cannot drop the PRIMARY KEY column".into(),
+            ));
+        }
+        if table.columns.len() == 1 {
+            return Err(SqlError::Unsupported("cannot drop the last column".into()));
+        }
+
+        let old_types = table.types();
+        let mut new_columns = table.columns.clone();
+        new_columns.remove(idx);
+        let new_types: Vec<Type> = new_columns.iter().map(|c| c.ty).collect();
+        // The PRIMARY KEY shifts left if it sat after the dropped column.
+        let new_pk = table
+            .primary_key
+            .map(|pk| if pk > idx { pk - 1 } else { pk });
+
+        let index = self.pk_index(table);
+        for (rid, payload) in self.store.scan(txn, table.heap)? {
+            let mut row = types::decode_row(&old_types, &payload)?;
+            row.remove(idx);
+            let bytes = types::encode_row(&new_types, &row)?;
+            let new_rid = self.store.update(txn, rid, &bytes)?;
+            if let (Some(tree), Some(pk_col)) = (&index, new_pk) {
+                tree.insert(&encode_index_key(&row[pk_col])?, new_rid)?;
+            }
+        }
+        self.catalog
+            .redefine_table(&table.name, new_columns, new_pk)?;
+        Ok(Outcome::AlterTable {
+            table: table.name.clone(),
+            renamed_from: None,
+        })
+    }
+
+    /// `ALTER TABLE … RENAME COLUMN`: metadata only — the payload is positional,
+    /// so no rows change.
+    fn alter_rename_column(&self, table: &Table, from: &str, to: &str) -> Result<Outcome> {
+        let idx = table
+            .column_index(from)
+            .ok_or_else(|| SqlError::NoSuchColumn(from.to_string()))?;
+        if table.column_index(to).is_some() {
+            return Err(SqlError::Constraint(format!("column {to} already exists")));
+        }
+        let mut new_columns = table.columns.clone();
+        new_columns[idx].name = to.to_string();
+        self.catalog
+            .redefine_table(&table.name, new_columns, table.primary_key)?;
+        Ok(Outcome::AlterTable {
+            table: table.name.clone(),
+            renamed_from: None,
+        })
     }
 
     fn exec_create_table(&self, ct: sqlparser::ast::CreateTable) -> Result<Outcome> {
@@ -1730,6 +1921,162 @@ mod tests {
                 name: "ghost".into()
             }
         );
+    }
+
+    #[test]
+    fn alter_add_column_backfills_null_and_keeps_index() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'alice'),(2,'bob')")
+            .unwrap();
+
+        assert_eq!(
+            env.engine
+                .execute_autocommit("ALTER TABLE t ADD COLUMN age BIGINT")
+                .unwrap(),
+            Outcome::AlterTable {
+                table: "t".into(),
+                renamed_from: None,
+            }
+        );
+        // An old row, fetched via the primary-key index, carries NULL for the
+        // new column (proves the row was re-encoded and the index repointed).
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT age FROM t WHERE id = 1")
+                    .unwrap()
+            ),
+            vec![vec![Value::Null]]
+        );
+        // New inserts populate the column.
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (3,'carol',41)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT age FROM t WHERE id = 3")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(41)]]
+        );
+    }
+
+    #[test]
+    fn alter_drop_column_reencodes_rows() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT, age BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'alice',30),(2,'bob',25)")
+            .unwrap();
+
+        env.engine
+            .execute_autocommit("ALTER TABLE t DROP COLUMN name")
+            .unwrap();
+        // Remaining columns decode correctly and the index still seeks.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id, age FROM t WHERE id = 2")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2), Value::Int64(25)]]
+        );
+        // The dropped column is gone; the PRIMARY KEY column cannot be dropped.
+        assert!(matches!(
+            env.engine.execute_autocommit("SELECT name FROM t"),
+            Err(SqlError::NoSuchColumn(_))
+        ));
+        assert!(
+            env.engine
+                .execute_autocommit("ALTER TABLE t DROP COLUMN id")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn alter_rename_column_and_table() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'alice')")
+            .unwrap();
+
+        env.engine
+            .execute_autocommit("ALTER TABLE t RENAME COLUMN name TO full_name")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT full_name FROM t")
+                    .unwrap()
+            ),
+            vec![vec![Value::Text("alice".into())]]
+        );
+        assert!(matches!(
+            env.engine.execute_autocommit("SELECT name FROM t"),
+            Err(SqlError::NoSuchColumn(_))
+        ));
+
+        assert_eq!(
+            env.engine
+                .execute_autocommit("ALTER TABLE t RENAME TO people")
+                .unwrap(),
+            Outcome::AlterTable {
+                table: "people".into(),
+                renamed_from: Some("t".into()),
+            }
+        );
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM people")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)]]
+        );
+        assert!(matches!(
+            env.engine.execute_autocommit("SELECT id FROM t"),
+            Err(SqlError::NoSuchTable(_))
+        ));
+    }
+
+    #[test]
+    fn alter_add_not_null_column_requires_empty_table() {
+        let nonempty = env();
+        nonempty
+            .engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        nonempty
+            .engine
+            .execute_autocommit("INSERT INTO t VALUES (1)")
+            .unwrap();
+        // A non-empty table has no value for a new NOT NULL column.
+        assert!(
+            nonempty
+                .engine
+                .execute_autocommit("ALTER TABLE t ADD COLUMN x BIGINT NOT NULL")
+                .is_err()
+        );
+        // On an empty table it is allowed.
+        let empty = env();
+        empty
+            .engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT)")
+            .unwrap();
+        empty
+            .engine
+            .execute_autocommit("ALTER TABLE t ADD COLUMN x BIGINT NOT NULL")
+            .unwrap();
     }
 
     #[test]

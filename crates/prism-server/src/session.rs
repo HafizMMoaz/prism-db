@@ -713,6 +713,14 @@ impl Session {
                 let persisted = match &outcome {
                     Outcome::CreateTable => db.persist_sql_tables(),
                     Outcome::DropTable { name } => db.drop_sql_table(name),
+                    Outcome::AlterTable {
+                        table,
+                        renamed_from: Some(old),
+                    } => db.rename_sql_table(old, table),
+                    Outcome::AlterTable {
+                        table,
+                        renamed_from: None,
+                    } => db.persist_table_schema(table),
                     _ => Ok(()),
                 };
                 if let Err(e) = persisted {
@@ -1380,7 +1388,9 @@ fn empty_kv_body(command: &KvCommand) -> KvResultBody {
 
 fn outcome_to_sql_result(outcome: Outcome) -> Message {
     let (affected_rows, columns, rows) = match outcome {
-        Outcome::CreateTable | Outcome::DropTable { .. } => (0, vec![], vec![]),
+        Outcome::CreateTable | Outcome::DropTable { .. } | Outcome::AlterTable { .. } => {
+            (0, vec![], vec![])
+        }
         Outcome::Insert { count } => (count as u64, vec![], vec![]),
         Outcome::Select { columns, rows } => {
             let wire_rows: Vec<Row> = rows

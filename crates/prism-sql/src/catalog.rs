@@ -106,6 +106,38 @@ impl Catalog {
         Ok(())
     }
 
+    /// Replace a table's columns and primary-key position in place, keeping its
+    /// heap and index root (used by `ALTER TABLE` add/drop/rename column).
+    pub fn redefine_table(
+        &self,
+        name: &str,
+        columns: Vec<Column>,
+        primary_key: Option<usize>,
+    ) -> Result<()> {
+        let mut tables = self.tables.lock().expect("catalog poisoned");
+        let table = tables
+            .get_mut(name)
+            .ok_or_else(|| SqlError::NoSuchTable(name.to_string()))?;
+        table.columns = columns;
+        table.primary_key = primary_key;
+        Ok(())
+    }
+
+    /// Rename a table, keeping its heap, schema, and index (`ALTER TABLE … RENAME
+    /// TO`). Errors if the new name is taken or the old name is unknown.
+    pub fn rename_table(&self, old: &str, new: &str) -> Result<()> {
+        let mut tables = self.tables.lock().expect("catalog poisoned");
+        if tables.contains_key(new) {
+            return Err(SqlError::TableExists(new.to_string()));
+        }
+        let mut table = tables
+            .remove(old)
+            .ok_or_else(|| SqlError::NoSuchTable(old.to_string()))?;
+        table.name = new.to_string();
+        tables.insert(new.to_string(), table);
+        Ok(())
+    }
+
     /// Look up a table by name.
     pub fn table(&self, name: &str) -> Result<Table> {
         self.tables

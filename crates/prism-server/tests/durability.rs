@@ -341,6 +341,43 @@ fn dropped_collection_and_namespace_stay_dropped_across_restart() {
     assert_eq!(show(&mut s, "SHOW NAMESPACES"), vec!["keep_n"]);
 }
 
+#[test]
+fn altered_table_schema_survives_restart() {
+    let tmp = TempDir::new("durability-alter").unwrap();
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)"));
+        s.handle(sql("INSERT INTO t VALUES (1,'alice')"));
+        s.handle(sql("ALTER TABLE t ADD COLUMN age BIGINT"));
+        s.handle(sql("INSERT INTO t VALUES (2,'bob',25)"));
+        // Rename the table too, to exercise the catalog re-key on reload.
+        s.handle(sql("ALTER TABLE t RENAME TO people"));
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    match s.handle(sql("SELECT id, name, age FROM people ORDER BY id")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => {
+            assert_eq!(rows.len(), 2);
+            // The added column survived: alice's value was backfilled NULL,
+            // bob's post-ALTER insert kept its value.
+            assert_eq!(rows[0][2], None, "backfilled NULL persisted");
+            assert_eq!(rows[1][2], Some(WireValue::Int64(25)));
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+    // The old name no longer resolves.
+    match s.handle(sql("SELECT id FROM t")) {
+        Message::SqlResult { status, .. } => assert_ne!(status, 0, "renamed-away table is gone"),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
 fn show(s: &mut Session, stmt: &str) -> Vec<String> {
     match s.handle(sql(stmt)) {
         Message::SqlResult {

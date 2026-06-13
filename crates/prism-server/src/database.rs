@@ -523,6 +523,47 @@ impl Database {
         Ok(())
     }
 
+    /// Persist a table's current schema as a fresh `Upsert` (for `ALTER TABLE`
+    /// add/drop/rename column). The latest record per name wins on reload, so
+    /// this overwrites the prior definition.
+    pub fn persist_table_schema(&self, name: &str) -> Result<()> {
+        let table = self.sql.catalog().table(name)?;
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Upsert,
+            kind: ObjectKind::Table,
+            name: name.to_string(),
+            heap: table.heap.0,
+            root_page: table.index_root.map_or(0, |p| p.as_u64()),
+            primary_key: table.primary_key.map(|p| p as u32),
+            columns: table.columns,
+        })?;
+        self.persisted_tables
+            .lock()
+            .expect("persisted set poisoned")
+            .insert(name.to_string());
+        Ok(())
+    }
+
+    /// Re-key a renamed table in the catalog (`ALTER TABLE … RENAME TO`):
+    /// tombstone the old name and persist the schema under the new one.
+    pub fn rename_sql_table(&self, old: &str, new: &str) -> Result<()> {
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Delete,
+            kind: ObjectKind::Table,
+            name: old.to_string(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+        })?;
+        self.persist_table_schema(new)?;
+        self.persisted_tables
+            .lock()
+            .expect("persisted set poisoned")
+            .remove(old);
+        Ok(())
+    }
+
     /// Drop a document collection: persist a tombstone and forget its mapping,
     /// returning whether it existed. Its heap and `_id` index pages are abandoned
     /// (unreachable) but not reclaimed, as with [`Self::drop_sql_table`].
