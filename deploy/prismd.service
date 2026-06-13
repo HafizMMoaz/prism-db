@@ -6,17 +6,20 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# A dedicated unprivileged account (create it: `useradd --system --no-create-home prismdb`).
-User=prismdb
-Group=prismdb
+# A transient, unprivileged service account is allocated per start; combined with
+# StateDirectory this needs no useradd in the package's install scripts.
+DynamicUser=true
 
-# systemd creates and owns /var/lib/prismdb for the service.
+# systemd creates and owns /var/lib/prismdb for the service. The config file
+# (installed at /etc/prismdb/prismd.conf) points PRISM_DATA_DIR at it and sets
+# the bind address, log level, and optional TLS — edit it, then restart.
 StateDirectory=prismdb
-Environment=PRISM_DATA_DIR=/var/lib/prismdb
-Environment=RUST_LOG=info
+EnvironmentFile=/etc/prismdb/prismd.conf
 
-# Serve on all interfaces, port 4444. Add `--tls-cert FILE --tls-key FILE` for TLS.
-ExecStart=/usr/local/bin/prismd run --bind 0.0.0.0:4444
+# All configuration (bind address, data dir, TLS) comes from the environment
+# file above; prismd reads PRISM_BIND / PRISM_DATA_DIR / PRISM_TLS_CERT /
+# PRISM_TLS_KEY / RUST_LOG.
+ExecStart=/usr/bin/prismd run
 
 Restart=on-failure
 RestartSec=2
@@ -26,7 +29,9 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/prismdb
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
 [Install]
 WantedBy=multi-user.target

@@ -1,59 +1,125 @@
-# Prism
+# PrismDB
 
-A multi-model database engine with unified ACID transactions across relational, document, and key-value access methods.
+A single-node, multi-model database engine: relational tables (SQL), JSON-like
+documents, and ordered key–value pairs — all on one storage engine, sharing one
+buffer pool, one write-ahead log, and one transaction manager. **A single
+transaction can mutate rows, documents, and KV pairs atomically.**
 
-**Status:** Design phase — v0.1 design documents locked, implementation not started.
-**License:** TBD (working assumption: Apache 2.0).
-**Primary language:** Rust (edition 2024, MSRV 1.85).
-**Target platforms:** Linux (x86_64, aarch64), macOS (aarch64), Windows (x86_64). All three are first-class, CI-tested, and shippable.
+[![CI](https://github.com/HafizMMoaz/prism-db/actions/workflows/ci.yml/badge.svg)](https://github.com/HafizMMoaz/prism-db/actions/workflows/ci.yml)
+&nbsp;License: Apache-2.0 &nbsp;·&nbsp; Rust 1.85+ &nbsp;·&nbsp; Linux · macOS · Windows
 
----
+This is not a wrapper around three databases. It is one engine with three access
+methods on top of a unified, WAL-logged, MVCC record store.
 
-## What this is
+## Install
 
-Prism is a single storage engine that exposes three first-class data models — relational tables with SQL, JSON-like documents, and ordered key-value pairs — all sharing one buffer pool, one write-ahead log, and one transaction manager. A single transaction can mutate rows, documents, and KV pairs atomically.
+PrismDB ships a single installer per platform. One install gives you the server
+(`prismd`), the interactive client (`prism-shell`), and the `prism-fsck` /
+`prism-dump` utilities.
 
-This is not a wrapper around three databases. It is one engine with three access methods on top of a unified record store.
+**Linux / macOS** — shell installer:
 
-## What this is not
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.sh | sh
+```
 
-- Not a distributed database. Single-node only. Replication is explicitly out of scope for v1.
-- Not a wire-compatible replacement for any existing system. We do not speak Postgres protocol, MongoDB protocol, or Redis RESP.
-- Not a research project. Every design choice has prior art in production systems; this is engineering, not novel CS.
-- Not an analytical engine. OLTP workloads only. Columnar storage and vectorized execution are out of scope for v1.
+**macOS / Linux** — Homebrew:
 
-## Why it exists
+```sh
+brew install HafizMMoaz/prism/prismdb
+```
 
-Polyglot persistence — running Postgres, MongoDB, and Redis side by side — is the default answer for applications that need multiple data shapes. It works, but it pushes consistency to the application layer. Cross-store transactions become saga patterns or two-phase commits between systems that were never designed to cooperate. The operational footprint is three services, three backup strategies, three failure modes.
+**Windows** — PowerShell installer:
 
-Prism asks a narrower question: if the storage primitive underneath these three shapes is the same — a tuple in a slotted page, written through a WAL, versioned by a transaction ID — can the three access methods share that primitive and inherit ACID across model boundaries for free?
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.ps1 | iex"
+```
 
-The answer, going in, is yes. The design documents in this repository argue why and lay out how.
+…or download the `.msi` from the [latest release](https://github.com/HafizMMoaz/prism-db/releases/latest).
 
-## Documentation map
+Prefer to build it yourself? `cargo install --git https://github.com/HafizMMoaz/prism-db prismdb`.
 
-The design corpus lives entirely in [`docs/`](docs/). Read in this order if you are new:
+See [docs/operations/install.md](docs/operations/install.md) for running `prismd`
+as a service (systemd / launchd / Windows) and for the data-directory layout.
 
-1. [`docs/overview/executive-summary.md`](docs/overview/executive-summary.md) — one-page summary
-2. [`docs/overview/vision-and-scope.md`](docs/overview/vision-and-scope.md) — goals, non-goals, success criteria
-3. [`docs/architecture/system-architecture.md`](docs/architecture/system-architecture.md) — components and how they fit
-4. [`docs/adr/`](docs/adr/) — every significant design decision and its rationale
-5. [`docs/components/`](docs/components/) — per-component design docs
-6. [`docs/specs/`](docs/specs/) — wire-level specifications
+## Quick start
 
-## Project state
+```sh
+prismd init                       # create the data directory
+prismd run --bind 127.0.0.1:4444  # start the server (durable: fsync on commit)
+```
 
-| Phase | Status |
-|---|---|
-| Design docs (this repo) | In progress |
-| Core foundation (disk, buffer pool, WAL) | Not started |
-| Transactions + recovery | Not started |
-| Access methods (SQL, document, KV) | Not started |
-| Network protocol + SDK | Not started |
-| Hardening + Jepsen-style testing | Not started |
+In another terminal, connect with the shell (default account `admin` / `admin`
+— change it before exposing the server):
 
-See [`docs/project/milestones.md`](docs/project/milestones.md) for the dated plan and [`docs/project/risk-register.md`](docs/project/risk-register.md) for what is most likely to go wrong.
+```sh
+prism-shell 127.0.0.1:4444 --user admin --password admin
+```
 
-## Contributing
+```sql
+CREATE DATABASE shop;
+USE shop;
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md). Short version: design docs are reviewed via pull request and discussed in writing. Code is not accepted until the relevant design doc and ADR are merged.
+-- Relational
+CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT, price BIGINT);
+INSERT INTO items VALUES (1, 'book', 1200), (2, 'pen', 150);
+SELECT name, price FROM items WHERE price > 200 ORDER BY price;
+
+-- and, in the same session, documents (\doc) and key–value (\kv).
+```
+
+All three models share one transaction: `\begin`, mutate across models, `\commit`
+— it is atomic and durable, or it is nothing.
+
+## What's inside
+
+- **Three models, one engine.** SQL tables, documents, and KV pairs over a shared
+  slotted-page store with a single WAL and MVCC snapshot isolation.
+- **ACID across models.** One transaction spans all three; commit is atomic and
+  crash-safe (WAL + checkpoints + redo recovery).
+- **Durable B-tree indexes** for every model (SQL primary keys, document `_id`,
+  KV keys), all WAL-logged.
+- **SQL surface:** `CREATE/ALTER/DROP TABLE`, `INSERT/UPDATE/DELETE`,
+  `SELECT` with `WHERE`/`ORDER BY`/`LIMIT`, joins-free aggregates
+  (`COUNT/SUM/MIN/MAX`, `GROUP BY … HAVING`), `DISTINCT`, scalar functions, and
+  richer expressions (`IN`/`BETWEEN`/`LIKE`/arithmetic).
+- **Multi-tenant server.** Many named databases under one instance, scrypt-hashed
+  accounts, role-based access with **per-database grants**, TLS, connection limits,
+  idempotent commits, structured audit logging.
+- **Clients:** the `prism-shell` REPL, a typed async Rust client, and a
+  pure-TypeScript Node SDK (`@prismdb/client`).
+- **Operations:** offline integrity checker (`prism-fsck`), logical export/import
+  (`prism-dump`), and a workload benchmark harness.
+
+## Building from source
+
+Requires Rust 1.85+.
+
+```sh
+cargo build --release        # binaries in target/release/
+cargo test --workspace       # the full suite
+```
+
+See [docs/operations/build-and-dev.md](docs/operations/build-and-dev.md).
+
+## Documentation
+
+The design corpus lives in [`docs/`](docs/). Good entry points:
+
+- [Executive summary](docs/overview/executive-summary.md) — one page
+- [System architecture](docs/architecture/system-architecture.md) — the components
+- [Wire protocol](docs/specs/wire-protocol.md) — the client/server format
+- [Installing as a server](docs/operations/install.md)
+- [Cutting a release](docs/operations/releasing.md)
+- [Architecture decisions](docs/adr/) — every significant choice and its rationale
+
+## Scope
+
+PrismDB is **single-node** and **OLTP**-focused. Distribution/replication and
+analytical (columnar) workloads are out of scope for v1. It does not speak the
+Postgres, MongoDB, or Redis wire protocols — it has its own
+[binary protocol](docs/specs/wire-protocol.md) and clients.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE). Contributions: [CONTRIBUTING.md](CONTRIBUTING.md).

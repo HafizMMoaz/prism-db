@@ -5,6 +5,28 @@ single **data directory** that holds many named databases (each a subdirectory;
 the reserved `_system` database holds the server-global user accounts). Clients
 connect over TCP, authenticate once, then select a database with `USE`.
 
+## Install the binaries
+
+One installer per platform delivers `prismd`, `prism-shell`, `prism-fsck`, and
+`prism-dump` together:
+
+```sh
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.sh | sh
+# macOS / Linux via Homebrew
+brew install HafizMMoaz/prism/prismdb
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.ps1 | iex"
+```
+
+Windows users can instead run the `.msi` from the
+[latest release](https://github.com/HafizMMoaz/prism-db/releases/latest). To run
+the server as a managed service that starts on boot, see
+[Run as a service](#run-as-a-service) below.
+
 ## The data directory
 
 `prismd` stores everything under one data directory — never in your project
@@ -53,45 +75,59 @@ A per-database grant overrides the user's global role for that database (it can
 widen *or*, as `REVOKE ALL ON <db>`, deny). User and grant management still
 requires the `admin` role, as does `CREATE`/`DROP DATABASE`.
 
-## Linux — systemd service
+## Run as a service
+
+### Linux — systemd
+
+`prismd` reads its configuration from the environment, so the service is driven
+entirely by an environment file (`/etc/prismdb/prismd.conf`): the bind address
+(`PRISM_BIND`, **defaulting to localhost** — `admin`/`admin` is a development
+credential), `PRISM_DATA_DIR`, `RUST_LOG`, and optional `PRISM_TLS_CERT` /
+`PRISM_TLS_KEY`. The unit uses `DynamicUser=` + `StateDirectory=`, so it needs no
+service account and owns `/var/lib/prismdb` itself.
 
 ```bash
-# 1. Build and install the binary.
-cargo build --release -p prism-server --bin prismd
-sudo install -m 0755 target/release/prismd /usr/local/bin/prismd
+# 1. Install the binary (the shell installer above puts it on your PATH;
+#    a service wants it somewhere stable):
+sudo install -m 0755 "$(command -v prismd)" /usr/bin/prismd
 
-# 2. Create a dedicated service account.
-sudo useradd --system --no-create-home --shell /usr/sbin/nologin prismdb
+# 2. Install the config and the unit (both ship in deploy/).
+sudo install -D -m 0644 deploy/prismd.conf    /etc/prismdb/prismd.conf
+sudo install -D -m 0644 deploy/prismd.service /etc/systemd/system/prismd.service
 
-# 3. Install and enable the unit (ships in deploy/prismd.service).
-sudo install -m 0644 deploy/prismd.service /etc/systemd/system/prismd.service
+# 3. Enable and start.
 sudo systemctl daemon-reload
 sudo systemctl enable --now prismd
-
-# 4. Check it.
 systemctl status prismd
 journalctl -u prismd -f          # structured logs, incl. the `audit` target
 ```
 
-systemd creates and owns `/var/lib/prismdb` (via `StateDirectory=`), which the
-unit passes as `PRISM_DATA_DIR`. Edit the unit to change the bind address, add
-TLS, or tune `RUST_LOG`.
+To accept remote connections, set `PRISM_BIND=0.0.0.0:4444` in
+`/etc/prismdb/prismd.conf` (after configuring TLS and real accounts) and
+`sudo systemctl restart prismd`.
 
-## Windows — service
+### macOS — Homebrew service
 
-`prismd` runs as a normal console process; wrap it with a service manager.
-[NSSM](https://nssm.cc) is the simplest:
+Installed via Homebrew, run it under `brew services`:
+
+```sh
+brew services start prismdb      # starts now and on login
+brew services stop  prismdb
+```
+
+### Windows — service
+
+Wrap `prismd` with a service manager. [NSSM](https://nssm.cc) is simplest:
 
 ```powershell
-# Install the binary somewhere stable, e.g. C:\Program Files\PrismDB\prismd.exe
-nssm install PrismDB "C:\Program Files\PrismDB\prismd.exe" run --bind 0.0.0.0:4444
-nssm set PrismDB AppEnvironmentExtra PRISM_DATA_DIR=C:\ProgramData\PrismDB\data RUST_LOG=info
+nssm install PrismDB "C:\Program Files\PrismDB\prismd.exe" run
+nssm set PrismDB AppEnvironmentExtra PRISM_DATA_DIR=C:\ProgramData\PrismDB\data PRISM_BIND=127.0.0.1:4444 RUST_LOG=info
 nssm start PrismDB
 ```
 
-Without NSSM, run it under Task Scheduler (“At startup”, run whether logged on or
-not) with the same `PRISM_DATA_DIR` environment variable, or for development just
-run `prismd run` in a terminal.
+Without NSSM, use Task Scheduler (“At startup”, run whether logged on or not)
+with the same environment variables, or just run `prismd run` in a terminal for
+development.
 
 ## Connecting
 
