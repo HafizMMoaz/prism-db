@@ -5,18 +5,19 @@
 //! documents. See `docs/components/sql-engine.md`.
 //!
 //! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`,
-//! `SELECT <exprs|*> FROM t [WHERE <predicate>] [ORDER BY col [ASC|DESC], …]
-//! [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`, and `DELETE FROM t
-//! [WHERE …]` over a sequential scan (with a primary-key index seek for
-//! `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`MIN`/`MAX` with an
-//! optional `GROUP BY`, for the types `BOOL`/`BIGINT`/`TEXT`. Expressions
-//! support arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
-//! `IS [NOT] NULL`, `[NOT] IN (…)`, `[NOT] BETWEEN … AND …`, and `[NOT] LIKE`
-//! (`%`/`_`) — usable in `WHERE`, `SET`, and the select list. Deferred: joins,
-//! `AVG` (needs a floating-point type), `HAVING`, `ORDER BY` over aggregate
-//! output, updating a primary-key column, the formal bind/rewrite/plan IR. The
-//! current executor interprets the parsed AST directly against the catalog; the
-//! full parse→bind→plan→execute pipeline is a follow-up.
+//! `SELECT [DISTINCT] <exprs|*> FROM t [WHERE <predicate>]
+//! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
+//! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
+//! index seek for `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`MIN`/
+//! `MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
+//! `BOOL`/`BIGINT`/`TEXT`. Expressions support arithmetic (`+ - * / %`),
+//! comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)`,
+//! `[NOT] BETWEEN … AND …`, and `[NOT] LIKE` (`%`/`_`) — usable in `WHERE`,
+//! `SET`, the select list, and `HAVING`. Deferred: joins, `AVG` (needs a
+//! floating-point type), `ORDER BY` over aggregate output, updating a
+//! primary-key column, the formal bind/rewrite/plan IR. The current executor
+//! interprets the parsed AST directly against the catalog; the full
+//! parse→bind→plan→execute pipeline is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -33,7 +34,7 @@ use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
-    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete,
+    Assignment, AssignmentTarget, BinaryOperator, ColumnOption, DataType, Delete, Distinct,
     DuplicateTreatment, Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments,
     GroupByExpr, OrderByExpr, Query, SelectItem, SetExpr, Statement, TableFactor, TableObject,
     TableWithJoins, UnaryOperator, Value as SqlValue,
@@ -299,6 +300,15 @@ impl SqlEngine {
         };
         let table = self.catalog.table(&object_name(name))?;
 
+        // SELECT DISTINCT dedupes the result rows (DISTINCT ON is not supported).
+        let distinct = match &select.distinct {
+            None => false,
+            Some(Distinct::Distinct) => true,
+            Some(other) => {
+                return Err(SqlError::Unsupported(format!("{other:?}")));
+            }
+        };
+
         // Aggregate query: any aggregate in the projection, or a GROUP BY.
         let group_keys = parse_group_by(&select.group_by, &table)?;
         if !group_keys.is_empty() || projection_has_aggregate(&select.projection) {
@@ -306,9 +316,11 @@ impl SqlEngine {
                 txn,
                 &select.projection,
                 &select.selection,
+                &select.having,
                 &table,
                 group_keys,
                 &query,
+                distinct,
             );
         }
 
@@ -371,12 +383,15 @@ impl SqlEngine {
             Some(e) => count_literal(e)?,
             None => usize::MAX,
         };
-        let rows = full_rows
+        let mut rows: Vec<Vec<Value>> = full_rows
             .into_iter()
             .skip(offset)
             .take(limit)
             .map(|full| self.project_row(&projection, &full, &table))
             .collect::<Result<_>>()?;
+        if distinct {
+            dedup_rows(&mut rows);
+        }
         Ok(Outcome::Select { columns, rows })
     }
 
@@ -401,14 +416,17 @@ impl SqlEngine {
     /// so `SELECT COUNT(*)` over an empty table still yields a single `0` row).
     /// Each group produces one output row. Groups are emitted in ascending
     /// group-key order for determinism; `LIMIT`/`OFFSET` then apply.
+    #[allow(clippy::too_many_arguments)]
     fn exec_aggregate(
         &self,
         txn: &TxnHandle,
         projection: &[SelectItem],
         selection: &Option<Expr>,
+        having: &Option<Expr>,
         table: &Table,
         group_keys: Vec<usize>,
         query: &Query,
+        distinct: bool,
     ) -> Result<Outcome> {
         // ORDER BY over aggregate output is not supported yet (it would need to
         // reference computed columns); LIMIT/OFFSET still apply below.
@@ -486,9 +504,16 @@ impl SqlEngine {
             groups.sort_by(|a, b| key_cmp(&a.0, &b.0));
         }
 
-        // Compute one output row per group.
+        // Compute one output row per group, applying HAVING (a predicate that
+        // may reference aggregates and group keys) to drop groups.
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
         for (key, members) in &groups {
+            if let Some(pred) = having {
+                let keep = Self::eval_having(pred, key, members, &rows_in, &group_keys, table)?;
+                if !matches!(keep, Value::Bool(true)) {
+                    continue;
+                }
+            }
             let mut cells = Vec::with_capacity(outputs.len());
             for (_, col) in &outputs {
                 let value = match col {
@@ -512,9 +537,72 @@ impl SqlEngine {
             Some(e) => count_literal(e)?,
             None => usize::MAX,
         };
-        let rows = out_rows.into_iter().skip(offset).take(limit).collect();
+        let mut rows: Vec<Vec<Value>> = out_rows.into_iter().skip(offset).take(limit).collect();
+        if distinct {
+            dedup_rows(&mut rows);
+        }
         let columns = outputs.into_iter().map(|(name, _)| name).collect();
         Ok(Outcome::Select { columns, rows })
+    }
+
+    /// Evaluate a HAVING predicate for one group. Aggregate function calls are
+    /// computed over the group's members; group-key columns resolve to the key;
+    /// comparisons, AND/OR/NOT, and arithmetic compose them.
+    fn eval_having(
+        expr: &Expr,
+        key: &[Value],
+        members: &[usize],
+        rows_in: &[Vec<Value>],
+        group_keys: &[usize],
+        table: &Table,
+    ) -> Result<Value> {
+        use BinaryOperator::*;
+        match expr {
+            Expr::Nested(inner) => {
+                Self::eval_having(inner, key, members, rows_in, group_keys, table)
+            }
+            Expr::Value(_) => literal(expr),
+            Expr::Function(f) => parse_aggregate(f, table)?.compute(members, rows_in),
+            Expr::Identifier(id) => {
+                let idx = table
+                    .column_index(&id.value)
+                    .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone()))?;
+                let pos = group_keys.iter().position(|k| *k == idx).ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "HAVING column {} must be in GROUP BY or an aggregate",
+                        id.value
+                    ))
+                })?;
+                Ok(key[pos].clone())
+            }
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr: inner,
+            } => Ok(Value::Bool(!matches!(
+                Self::eval_having(inner, key, members, rows_in, group_keys, table)?,
+                Value::Bool(true)
+            ))),
+            Expr::BinaryOp { left, op, right } => {
+                let l = || Self::eval_having(left, key, members, rows_in, group_keys, table);
+                let r = || Self::eval_having(right, key, members, rows_in, group_keys, table);
+                match op {
+                    And => Ok(Value::Bool(
+                        matches!(l()?, Value::Bool(true)) && matches!(r()?, Value::Bool(true)),
+                    )),
+                    Or => Ok(Value::Bool(
+                        matches!(l()?, Value::Bool(true)) || matches!(r()?, Value::Bool(true)),
+                    )),
+                    Plus | Minus | Multiply | Divide | Modulo => arith(op, &l()?, &r()?),
+                    Eq | NotEq | Lt | LtEq | Gt | GtEq => {
+                        Ok(Value::Bool(compare(op, &l()?, &r()?)))
+                    }
+                    other => Err(SqlError::Unsupported(format!("operator: {other}"))),
+                }
+            }
+            other => Err(SqlError::Unsupported(format!(
+                "HAVING expression: {other:?}"
+            ))),
+        }
     }
 
     /// Execute `UPDATE t SET col = expr, … [WHERE pred]`.
@@ -850,6 +938,12 @@ fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<ProjIte
         }
     }
     Ok(out)
+}
+
+/// Remove duplicate rows in place, preserving first-seen order (for DISTINCT).
+fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
+    let mut seen = std::collections::HashSet::new();
+    rows.retain(|row| seen.insert(row.clone()));
 }
 
 /// Apply an arithmetic operator to two integer values, propagating NULL and
@@ -2263,5 +2357,117 @@ mod tests {
             ),
             vec![1, 3, 4]
         );
+    }
+
+    #[test]
+    fn select_distinct_dedupes_rows() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, city TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "INSERT INTO t VALUES (1,'NYC'),(2,'LA'),(3,'NYC'),(4,'LA'),(5,'SF')",
+            )
+            .unwrap();
+
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT DISTINCT city FROM t ORDER BY city")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Text("LA".into())],
+                vec![Value::Text("NYC".into())],
+                vec![Value::Text("SF".into())],
+            ]
+        );
+
+        // Without DISTINCT all five rows come back.
+        let all = rows(env.engine.execute_autocommit("SELECT city FROM t").unwrap());
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn select_distinct_on_multiple_columns() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (a BIGINT, b BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,1),(1,1),(1,2),(2,1)")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT DISTINCT a, b FROM t ORDER BY a, b")
+                .unwrap(),
+        );
+        assert_eq!(
+            r.len(),
+            3,
+            "(1,1),(1,2),(2,1) — the duplicate (1,1) collapses"
+        );
+    }
+
+    #[test]
+    fn having_filters_groups() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (g BIGINT, v BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,10),(1,20),(2,5),(3,100),(3,1),(3,9)")
+            .unwrap();
+
+        // Groups with more than one row: g=1 (2 rows) and g=3 (3 rows).
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT g, COUNT(*) FROM t GROUP BY g HAVING COUNT(*) > 1")
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(3), Value::Int64(3)],
+            ]
+        );
+
+        // HAVING on SUM, combined with a group-key condition.
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT g, SUM(v) FROM t GROUP BY g HAVING SUM(v) >= 100 AND g > 1",
+                )
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Int64(3), Value::Int64(110)]]);
+    }
+
+    #[test]
+    fn having_without_group_by_filters_the_whole_table() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (v BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1),(2),(3)")
+            .unwrap();
+        // The single implicit group passes (COUNT = 3 > 2).
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT COUNT(*) FROM t HAVING COUNT(*) > 2")
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Int64(3)]]);
+        // A failing HAVING yields no rows.
+        let r = rows(
+            env.engine
+                .execute_autocommit("SELECT COUNT(*) FROM t HAVING COUNT(*) > 5")
+                .unwrap(),
+        );
+        assert!(r.is_empty());
     }
 }

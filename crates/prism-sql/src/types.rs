@@ -34,7 +34,7 @@ impl Type {
 }
 
 /// A SQL value.
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Value {
     /// SQL NULL.
     Null,
