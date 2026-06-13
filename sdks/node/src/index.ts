@@ -6,6 +6,8 @@ export type { ConnectOptions, SqlResult } from "./client.js";
 export type { ConnectionOptions, Notice } from "./connection.js";
 export { Q } from "./query.js";
 export type { DocQuery } from "./query.js";
+export { U } from "./update.js";
+export type { DocUpdate } from "./update.js";
 export type { Document } from "./document.js";
 export { ObjectId, Typed, int32, int64, float64, timestamp, TAG } from "./value.js";
 export type { Value } from "./value.js";

@@ -28,8 +28,8 @@ use prism_core::txn::{Snapshot, TxnHandle, TxnMode};
 use prism_doc::{DocCollection, DocValue, Document, Filter, Update};
 use prism_kv::KvNamespace;
 use prism_protocol::{
-    ColumnDesc, DocCommand, DocQuery, KvCommand, KvResultBody, Message, NoticeSeverity,
-    PROTOCOL_VERSION, Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
+    ColumnDesc, DocCommand, DocQuery, DocUpdate, DocUpdateOp, KvCommand, KvResultBody, Message,
+    NoticeSeverity, PROTOCOL_VERSION, Packet, Row, TxnMode as WireTxnMode, Value as WireValue,
 };
 use prism_sql::{Outcome, Value as SqlValue};
 use prism_wal::Lsn;
@@ -915,12 +915,17 @@ fn wire_to_doc_value(v: WireValue) -> Result<DocValue> {
     })
 }
 
-/// Compile a flat update document into an implicit `$set` of each field.
+/// Decode a wire [`DocUpdate`] and map it onto the engine's [`Update`]
+/// ($set/$unset/$inc), translating set operands from the wire `Value`.
 fn update_to_update(bytes: &[u8]) -> Result<Update> {
-    let doc = Document::decode(bytes)?;
+    let wire = DocUpdate::from_bytes(bytes)?;
     let mut update = Update::new();
-    for (k, v) in doc.iter() {
-        update = update.set(k.to_string(), v.clone());
+    for op in wire.ops {
+        update = match op {
+            DocUpdateOp::Set(field, value) => update.set(field, wire_to_doc_value(value)?),
+            DocUpdateOp::Unset(field) => update.unset(field),
+            DocUpdateOp::Inc(field, delta) => update.inc(field, delta),
+        };
     }
     Ok(update)
 }

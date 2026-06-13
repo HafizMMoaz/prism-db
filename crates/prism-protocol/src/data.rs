@@ -538,6 +538,84 @@ fn decode_group(r: &mut Reader) -> Result<Vec<DocQuery>> {
     Ok(out)
 }
 
+/// One field mutation in a [`DocUpdate`].
+#[derive(Clone, PartialEq, Debug)]
+pub enum DocUpdateOp {
+    /// Set `field` to `value` (MongoDB `$set`).
+    Set(String, Value),
+    /// Remove `field` (MongoDB `$unset`).
+    Unset(String),
+    /// Add `delta` to the integer `field` (MongoDB `$inc`).
+    Inc(String, i64),
+}
+
+/// A document update on the wire — an ordered list of field mutations, the
+/// structured form of a MongoDB update document. The server maps it onto the
+/// engine's `Update`. Carried as the `update` blob of an update [`DocCommand`].
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct DocUpdate {
+    /// The mutations, applied in order.
+    pub ops: Vec<DocUpdateOp>,
+}
+
+impl DocUpdate {
+    /// Encode to a standalone byte string (the `update` blob).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut w = Writer::new();
+        let count: u32 = self
+            .ops
+            .len()
+            .try_into()
+            .map_err(|_| ProtocolError::ValueTooLarge {
+                field: "update.ops",
+            })?;
+        w.put_u32(count);
+        for op in &self.ops {
+            match op {
+                DocUpdateOp::Set(field, value) => {
+                    w.put_u8(1);
+                    w.put_str_u16("update.field", field)?;
+                    value.encode_tagged(&mut w)?;
+                }
+                DocUpdateOp::Unset(field) => {
+                    w.put_u8(2);
+                    w.put_str_u16("update.field", field)?;
+                }
+                DocUpdateOp::Inc(field, delta) => {
+                    w.put_u8(3);
+                    w.put_str_u16("update.field", field)?;
+                    w.put_u64(*delta as u64);
+                }
+            }
+        }
+        Ok(w.into_vec())
+    }
+
+    /// Decode from an `update` blob.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let mut r = Reader::new(bytes);
+        let count = r.get_u32("update.op_count")? as usize;
+        let mut ops = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let tag = r.get_u8("update.tag")?;
+            let op = match tag {
+                1 => DocUpdateOp::Set(read_field(&mut r)?, Value::decode_tagged(&mut r)?),
+                2 => DocUpdateOp::Unset(read_field(&mut r)?),
+                3 => DocUpdateOp::Inc(read_field(&mut r)?, r.get_u64("update.delta")? as i64),
+                other => {
+                    return Err(ProtocolError::BadEnum {
+                        field: "update.tag",
+                        value: other,
+                    });
+                }
+            };
+            ops.push(op);
+        }
+        r.expect_end()?;
+        Ok(Self { ops })
+    }
+}
+
 /// The op-specific body of a [`crate::Message::KvOp`]. Keys and values are
 /// opaque byte strings.
 #[derive(Clone, PartialEq, Eq, Debug)]

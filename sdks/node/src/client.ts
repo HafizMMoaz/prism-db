@@ -13,6 +13,7 @@ import {
   TXN_READ_WRITE,
 } from "./messages.js";
 import { DocQuery, Q, encodeDocQuery } from "./query.js";
+import { DocUpdate, encodeDocUpdate } from "./update.js";
 import { ObjectId, Value } from "./value.js";
 
 const PROTOCOL_VERSION = 1;
@@ -197,20 +198,20 @@ export class Client {
       return first ? decodeDocument(first) : null;
     },
 
-    updateOne: async (collection: string, query: DocQuery, update: Document): Promise<bigint> => {
+    updateOne: async (collection: string, query: DocQuery, update: DocUpdate[]): Promise<bigint> => {
       const reply = await this.docReply({
         type: "docOp",
         collection,
-        command: { op: 5, query: encodeDocQuery(query), update: encodeDocument(update), options: EMPTY },
+        command: { op: 5, query: encodeDocQuery(query), update: encodeDocUpdate(update), options: EMPTY },
       });
       return reply.affected;
     },
 
-    updateMany: async (collection: string, query: DocQuery, update: Document): Promise<bigint> => {
+    updateMany: async (collection: string, query: DocQuery, update: DocUpdate[]): Promise<bigint> => {
       const reply = await this.docReply({
         type: "docOp",
         collection,
-        command: { op: 6, query: encodeDocQuery(query), update: encodeDocument(update), options: EMPTY },
+        command: { op: 6, query: encodeDocQuery(query), update: encodeDocUpdate(update), options: EMPTY },
       });
       return reply.affected;
     },

@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { Client, ObjectId, Q } from "../src/index.js";
+import { Client, ObjectId, Q, U } from "../src/index.js";
 
 const addr = process.env.PRISM_E2E_ADDR;
 const [host, portStr] = (addr ?? "").split(":");
@@ -89,6 +89,16 @@ test("e2e: documents with query operators", { skip: !addr }, async () => {
 
     const inSet = await c.doc.find(coll, Q.in("name", ["alice", "bob"]));
     assert.equal(inSet.length, 2);
+
+    // Update operators: $set city, $inc age, $unset a field.
+    const updated = await c.doc.updateOne(coll, Q.eq("name", "carol"), [
+      U.set("city", "Boston"),
+      U.inc("age", 1),
+    ]);
+    assert.equal(updated, 1n);
+    const carol = await c.doc.findOne(coll, Q.eq("name", "carol"));
+    assert.equal(carol?.city, "Boston");
+    assert.equal(carol?.age, 42n);
 
     const n = await c.doc.deleteMany(coll, Q.lt("age", 31));
     assert.equal(n, 2n); // alice (30) + bob (25)

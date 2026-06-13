@@ -25,7 +25,9 @@ pub mod error;
 pub mod frame;
 pub mod message;
 
-pub use data::{ColumnDesc, DocCommand, DocQuery, KvCommand, KvResultBody, Row, Value};
+pub use data::{
+    ColumnDesc, DocCommand, DocQuery, DocUpdate, DocUpdateOp, KvCommand, KvResultBody, Row, Value,
+};
 pub use error::{ProtocolError, Result};
 pub use message::{
     AuthMechanism, ErrorInfo, Message, MessageType, NoticeSeverity, Packet, TxnMode,
@@ -498,6 +500,27 @@ mod tests {
         ]);
         let bytes = q.to_bytes().unwrap();
         assert_eq!(DocQuery::from_bytes(&bytes).unwrap(), q);
+    }
+
+    #[test]
+    fn doc_update_round_trips_through_bytes() {
+        let u = DocUpdate {
+            ops: vec![
+                DocUpdateOp::Set("name".into(), Value::Str("alice".into())),
+                DocUpdateOp::Unset("temp".into()),
+                DocUpdateOp::Inc("visits".into(), -3),
+            ],
+        };
+        let bytes = u.to_bytes().unwrap();
+        assert_eq!(DocUpdate::from_bytes(&bytes).unwrap(), u);
+        // Unknown op tag is a BadEnum.
+        assert!(matches!(
+            DocUpdate::from_bytes(&[1, 0, 0, 0, 0xEE]),
+            Err(ProtocolError::BadEnum {
+                field: "update.tag",
+                ..
+            })
+        ));
     }
 
     #[test]

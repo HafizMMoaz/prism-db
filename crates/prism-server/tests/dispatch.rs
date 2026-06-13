@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use prism_doc::{DocValue, Document};
 use prism_protocol::{
-    AuthMechanism, DocCommand, DocQuery, KvCommand, KvResultBody, Message, TxnMode,
-    Value as WireValue,
+    AuthMechanism, DocCommand, DocQuery, DocUpdate, DocUpdateOp, KvCommand, KvResultBody, Message,
+    TxnMode, Value as WireValue,
 };
 use prism_server::{Database, Session};
 use prism_testkit::TempDir;
@@ -147,6 +147,18 @@ fn doc_query(collection: &str, query: DocQuery) -> Message {
         collection: collection.into(),
         command: DocCommand::Find {
             query: query.to_bytes().unwrap(),
+            options: vec![],
+        },
+    }
+}
+
+/// An `UpdateOne` carrying a structured query and update.
+fn doc_update_one(collection: &str, query: DocQuery, update: DocUpdate) -> Message {
+    Message::DocOp {
+        collection: collection.into(),
+        command: DocCommand::UpdateOne {
+            query: query.to_bytes().unwrap(),
+            update: update.to_bytes().unwrap(),
             options: vec![],
         },
     }
@@ -418,6 +430,50 @@ fn doc_query_operators_over_the_wire() {
         names(s.handle(doc_query("people", q))),
         vec!["alice", "bob"]
     );
+}
+
+#[test]
+fn doc_update_operators_over_the_wire() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    s.handle(doc_insert(
+        "u",
+        &[
+            ("name", DocValue::Str("alice".into())),
+            ("visits", DocValue::Int64(1)),
+            ("temp", DocValue::Int64(9)),
+        ],
+    ));
+
+    // $set name, $inc visits by 5, $unset temp — all in one update.
+    let q = DocQuery::Eq("name".into(), WireValue::Str("alice".into()));
+    let upd = DocUpdate {
+        ops: vec![
+            DocUpdateOp::Set("name".into(), WireValue::Str("alicia".into())),
+            DocUpdateOp::Inc("visits".into(), 5),
+            DocUpdateOp::Unset("temp".into()),
+        ],
+    };
+    match s.handle(doc_update_one("u", q, upd)) {
+        Message::DocResult {
+            status: 0,
+            affected,
+            ..
+        } => assert_eq!(affected, 1),
+        other => panic!("expected DocResult, got {other:?}"),
+    }
+
+    let docs = doc_results(s.handle(doc_query("u", DocQuery::All)));
+    assert_eq!(docs.len(), 1);
+    let d = &docs[0];
+    assert_eq!(
+        d.get("name"),
+        Some(&DocValue::Str("alicia".into())),
+        "$set applied"
+    );
+    assert_eq!(d.get("visits"), Some(&DocValue::Int64(6)), "$inc applied");
+    assert_eq!(d.get("temp"), None, "$unset removed the field");
 }
 
 #[test]

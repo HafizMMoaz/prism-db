@@ -72,8 +72,8 @@ and values are `string | Uint8Array`.
 ### Documents — `db.doc`
 
 `insertOne`/`insertMany` (return the assigned `ObjectId`s), `find`/`findOne`,
-`updateOne`/`updateMany` (the update document is an implicit `$set`),
-`deleteOne`/`deleteMany`. Build filters with `Q`:
+`updateOne`/`updateMany`, `deleteOne`/`deleteMany`. Build filters with `Q` and
+updates with `U`:
 
 ```ts
 Q.all();
@@ -81,6 +81,13 @@ Q.eq("f", v); Q.ne; Q.gt; Q.lt; Q.gte; Q.lte;
 Q.in("f", [a, b]); Q.nin("f", [a, b]);
 Q.exists("f", true);
 Q.and(a, b); Q.or(a, b); Q.not(a);
+
+// updateOne/updateMany take a list of update operators:
+await db.doc.updateOne("people", Q.eq("name", "carol"), [
+  U.set("city", "Boston"),
+  U.inc("age", 1),
+  U.unset("temp"),
+]);
 ```
 
 ### Transactions — `db.begin(mode?)`, `db.commit({ idempotencyKey? })`, `db.abort()`
