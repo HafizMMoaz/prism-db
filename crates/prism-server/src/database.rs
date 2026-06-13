@@ -113,6 +113,17 @@ impl Database {
 
     /// Open the database under `dir` with an explicit [`Config`].
     pub fn open_with(dir: &Path, config: Config) -> Result<Self> {
+        Self::open_inner(dir, config, true)
+    }
+
+    /// Open a *data-only* database: no user store is seeded or loaded. Used for
+    /// the data databases of a multi-database [`crate::Instance`], whose users
+    /// live at the instance level (server-global), not per database.
+    pub fn open_data(dir: &Path, config: Config) -> Result<Self> {
+        Self::open_inner(dir, config, false)
+    }
+
+    fn open_inner(dir: &Path, config: Config, manage_users: bool) -> Result<Self> {
         let heap_path = dir.join("heap.db");
         let wal_cfg = WalConfig {
             segment_size: config.wal_segment_size,
@@ -168,9 +179,11 @@ impl Database {
         if existing {
             db.load_catalog()?;
         }
-        // Load persisted accounts (or seed+persist the default admin on a fresh
-        // or pre-feature database).
-        db.load_or_seed_users()?;
+        // Load persisted accounts (or seed+persist the default admin). Skipped
+        // for data-only databases, whose users live at the instance level.
+        if manage_users {
+            db.load_or_seed_users()?;
+        }
         Ok(db)
     }
 

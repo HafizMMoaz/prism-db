@@ -39,6 +39,9 @@ pub enum ServerError {
     /// Persistent state (e.g. a catalog record) could not be decoded.
     #[error("corrupt: {0}")]
     Corrupt(String),
+    /// A filesystem error managing the data directory (multi-database instance).
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
 }
 
 impl From<prism_protocol::ProtocolError> for ServerError {
@@ -73,6 +76,8 @@ impl ServerError {
             ServerError::Sql(_) | ServerError::Doc(_) | ServerError::Kv(_) => 0x0400,
             // 0x0200–0x02FF transaction errors (serialization, deadlock, …).
             ServerError::Core(_) => 0x0200,
+            // 0x0300–0x03FF storage / I/O errors.
+            ServerError::Io(_) => 0x0300,
             // 0x0001–0x00FF protocol errors.
             ServerError::State(_) => 0x0001,
             // 0x0100–0x01FF authentication / authorization.
