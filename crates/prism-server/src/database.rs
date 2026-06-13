@@ -523,6 +523,61 @@ impl Database {
         Ok(())
     }
 
+    /// Drop a document collection: persist a tombstone and forget its mapping,
+    /// returning whether it existed. Its heap and `_id` index pages are abandoned
+    /// (unreachable) but not reclaimed, as with [`Self::drop_sql_table`].
+    pub fn drop_collection(&self, name: &str) -> Result<bool> {
+        if !self
+            .doc_heaps
+            .lock()
+            .expect("doc heap map poisoned")
+            .contains_key(name)
+        {
+            return Ok(false);
+        }
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Delete,
+            kind: ObjectKind::Collection,
+            name: name.to_string(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+        })?;
+        self.doc_heaps
+            .lock()
+            .expect("doc heap map poisoned")
+            .remove(name);
+        Ok(true)
+    }
+
+    /// Drop a key–value namespace: persist a tombstone and forget its mapping,
+    /// returning whether it existed. Its heap and index pages are abandoned.
+    pub fn drop_namespace(&self, name: &str) -> Result<bool> {
+        if !self
+            .kv_namespaces
+            .lock()
+            .expect("kv namespace map poisoned")
+            .contains_key(name)
+        {
+            return Ok(false);
+        }
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Delete,
+            kind: ObjectKind::Namespace,
+            name: name.to_string(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+        })?;
+        self.kv_namespaces
+            .lock()
+            .expect("kv namespace map poisoned")
+            .remove(name);
+        Ok(true)
+    }
+
     /// Append `entry` to the catalog heap in its own committed transaction.
     fn persist_entry(&self, entry: &CatalogEntry) -> Result<()> {
         let bytes = entry.encode()?;

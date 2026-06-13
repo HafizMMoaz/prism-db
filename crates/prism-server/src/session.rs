@@ -670,6 +670,15 @@ impl Session {
             };
         }
 
+        // Document/KV DDL (DROP COLLECTION / DROP NAMESPACE) over the current
+        // database — the relational engine does not know these object kinds.
+        if is_object_ddl_sql(&sql) {
+            return match self.run_object_ddl_sql(&sql) {
+                Ok(msg) => msg,
+                Err(e) => sql_result_err(&e),
+            };
+        }
+
         // Administrative statements (user/grant management) are handled here, not
         // by the relational engine, and need the ADMIN privilege.
         if is_admin_sql(&sql) {
@@ -848,6 +857,50 @@ impl Session {
             more_frames: false,
             error: None,
         })
+    }
+
+    /// Handle `DROP COLLECTION` / `DROP NAMESPACE` (optionally `IF EXISTS`) over
+    /// the current database. These mutate the catalog, so they need WRITE.
+    fn run_object_ddl_sql(&mut self, sql: &str) -> Result<Message> {
+        self.authorize(Need::Write)?;
+        let db = self.data_db()?;
+        let stmt = sql.trim().trim_end_matches(';');
+        let upper = stmt.to_ascii_uppercase();
+
+        let (label, is_collection, rest) =
+            if let Some(rest) = strip_kw(stmt, &upper, "DROP COLLECTION") {
+                ("collection", true, rest)
+            } else if let Some(rest) = strip_kw(stmt, &upper, "DROP NAMESPACE") {
+                ("namespace", false, rest)
+            } else {
+                return Err(ServerError::Unsupported(format!(
+                    "object statement: {stmt}"
+                )));
+            };
+
+        let rest_upper = rest.to_ascii_uppercase();
+        let (if_exists, target) = match strip_kw(rest, &rest_upper, "IF EXISTS") {
+            Some(after) => (true, after),
+            None => (false, rest),
+        };
+        let name = first_word(target)
+            .ok_or_else(|| ServerError::State(format!("DROP {label} needs a name")))?;
+
+        let existed = if is_collection {
+            db.drop_collection(name)?
+        } else {
+            db.drop_namespace(name)?
+        };
+        if !existed && !if_exists {
+            return Err(ServerError::State(format!("no such {label}: `{name}`")));
+        }
+        let action = if is_collection {
+            "DROP COLLECTION"
+        } else {
+            "DROP NAMESPACE"
+        };
+        crate::audit::admin(self.user_oid(), action, name);
+        Ok(sql_ack(0))
     }
 
     /// Execute an administrative statement (user/grant management). The caller
@@ -1090,6 +1143,13 @@ fn is_db_admin_sql(sql: &str) -> bool {
         || u.starts_with("CREATE DATABASE")
         || u.starts_with("DROP DATABASE")
         || u.starts_with("SHOW DATABASES")
+}
+
+/// Whether `sql` is document/KV DDL (`DROP COLLECTION` / `DROP NAMESPACE`)
+/// handled by the session, not the relational engine.
+fn is_object_ddl_sql(sql: &str) -> bool {
+    let u = sql.trim_start().to_ascii_uppercase();
+    u.starts_with("DROP COLLECTION") || u.starts_with("DROP NAMESPACE")
 }
 
 /// Whether `sql` is an introspection statement over the current database.

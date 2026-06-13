@@ -725,3 +725,69 @@ fn cannot_begin_twice_or_commit_without_a_transaction() {
     assert!(s.in_transaction());
     txn_ok(s.handle(Message::Abort));
 }
+
+/// The string cells of a one-column listing (e.g. `SHOW COLLECTIONS`).
+fn name_list(msg: Message) -> Vec<String> {
+    match msg {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => rows
+            .iter()
+            .map(|r| match &r[0] {
+                Some(WireValue::Str(s)) => s.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect(),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+fn ddl_ok(msg: Message) {
+    match msg {
+        Message::SqlResult { status: 0, .. } => {}
+        other => panic!("expected ok SqlResult, got {other:?}"),
+    }
+}
+
+fn ddl_err(msg: Message) {
+    match msg {
+        Message::SqlResult { status, .. } => assert_ne!(status, 0),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
+fn drop_collection_and_namespace() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+
+    // Create a collection and a namespace by using them.
+    doc_results(s.handle(doc_insert("events", &[("v", DocValue::Int64(1))])));
+    s.handle(kv_put("cache", b"k", b"v"));
+    assert_eq!(name_list(s.handle(sql("SHOW COLLECTIONS"))), vec!["events"]);
+    assert_eq!(name_list(s.handle(sql("SHOW NAMESPACES"))), vec!["cache"]);
+
+    // Drop them; the listings go empty.
+    ddl_ok(s.handle(sql("DROP COLLECTION events")));
+    ddl_ok(s.handle(sql("DROP NAMESPACE cache")));
+    assert!(name_list(s.handle(sql("SHOW COLLECTIONS"))).is_empty());
+    assert!(name_list(s.handle(sql("SHOW NAMESPACES"))).is_empty());
+
+    // Dropping a missing object errors unless IF EXISTS.
+    ddl_err(s.handle(sql("DROP COLLECTION events")));
+    ddl_ok(s.handle(sql("DROP COLLECTION IF EXISTS events")));
+    ddl_err(s.handle(sql("DROP NAMESPACE cache")));
+    ddl_ok(s.handle(sql("DROP NAMESPACE IF EXISTS cache")));
+
+    // Re-using the name gives a fresh, empty object — the old data is gone.
+    s.handle(kv_put("cache", b"k2", b"v2"));
+    assert_eq!(
+        kv_value(s.handle(kv_get("cache", b"k"))),
+        None,
+        "old key gone"
+    );
+    assert_eq!(
+        kv_value(s.handle(kv_get("cache", b"k2"))),
+        Some(b"v2".to_vec())
+    );
+}

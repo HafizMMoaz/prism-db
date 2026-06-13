@@ -302,6 +302,60 @@ fn recreated_table_after_drop_keeps_new_schema_across_restart() {
     }
 }
 
+#[test]
+fn dropped_collection_and_namespace_stay_dropped_across_restart() {
+    let tmp = TempDir::new("durability-drop-obj").unwrap();
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(doc_insert("gone_c", &[("v", DocValue::Int64(1))]));
+        s.handle(doc_insert("keep_c", &[("v", DocValue::Int64(2))]));
+        s.handle(kv(
+            "gone_n",
+            KvCommand::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        ));
+        s.handle(kv(
+            "keep_n",
+            KvCommand::Put {
+                key: b"k".to_vec(),
+                value: b"v".to_vec(),
+            },
+        ));
+        for stmt in ["DROP COLLECTION gone_c", "DROP NAMESPACE gone_n"] {
+            match s.handle(sql(stmt)) {
+                Message::SqlResult { status: 0, .. } => {}
+                other => panic!("{stmt}: {other:?}"),
+            }
+        }
+        drop(s);
+        drop(db);
+    }
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    // The tombstones replayed: only the survivors are listed.
+    assert_eq!(show(&mut s, "SHOW COLLECTIONS"), vec!["keep_c"]);
+    assert_eq!(show(&mut s, "SHOW NAMESPACES"), vec!["keep_n"]);
+}
+
+fn show(s: &mut Session, stmt: &str) -> Vec<String> {
+    match s.handle(sql(stmt)) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => rows
+            .iter()
+            .map(|r| match &r[0] {
+                Some(WireValue::Str(name)) => name.clone(),
+                other => panic!("{other:?}"),
+            })
+            .collect(),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
 fn doc_count(s: &mut Session, collection: &str) -> usize {
     match s.handle(doc_find_all(collection)) {
         Message::DocResult {
