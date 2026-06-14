@@ -1,3 +1,5 @@
+![Logo](./logo.png)
+
 # PrismDB
 
 A single-node, multi-model database engine: relational tables (SQL), JSON-like
