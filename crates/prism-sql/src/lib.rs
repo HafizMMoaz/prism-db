@@ -5,22 +5,26 @@
 //! documents. See `docs/components/sql-engine.md`.
 //!
 //! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`,
-//! `SELECT [DISTINCT] <exprs|*> FROM t [WHERE <predicate>]
+//! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
 //! index seek for `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`MIN`/
 //! `MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
-//! `BOOL`/`BIGINT`/`TEXT`. Expressions support arithmetic (`+ - * / %`),
+//! `BOOL`/`BIGINT`/`TEXT`. Multi-table queries support `INNER` / `LEFT` /
+//! `RIGHT` / `FULL OUTER` / `CROSS` joins (and comma-separated cartesian
+//! products and self-joins via aliases) by nested loop, with `t.col`-qualified
+//! column references throughout `SELECT`/`WHERE`/`ON`/`GROUP BY`/`HAVING`/
+//! `ORDER BY`. Expressions support arithmetic (`+ - * / %`),
 //! comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)`,
 //! `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`), and scalar functions —
 //! date/time (`NOW`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND` over Unix
 //! epoch seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`),
 //! and numeric (`ABS`/`MOD`/`COALESCE`) — usable in `WHERE`, `SET`, the select
-//! list, and `HAVING`. Deferred: joins, `AVG` (needs a
-//! floating-point type), `ORDER BY` over aggregate output, updating a
-//! primary-key column, the formal bind/rewrite/plan IR. The current executor
-//! interprets the parsed AST directly against the catalog; the full
-//! parse→bind→plan→execute pipeline is a follow-up.
+//! list, and `HAVING`. Deferred: `USING`/`NATURAL` join constraints, `AVG`
+//! (needs a floating-point type), `ORDER BY` over aggregate output, updating a
+//! primary-key column, join predicate pushdown / index nested-loop, the formal
+//! bind/rewrite/plan IR. The current executor interprets the parsed AST directly
+//! against the catalog; the full parse→bind→plan→execute pipeline is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -39,9 +43,9 @@ use prism_index::BTree;
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption,
     DataType, Delete, Distinct, DuplicateTreatment, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectName, ObjectType, OrderByExpr, Query,
-    SelectItem, SetExpr, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator,
-    Value as SqlValue,
+    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
+    ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -517,96 +521,119 @@ impl SqlEngine {
     }
 
     fn exec_select(&self, txn: &TxnHandle, query: Query) -> Result<Outcome> {
-        let SetExpr::Select(select) = query.body.as_ref() else {
-            return Err(SqlError::Unsupported(
-                "only simple SELECT is supported".into(),
-            ));
+        let select: &Select = match query.body.as_ref() {
+            SetExpr::Select(s) => s.as_ref(),
+            _ => {
+                return Err(SqlError::Unsupported(
+                    "only simple SELECT is supported".into(),
+                ));
+            }
         };
-        if select.from.len() != 1 || !select.from[0].joins.is_empty() {
-            return Err(SqlError::Unsupported(
-                "SELECT needs exactly one table, no joins".into(),
-            ));
-        }
-        let TableFactor::Table { name, .. } = &select.from[0].relation else {
-            return Err(SqlError::Unsupported("FROM must be a table name".into()));
-        };
-        let table = self.catalog.table(&object_name(name))?;
 
         // SELECT DISTINCT dedupes the result rows (DISTINCT ON is not supported).
         let distinct = match &select.distinct {
             None => false,
             Some(Distinct::Distinct) => true,
-            Some(other) => {
-                return Err(SqlError::Unsupported(format!("{other:?}")));
-            }
+            Some(other) => return Err(SqlError::Unsupported(format!("{other:?}"))),
         };
 
-        // Aggregate query: any aggregate in the projection, or a GROUP BY.
-        let group_keys = parse_group_by(&select.group_by, &table)?;
+        // A single base table (no joins) keeps the primary-key index-seek fast
+        // path; anything with joins or several FROM items goes through the
+        // nested-loop join materializer.
+        if select.from.len() == 1 && select.from[0].joins.is_empty() {
+            let (qualifier, table) = self.relation_of(&select.from[0].relation)?;
+            let schema = JoinSchema::single(&qualifier, &table);
+            return self.select_single(txn, select, &query, &table, &schema, distinct);
+        }
+
+        let (schema, combined) = self.materialize_from(txn, &select.from)?;
+        let mut filtered: Vec<Vec<Value>> = Vec::new();
+        for row in combined {
+            match &select.selection {
+                Some(pred) if !self.matches(pred, &row, &schema)? => continue,
+                _ => filtered.push(row),
+            }
+        }
+        self.finish_select(select, &query, &schema, filtered, distinct)
+    }
+
+    /// The single-base-table path: an index seek for `WHERE <pk> = <literal>`
+    /// (when there is no ORDER BY / LIMIT / OFFSET), otherwise a full scan with
+    /// the predicate applied per row. Produces the WHERE-filtered rows and hands
+    /// off to [`Self::finish_select`].
+    fn select_single(
+        &self,
+        txn: &TxnHandle,
+        select: &Select,
+        query: &Query,
+        table: &Table,
+        schema: &JoinSchema,
+        distinct: bool,
+    ) -> Result<Outcome> {
+        let types = table.types();
+        let plain = query.order_by.is_none() && query.limit.is_none() && query.offset.is_none();
+
+        let mut filtered: Vec<Vec<Value>> = Vec::new();
+        let mut seeked = false;
+        if plain {
+            if let (Some(tree), Some(key_value)) = (
+                self.pk_index(table),
+                self.pk_equality_literal(&select.selection, table)?,
+            ) {
+                let key = encode_index_key(&key_value)?;
+                if let Some(rid) = tree.search(&key)? {
+                    if let Some(payload) = self.store.read(txn, rid)? {
+                        // The seek key *is* the whole predicate, so no re-filter.
+                        filtered.push(types::decode_row(&types, &payload)?);
+                    }
+                }
+                seeked = true;
+            }
+        }
+        if !seeked {
+            for (_, payload) in self.store.scan(txn, table.heap)? {
+                let full = types::decode_row(&types, &payload)?;
+                match &select.selection {
+                    Some(pred) if !self.matches(pred, &full, schema)? => continue,
+                    _ => filtered.push(full),
+                }
+            }
+        }
+        self.finish_select(select, query, schema, filtered, distinct)
+    }
+
+    /// Shared tail of a `SELECT`: dispatch to the aggregate path when the query
+    /// groups or aggregates, otherwise order / offset / limit / project the
+    /// already-WHERE-filtered `rows`.
+    fn finish_select(
+        &self,
+        select: &Select,
+        query: &Query,
+        schema: &JoinSchema,
+        mut rows: Vec<Vec<Value>>,
+        distinct: bool,
+    ) -> Result<Outcome> {
+        let group_keys = parse_group_by(&select.group_by, schema)?;
         if !group_keys.is_empty() || projection_has_aggregate(&select.projection) {
             return self.exec_aggregate(
-                txn,
+                schema,
                 &select.projection,
-                &select.selection,
                 &select.having,
-                &table,
                 group_keys,
-                &query,
+                rows,
+                query,
                 distinct,
             );
         }
 
-        // Resolve the projection to (output name, expression) pairs. A bare
-        // column is just an identifier expression; `*` expands to one per
-        // column; arbitrary expressions (e.g. `a + b`) are evaluated per row.
-        let projection = resolve_projection(&select.projection, &table)?;
+        let projection = resolve_projection(&select.projection, schema)?;
         let columns: Vec<String> = projection.iter().map(|p| p.name.clone()).collect();
 
-        let types = table.types();
-
-        // Index seek: `WHERE <pk> = <literal>` resolves to a single B+tree
-        // lookup instead of a full scan. Only taken when there is no ORDER BY /
-        // LIMIT / OFFSET to apply (a single row makes ordering moot, but a
-        // LIMIT/OFFSET still has to be honored — let the scan path do that).
-        let plain = query.order_by.is_none() && query.limit.is_none() && query.offset.is_none();
-        if plain {
-            if let (Some(tree), Some(key_value)) = (
-                self.pk_index(&table),
-                self.pk_equality_literal(&select.selection, &table)?,
-            ) {
-                let key = encode_index_key(&key_value)?;
-                let mut rows = Vec::new();
-                if let Some(rid) = tree.search(&key)? {
-                    if let Some(payload) = self.store.read(txn, rid)? {
-                        let full = types::decode_row(&types, &payload)?;
-                        rows.push(self.project_row(&projection, &full, &table)?);
-                    }
-                }
-                return Ok(Outcome::Select { columns, rows });
-            }
-        }
-
-        // Otherwise, a full sequential scan with the predicate applied per row.
-        // Keep whole rows so an ORDER BY can sort on columns that are not in the
-        // projection; project only after ordering and LIMIT/OFFSET.
-        let mut full_rows: Vec<Vec<Value>> = Vec::new();
-        for (_, payload) in self.store.scan(txn, table.heap)? {
-            let full = types::decode_row(&types, &payload)?;
-            if let Some(pred) = &select.selection {
-                if !self.matches(pred, &full, &table)? {
-                    continue;
-                }
-            }
-            full_rows.push(full);
-        }
-
-        // ORDER BY <col> [ASC|DESC] [, …] — a stable sort by the key columns.
         if let Some(order_by) = &query.order_by {
-            let keys = resolve_order_keys(&order_by.exprs, &table)?;
-            full_rows.sort_by(|a, b| order_cmp(&keys, a, b));
+            let keys = resolve_order_keys(&order_by.exprs, schema)?;
+            rows.sort_by(|a, b| order_cmp(&keys, a, b));
         }
 
-        // OFFSET then LIMIT, both non-negative integer literals.
         let offset = match &query.offset {
             Some(o) => count_literal(&o.value)?,
             None => 0,
@@ -615,28 +642,216 @@ impl SqlEngine {
             Some(e) => count_literal(e)?,
             None => usize::MAX,
         };
-        let mut rows: Vec<Vec<Value>> = full_rows
+        let mut out: Vec<Vec<Value>> = rows
             .into_iter()
             .skip(offset)
             .take(limit)
-            .map(|full| self.project_row(&projection, &full, &table))
+            .map(|full| self.project_row(&projection, &full, schema))
             .collect::<Result<_>>()?;
         if distinct {
-            dedup_rows(&mut rows);
+            dedup_rows(&mut out);
         }
-        Ok(Outcome::Select { columns, rows })
+        Ok(Outcome::Select { columns, rows: out })
     }
 
-    /// Evaluate each projection expression against `row`.
+    /// Resolve a `FROM`/`JOIN` table factor to `(qualifier, table)`. The
+    /// qualifier is the alias if present, else the table name; it is what
+    /// `t.col` references resolve against (so a self-join needs aliases).
+    fn relation_of(&self, factor: &TableFactor) -> Result<(String, Table)> {
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                let table = self.catalog.table(&object_name(name))?;
+                let qualifier = match alias {
+                    Some(a) => a.name.value.clone(),
+                    None => table.name.clone(),
+                };
+                Ok((qualifier, table))
+            }
+            other => Err(SqlError::Unsupported(format!("FROM item: {other:?}"))),
+        }
+    }
+
+    /// Decode every row of `table` visible to `txn` (a full scan).
+    fn scan_rows(&self, txn: &TxnHandle, table: &Table) -> Result<Vec<Vec<Value>>> {
+        let types = table.types();
+        let mut rows = Vec::new();
+        for (_, payload) in self.store.scan(txn, table.heap)? {
+            rows.push(types::decode_row(&types, &payload)?);
+        }
+        Ok(rows)
+    }
+
+    /// Materialize the `FROM` clause (comma-separated tables cross-joined, each
+    /// with its chain of `JOIN`s) into a combined schema and row set via
+    /// nested-loop joins.
+    fn materialize_from(
+        &self,
+        txn: &TxnHandle,
+        from: &[TableWithJoins],
+    ) -> Result<(JoinSchema, Vec<Vec<Value>>)> {
+        let mut schema = JoinSchema { cols: Vec::new() };
+        // The identity for a cross product is a single zero-width row.
+        let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
+
+        for twj in from {
+            let (q, table) = self.relation_of(&twj.relation)?;
+            let base_schema = JoinSchema::single(&q, &table);
+            let base_rows = self.scan_rows(txn, &table)?;
+            let (s, r) = cross_join(schema, rows, base_schema, base_rows);
+            schema = s;
+            rows = r;
+
+            for join in &twj.joins {
+                let (rq, rtable) = self.relation_of(&join.relation)?;
+                let right_schema = JoinSchema::single(&rq, &rtable);
+                let right_rows = self.scan_rows(txn, &rtable)?;
+                let (s, r) =
+                    self.apply_join(schema, rows, right_schema, right_rows, &join.join_operator)?;
+                schema = s;
+                rows = r;
+            }
+        }
+        Ok((schema, rows))
+    }
+
+    /// Evaluate a join `ON` predicate against the concatenation of a left and a
+    /// right row, resolved through the combined `schema`. `None` means an
+    /// unconditional join (CROSS), always true.
+    fn eval_on(
+        &self,
+        on: Option<&Expr>,
+        schema: &JoinSchema,
+        left: &[Value],
+        right: &[Value],
+    ) -> Result<bool> {
+        match on {
+            None => Ok(true),
+            Some(e) => {
+                let mut row = left.to_vec();
+                row.extend_from_slice(right);
+                self.matches(e, &row, schema)
+            }
+        }
+    }
+
+    /// Nested-loop join of accumulated `left` rows with a `right` source.
+    /// Supports INNER, LEFT/RIGHT/FULL OUTER, and CROSS; the unmatched side of
+    /// an outer join is padded with NULLs.
+    fn apply_join(
+        &self,
+        left_schema: JoinSchema,
+        left_rows: Vec<Vec<Value>>,
+        right_schema: JoinSchema,
+        right_rows: Vec<Vec<Value>>,
+        op: &JoinOperator,
+    ) -> Result<(JoinSchema, Vec<Vec<Value>>)> {
+        let left_w = left_schema.cols.len();
+        let right_w = right_schema.cols.len();
+        let mut combined = left_schema;
+        combined.cols.extend(right_schema.cols);
+
+        enum Kind {
+            Inner,
+            Left,
+            Right,
+            Full,
+            Cross,
+        }
+        let (kind, on) = match op {
+            JoinOperator::Inner(c) => (Kind::Inner, constraint_on(c)?),
+            JoinOperator::LeftOuter(c) => (Kind::Left, constraint_on(c)?),
+            JoinOperator::RightOuter(c) => (Kind::Right, constraint_on(c)?),
+            JoinOperator::FullOuter(c) => (Kind::Full, constraint_on(c)?),
+            JoinOperator::CrossJoin => (Kind::Cross, None),
+            other => return Err(SqlError::Unsupported(format!("join type: {other:?}"))),
+        };
+
+        let cat = |l: &[Value], r: &[Value]| -> Vec<Value> {
+            let mut row = Vec::with_capacity(l.len() + r.len());
+            row.extend_from_slice(l);
+            row.extend_from_slice(r);
+            row
+        };
+        let null_left = || vec![Value::Null; left_w];
+        let null_right = || vec![Value::Null; right_w];
+
+        let mut out = Vec::new();
+        match kind {
+            Kind::Inner | Kind::Cross => {
+                for l in &left_rows {
+                    for r in &right_rows {
+                        if self.eval_on(on, &combined, l, r)? {
+                            out.push(cat(l, r));
+                        }
+                    }
+                }
+            }
+            Kind::Left => {
+                for l in &left_rows {
+                    let mut matched = false;
+                    for r in &right_rows {
+                        if self.eval_on(on, &combined, l, r)? {
+                            out.push(cat(l, r));
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        out.push(cat(l, &null_right()));
+                    }
+                }
+            }
+            Kind::Right => {
+                for r in &right_rows {
+                    let mut matched = false;
+                    for l in &left_rows {
+                        if self.eval_on(on, &combined, l, r)? {
+                            out.push(cat(l, r));
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        out.push(cat(&null_left(), r));
+                    }
+                }
+            }
+            Kind::Full => {
+                let mut right_hit = vec![false; right_rows.len()];
+                for l in &left_rows {
+                    let mut matched = false;
+                    for (ri, r) in right_rows.iter().enumerate() {
+                        if self.eval_on(on, &combined, l, r)? {
+                            out.push(cat(l, r));
+                            matched = true;
+                            right_hit[ri] = true;
+                        }
+                    }
+                    if !matched {
+                        out.push(cat(l, &null_right()));
+                    }
+                }
+                for (ri, r) in right_rows.iter().enumerate() {
+                    if !right_hit[ri] {
+                        out.push(cat(&null_left(), r));
+                    }
+                }
+            }
+        }
+        Ok((combined, out))
+    }
+
+    /// Evaluate each projection item against `row`.
     fn project_row(
         &self,
         projection: &[ProjItem],
         row: &[Value],
-        table: &Table,
+        cols: &dyn ColumnResolver,
     ) -> Result<Vec<Value>> {
         projection
             .iter()
-            .map(|p| self.eval(&p.expr, row, table))
+            .map(|p| match &p.kind {
+                ProjKind::Col(i) => Ok(row[*i].clone()),
+                ProjKind::Expr(e) => self.eval(e, row, cols),
+            })
             .collect()
     }
 
@@ -651,12 +866,11 @@ impl SqlEngine {
     #[allow(clippy::too_many_arguments)]
     fn exec_aggregate(
         &self,
-        txn: &TxnHandle,
+        schema: &JoinSchema,
         projection: &[SelectItem],
-        selection: &Option<Expr>,
         having: &Option<Expr>,
-        table: &Table,
         group_keys: Vec<usize>,
+        rows_in: Vec<Vec<Value>>,
         query: &Query,
         distinct: bool,
     ) -> Result<Outcome> {
@@ -683,21 +897,18 @@ impl SqlEngine {
             };
             match expr {
                 Expr::Function(f) => {
-                    let agg = parse_aggregate(f, table)?;
+                    let agg = parse_aggregate(f, schema)?;
                     let name = alias.unwrap_or_else(|| expr.to_string());
                     outputs.push((name, OutputCol::Aggregate(agg)));
                 }
-                Expr::Identifier(id) => {
-                    let idx = table
-                        .column_index(&id.value)
-                        .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone()))?;
+                Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                    let idx = resolve_col_expr(schema, expr)?;
                     if !group_keys.contains(&idx) {
                         return Err(SqlError::Unsupported(format!(
-                            "column {} must appear in GROUP BY or an aggregate",
-                            id.value
+                            "column {expr} must appear in GROUP BY or an aggregate"
                         )));
                     }
-                    let name = alias.unwrap_or_else(|| id.value.clone());
+                    let name = alias.unwrap_or_else(|| expr.to_string());
                     outputs.push((name, OutputCol::GroupKey(idx)));
                 }
                 other => {
@@ -706,19 +917,6 @@ impl SqlEngine {
                     )));
                 }
             }
-        }
-
-        // Gather the rows passing the predicate.
-        let types = table.types();
-        let mut rows_in: Vec<Vec<Value>> = Vec::new();
-        for (_, payload) in self.store.scan(txn, table.heap)? {
-            let full = types::decode_row(&types, &payload)?;
-            if let Some(pred) = selection {
-                if !self.matches(pred, &full, table)? {
-                    continue;
-                }
-            }
-            rows_in.push(full);
         }
 
         // Partition into groups, preserving first-seen order then sorting by key.
@@ -741,7 +939,7 @@ impl SqlEngine {
         let mut out_rows: Vec<Vec<Value>> = Vec::with_capacity(groups.len());
         for (key, members) in &groups {
             if let Some(pred) = having {
-                let keep = Self::eval_having(pred, key, members, &rows_in, &group_keys, table)?;
+                let keep = Self::eval_having(pred, key, members, &rows_in, &group_keys, schema)?;
                 if !matches!(keep, Value::Bool(true)) {
                     continue;
                 }
@@ -786,23 +984,20 @@ impl SqlEngine {
         members: &[usize],
         rows_in: &[Vec<Value>],
         group_keys: &[usize],
-        table: &Table,
+        cols: &dyn ColumnResolver,
     ) -> Result<Value> {
         use BinaryOperator::*;
         match expr {
             Expr::Nested(inner) => {
-                Self::eval_having(inner, key, members, rows_in, group_keys, table)
+                Self::eval_having(inner, key, members, rows_in, group_keys, cols)
             }
             Expr::Value(_) => literal(expr),
-            Expr::Function(f) => parse_aggregate(f, table)?.compute(members, rows_in),
-            Expr::Identifier(id) => {
-                let idx = table
-                    .column_index(&id.value)
-                    .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone()))?;
+            Expr::Function(f) => parse_aggregate(f, cols)?.compute(members, rows_in),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => {
+                let idx = resolve_col_expr(cols, expr)?;
                 let pos = group_keys.iter().position(|k| *k == idx).ok_or_else(|| {
                     SqlError::Unsupported(format!(
-                        "HAVING column {} must be in GROUP BY or an aggregate",
-                        id.value
+                        "HAVING column {expr} must be in GROUP BY or an aggregate"
                     ))
                 })?;
                 Ok(key[pos].clone())
@@ -811,12 +1006,12 @@ impl SqlEngine {
                 op: UnaryOperator::Not,
                 expr: inner,
             } => Ok(Value::Bool(!matches!(
-                Self::eval_having(inner, key, members, rows_in, group_keys, table)?,
+                Self::eval_having(inner, key, members, rows_in, group_keys, cols)?,
                 Value::Bool(true)
             ))),
             Expr::BinaryOp { left, op, right } => {
-                let l = || Self::eval_having(left, key, members, rows_in, group_keys, table);
-                let r = || Self::eval_having(right, key, members, rows_in, group_keys, table);
+                let l = || Self::eval_having(left, key, members, rows_in, group_keys, cols);
+                let r = || Self::eval_having(right, key, members, rows_in, group_keys, cols);
                 match op {
                     And => Ok(Value::Bool(
                         matches!(l()?, Value::Bool(true)) && matches!(r()?, Value::Bool(true)),
@@ -993,26 +1188,29 @@ impl SqlEngine {
     }
 
     /// Whether `row` satisfies the boolean predicate `expr`.
-    fn matches(&self, expr: &Expr, row: &[Value], table: &Table) -> Result<bool> {
-        Ok(matches!(self.eval(expr, row, table)?, Value::Bool(true)))
+    fn matches(&self, expr: &Expr, row: &[Value], cols: &dyn ColumnResolver) -> Result<bool> {
+        Ok(matches!(self.eval(expr, row, cols)?, Value::Bool(true)))
     }
 
-    /// Evaluate `expr` against `row`.
-    fn eval(&self, expr: &Expr, row: &[Value], table: &Table) -> Result<Value> {
+    /// Evaluate `expr` against `row`, resolving column references through `cols`.
+    fn eval(&self, expr: &Expr, row: &[Value], cols: &dyn ColumnResolver) -> Result<Value> {
         use BinaryOperator::*;
         match expr {
-            Expr::Nested(inner) => self.eval(inner, row, table),
+            Expr::Nested(inner) => self.eval(inner, row, cols),
             Expr::Identifier(ident) => {
-                let idx = table
-                    .column_index(&ident.value)
-                    .ok_or_else(|| SqlError::NoSuchColumn(ident.value.clone()))?;
+                let idx = cols.resolve(None, &ident.value)?;
+                Ok(row[idx].clone())
+            }
+            // `t.col` — a qualified reference into a joined row.
+            Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+                let idx = cols.resolve(Some(&parts[0].value), &parts[1].value)?;
                 Ok(row[idx].clone())
             }
             Expr::Value(_) => literal(expr),
             Expr::UnaryOp { op, expr: inner } => match op {
-                UnaryOperator::Not => Ok(Value::Bool(!self.matches(inner, row, table)?)),
+                UnaryOperator::Not => Ok(Value::Bool(!self.matches(inner, row, cols)?)),
                 UnaryOperator::Minus | UnaryOperator::Plus => {
-                    match (op, self.eval(inner, row, table)?) {
+                    match (op, self.eval(inner, row, cols)?) {
                         (_, Value::Null) => Ok(Value::Null),
                         (UnaryOperator::Minus, Value::Int64(n)) => Ok(Value::Int64(-n)),
                         (UnaryOperator::Plus, v @ Value::Int64(_)) => Ok(v),
@@ -1025,29 +1223,29 @@ impl SqlEngine {
             },
             Expr::BinaryOp { left, op, right } => match op {
                 And => Ok(Value::Bool(
-                    self.matches(left, row, table)? && self.matches(right, row, table)?,
+                    self.matches(left, row, cols)? && self.matches(right, row, cols)?,
                 )),
                 Or => Ok(Value::Bool(
-                    self.matches(left, row, table)? || self.matches(right, row, table)?,
+                    self.matches(left, row, cols)? || self.matches(right, row, cols)?,
                 )),
                 Plus | Minus | Multiply | Divide | Modulo => {
-                    let l = self.eval(left, row, table)?;
-                    let r = self.eval(right, row, table)?;
+                    let l = self.eval(left, row, cols)?;
+                    let r = self.eval(right, row, cols)?;
                     arith(op, &l, &r)
                 }
                 Eq | NotEq | Lt | LtEq | Gt | GtEq => {
-                    let l = self.eval(left, row, table)?;
-                    let r = self.eval(right, row, table)?;
+                    let l = self.eval(left, row, cols)?;
+                    let r = self.eval(right, row, cols)?;
                     Ok(Value::Bool(compare(op, &l, &r)))
                 }
                 other => Err(SqlError::Unsupported(format!("operator: {other}"))),
             },
             Expr::IsNull(inner) => Ok(Value::Bool(matches!(
-                self.eval(inner, row, table)?,
+                self.eval(inner, row, cols)?,
                 Value::Null
             ))),
             Expr::IsNotNull(inner) => Ok(Value::Bool(!matches!(
-                self.eval(inner, row, table)?,
+                self.eval(inner, row, cols)?,
                 Value::Null
             ))),
             // `v [NOT] IN (a, b, …)`. A NULL probe never matches.
@@ -1056,11 +1254,11 @@ impl SqlEngine {
                 list,
                 negated,
             } => {
-                let v = self.eval(inner, row, table)?;
+                let v = self.eval(inner, row, cols)?;
                 let mut found = false;
                 if !matches!(v, Value::Null) {
                     for item in list {
-                        if self.eval(item, row, table)? == v {
+                        if self.eval(item, row, cols)? == v {
                             found = true;
                             break;
                         }
@@ -1075,9 +1273,9 @@ impl SqlEngine {
                 low,
                 high,
             } => {
-                let v = self.eval(inner, row, table)?;
-                let lo = self.eval(low, row, table)?;
-                let hi = self.eval(high, row, table)?;
+                let v = self.eval(inner, row, cols)?;
+                let lo = self.eval(low, row, cols)?;
+                let hi = self.eval(high, row, cols)?;
                 let in_range = compare(&GtEq, &v, &lo) && compare(&LtEq, &v, &hi);
                 Ok(Value::Bool(in_range ^ negated))
             }
@@ -1092,8 +1290,8 @@ impl SqlEngine {
                 if *any || escape_char.is_some() {
                     return Err(SqlError::Unsupported("LIKE ANY / ESCAPE".into()));
                 }
-                let v = self.eval(inner, row, table)?;
-                let p = self.eval(pattern, row, table)?;
+                let v = self.eval(inner, row, cols)?;
+                let p = self.eval(pattern, row, cols)?;
                 let hit = match (&v, &p) {
                     (Value::Text(s), Value::Text(pat)) => like_match(s, pat),
                     (Value::Null, _) | (_, Value::Null) => false,
@@ -1101,7 +1299,7 @@ impl SqlEngine {
                 };
                 Ok(Value::Bool(hit ^ negated))
             }
-            Expr::Function(f) => self.eval_function(f, row, table),
+            Expr::Function(f) => self.eval_function(f, row, cols),
             // `TRIM(x)` parses to its own node (not a function call).
             Expr::Trim {
                 expr: inner,
@@ -1114,7 +1312,7 @@ impl SqlEngine {
                         "TRIM with LEADING/TRAILING or trim characters".into(),
                     ));
                 }
-                str_map(self.eval(inner, row, table)?, |s| s.trim().to_string())
+                str_map(self.eval(inner, row, cols)?, |s| s.trim().to_string())
             }
             other => Err(SqlError::Unsupported(format!("expression: {other:?}"))),
         }
@@ -1123,7 +1321,7 @@ impl SqlEngine {
     /// Evaluate a scalar function call (date/time, string, numeric helpers).
     /// Aggregate names are rejected here — they are handled by the aggregate
     /// path, not per-row evaluation.
-    fn eval_function(&self, f: &Function, row: &[Value], table: &Table) -> Result<Value> {
+    fn eval_function(&self, f: &Function, row: &[Value], cols: &dyn ColumnResolver) -> Result<Value> {
         let name = object_name(&f.name).to_ascii_uppercase();
         if is_aggregate_name(&name) {
             return Err(SqlError::Unsupported(format!(
@@ -1135,7 +1333,7 @@ impl SqlEngine {
             let e = arg_exprs
                 .get(i)
                 .ok_or_else(|| SqlError::Type(format!("{name} is missing an argument")))?;
-            self.eval(e, row, table)
+            self.eval(e, row, cols)
         };
         let nargs = arg_exprs.len();
         match name.as_str() {
@@ -1254,46 +1452,202 @@ fn compare(op: &BinaryOperator, l: &Value, r: &Value) -> bool {
     }
 }
 
-/// One output column of a (non-aggregate) `SELECT`: an expression to evaluate
-/// per row, plus the name to report for it.
-struct ProjItem {
-    name: String,
-    expr: Expr,
+/// How a projected output column is produced.
+enum ProjKind {
+    /// A direct column index into the (joined) row — used for `*` expansion so a
+    /// duplicate column name across joined tables is never re-resolved by name.
+    Col(usize),
+    /// An expression evaluated per row.
+    Expr(Expr),
 }
 
-/// Resolve a select list to projected expressions. `*` expands to one item per
-/// table column; `expr AS alias` takes the alias; a bare column or expression
-/// is named after itself.
-fn resolve_projection(items: &[SelectItem], table: &Table) -> Result<Vec<ProjItem>> {
+/// One output column of a (non-aggregate) `SELECT`: how to produce it, plus the
+/// name to report for it.
+struct ProjItem {
+    name: String,
+    kind: ProjKind,
+}
+
+/// Resolve a select list to projection items. `*` expands to one item per column
+/// (across all joined tables, in order); `t.*` to that table's columns;
+/// `expr AS alias` takes the alias; a bare column or expression is named after
+/// itself.
+fn resolve_projection(items: &[SelectItem], cols: &dyn ColumnResolver) -> Result<Vec<ProjItem>> {
+    let all = cols.columns();
     let mut out = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard(_) => {
-                for col in &table.columns {
+                for (i, (_q, name)) in all.iter().enumerate() {
                     out.push(ProjItem {
-                        name: col.name.clone(),
-                        expr: Expr::Identifier(col.name.as_str().into()),
+                        name: name.clone(),
+                        kind: ProjKind::Col(i),
                     });
+                }
+            }
+            SelectItem::QualifiedWildcard(obj, _) => {
+                let q = object_name(obj);
+                let mut any = false;
+                for (i, (cq, name)) in all.iter().enumerate() {
+                    if cq.as_deref() == Some(q.as_str()) {
+                        out.push(ProjItem {
+                            name: name.clone(),
+                            kind: ProjKind::Col(i),
+                        });
+                        any = true;
+                    }
+                }
+                if !any {
+                    return Err(SqlError::NoSuchTable(q));
                 }
             }
             SelectItem::UnnamedExpr(expr) => {
                 let name = match expr {
                     Expr::Identifier(id) => id.value.clone(),
+                    Expr::CompoundIdentifier(parts) if !parts.is_empty() => {
+                        parts.last().unwrap().value.clone()
+                    }
                     other => other.to_string(),
                 };
                 out.push(ProjItem {
                     name,
-                    expr: expr.clone(),
+                    kind: ProjKind::Expr(expr.clone()),
                 });
             }
             SelectItem::ExprWithAlias { expr, alias } => out.push(ProjItem {
                 name: alias.value.clone(),
-                expr: expr.clone(),
+                kind: ProjKind::Expr(expr.clone()),
             }),
-            other => return Err(SqlError::Unsupported(format!("projection: {other:?}"))),
         }
     }
     Ok(out)
+}
+
+/// A resolver from a column reference (optional table qualifier + name) to its
+/// index in a row. Implemented by a single [`Table`] and by a joined
+/// [`JoinSchema`].
+trait ColumnResolver {
+    /// Resolve `[qualifier.]name` to a row index, or error (not found / ambiguous).
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<usize>;
+    /// Each output column as `(qualifier, name)`, in row order (for `*`).
+    fn columns(&self) -> Vec<(Option<String>, String)>;
+}
+
+impl ColumnResolver for Table {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<usize> {
+        if let Some(q) = qualifier {
+            if q != self.name {
+                return Err(SqlError::NoSuchColumn(format!("{q}.{name}")));
+            }
+        }
+        self.column_index(name)
+            .ok_or_else(|| SqlError::NoSuchColumn(name.to_string()))
+    }
+
+    fn columns(&self) -> Vec<(Option<String>, String)> {
+        self.columns
+            .iter()
+            .map(|c| (Some(self.name.clone()), c.name.clone()))
+            .collect()
+    }
+}
+
+/// One column of a joined row: which source it came from, and its name.
+struct JoinCol {
+    qualifier: String,
+    name: String,
+}
+
+/// The schema of a (possibly joined) row: a flat, ordered list of columns, each
+/// tagged with the source table's alias/name so `t.col` resolves unambiguously.
+struct JoinSchema {
+    cols: Vec<JoinCol>,
+}
+
+impl JoinSchema {
+    /// The schema of a single base table under `qualifier` (its alias or name).
+    fn single(qualifier: &str, table: &Table) -> Self {
+        JoinSchema {
+            cols: table
+                .columns
+                .iter()
+                .map(|c| JoinCol {
+                    qualifier: qualifier.to_string(),
+                    name: c.name.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl ColumnResolver for JoinSchema {
+    fn resolve(&self, qualifier: Option<&str>, name: &str) -> Result<usize> {
+        let mut hit = None;
+        for (i, c) in self.cols.iter().enumerate() {
+            let q_ok = qualifier.is_none_or(|q| q == c.qualifier);
+            if q_ok && c.name == name {
+                if hit.is_some() {
+                    return Err(SqlError::Unsupported(format!(
+                        "ambiguous column reference '{name}' (qualify it with a table name)"
+                    )));
+                }
+                hit = Some(i);
+            }
+        }
+        hit.ok_or_else(|| match qualifier {
+            Some(q) => SqlError::NoSuchColumn(format!("{q}.{name}")),
+            None => SqlError::NoSuchColumn(name.to_string()),
+        })
+    }
+
+    fn columns(&self) -> Vec<(Option<String>, String)> {
+        self.cols
+            .iter()
+            .map(|c| (Some(c.qualifier.clone()), c.name.clone()))
+            .collect()
+    }
+}
+
+/// Resolve a column-reference expression (`col` or `t.col`) to a row index.
+fn resolve_col_expr(cols: &dyn ColumnResolver, expr: &Expr) -> Result<usize> {
+    match expr {
+        Expr::Identifier(id) => cols.resolve(None, &id.value),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            cols.resolve(Some(&parts[0].value), &parts[1].value)
+        }
+        other => Err(SqlError::Unsupported(format!("column reference: {other:?}"))),
+    }
+}
+
+/// Cross-join (cartesian product) of two materialized row sets, concatenating
+/// their schemas. Used for comma-separated `FROM` items and as the seed step.
+fn cross_join(
+    mut left_schema: JoinSchema,
+    left_rows: Vec<Vec<Value>>,
+    right_schema: JoinSchema,
+    right_rows: Vec<Vec<Value>>,
+) -> (JoinSchema, Vec<Vec<Value>>) {
+    let mut out = Vec::with_capacity(left_rows.len().saturating_mul(right_rows.len()));
+    for l in &left_rows {
+        for r in &right_rows {
+            let mut row = Vec::with_capacity(l.len() + r.len());
+            row.extend_from_slice(l);
+            row.extend_from_slice(r);
+            out.push(row);
+        }
+    }
+    left_schema.cols.extend(right_schema.cols);
+    (left_schema, out)
+}
+
+/// The `ON <expr>` of a join constraint, `None` for a constraint-free (cross)
+/// join. `USING` / `NATURAL` are not supported yet.
+fn constraint_on(c: &JoinConstraint) -> Result<Option<&Expr>> {
+    match c {
+        JoinConstraint::On(e) => Ok(Some(e)),
+        JoinConstraint::None => Ok(None),
+        other => Err(SqlError::Unsupported(format!("join constraint: {other:?}"))),
+    }
 }
 
 /// Remove duplicate rows in place, preserving first-seen order (for DISTINCT).
@@ -1454,18 +1808,11 @@ fn like_match(text: &str, pattern: &str) -> bool {
 
 /// Resolve `ORDER BY` items to `(column index, ascending)` pairs. Only simple
 /// column references are supported (ascending by default; `DESC` flips it).
-fn resolve_order_keys(items: &[OrderByExpr], table: &Table) -> Result<Vec<(usize, bool)>> {
+fn resolve_order_keys(items: &[OrderByExpr], cols: &dyn ColumnResolver) -> Result<Vec<(usize, bool)>> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
-        let Expr::Identifier(ident) = &item.expr else {
-            return Err(SqlError::Unsupported(format!(
-                "ORDER BY expression: {:?}",
-                item.expr
-            )));
-        };
-        let idx = table
-            .column_index(&ident.value)
-            .ok_or_else(|| SqlError::NoSuchColumn(ident.value.clone()))?;
+        // Supports `ORDER BY col` and `ORDER BY t.col`.
+        let idx = resolve_col_expr(cols, &item.expr)?;
         // `asc: None` means the default, which is ascending.
         keys.push((idx, item.asc != Some(false)));
     }
@@ -1622,7 +1969,7 @@ fn projection_has_aggregate(items: &[SelectItem]) -> bool {
 
 /// Parse a `GROUP BY` clause to a list of distinct key column indices. Only
 /// simple column references are supported.
-fn parse_group_by(group_by: &GroupByExpr, table: &Table) -> Result<Vec<usize>> {
+fn parse_group_by(group_by: &GroupByExpr, cols: &dyn ColumnResolver) -> Result<Vec<usize>> {
     match group_by {
         GroupByExpr::Expressions(exprs, modifiers) => {
             if !modifiers.is_empty() {
@@ -1630,12 +1977,7 @@ fn parse_group_by(group_by: &GroupByExpr, table: &Table) -> Result<Vec<usize>> {
             }
             let mut keys = Vec::with_capacity(exprs.len());
             for e in exprs {
-                let Expr::Identifier(id) = e else {
-                    return Err(SqlError::Unsupported(format!("GROUP BY expression: {e:?}")));
-                };
-                let idx = table
-                    .column_index(&id.value)
-                    .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone()))?;
+                let idx = resolve_col_expr(cols, e)?;
                 if !keys.contains(&idx) {
                     keys.push(idx);
                 }
@@ -1648,7 +1990,7 @@ fn parse_group_by(group_by: &GroupByExpr, table: &Table) -> Result<Vec<usize>> {
 
 /// Parse an aggregate function call (`COUNT`/`SUM`/`MIN`/`MAX`) to an
 /// [`Aggregate`]. `AVG` is rejected for now (it needs a floating-point type).
-fn parse_aggregate(f: &Function, table: &Table) -> Result<Aggregate> {
+fn parse_aggregate(f: &Function, cols: &dyn ColumnResolver) -> Result<Aggregate> {
     if f.over.is_some() || f.filter.is_some() || !f.within_group.is_empty() {
         return Err(SqlError::Unsupported(
             "window / FILTER / WITHIN GROUP aggregates".into(),
@@ -1671,12 +2013,10 @@ fn parse_aggregate(f: &Function, table: &Table) -> Result<Aggregate> {
     let FunctionArg::Unnamed(arg) = &list.args[0] else {
         return Err(SqlError::Unsupported("named aggregate argument".into()));
     };
-    // Resolve a column-identifier argument to its index.
+    // Resolve a column argument (`col` or `t.col`) to its index.
     let col_of = |arg: &FunctionArgExpr| -> Result<usize> {
         match arg {
-            FunctionArgExpr::Expr(Expr::Identifier(id)) => table
-                .column_index(&id.value)
-                .ok_or_else(|| SqlError::NoSuchColumn(id.value.clone())),
+            FunctionArgExpr::Expr(e) => resolve_col_expr(cols, e),
             other => Err(SqlError::Unsupported(format!(
                 "aggregate argument: {other:?}"
             ))),
@@ -3220,6 +3560,213 @@ mod tests {
                 Value::Int64(1),
                 Value::Text("x".into()),
             ]
+        );
+    }
+
+    // ---- joins ----------------------------------------------------------
+
+    fn seed_join(env: &Env) {
+        env.engine
+            .execute_autocommit("CREATE TABLE users (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "CREATE TABLE orders (id BIGINT PRIMARY KEY, user_id BIGINT, total BIGINT)",
+            )
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO users VALUES (1,'alice'),(2,'bob'),(3,'carol')")
+            .unwrap();
+        // alice: two orders, bob: one, carol: none; order 13 references no user.
+        env.engine
+            .execute_autocommit("INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,70),(13,99,5)")
+            .unwrap();
+    }
+
+    fn t(s: &str) -> Value {
+        Value::Text(s.into())
+    }
+
+    #[test]
+    fn inner_join_matches_on_key() {
+        let env = env();
+        seed_join(&env);
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT u.name, o.total FROM users u JOIN orders o \
+                     ON u.id = o.user_id ORDER BY o.total",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![t("alice"), Value::Int64(50)],
+                vec![t("bob"), Value::Int64(70)],
+                vec![t("alice"), Value::Int64(100)],
+            ]
+        );
+    }
+
+    #[test]
+    fn left_join_keeps_unmatched_left_with_nulls() {
+        let env = env();
+        seed_join(&env);
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT u.name, o.total FROM users u LEFT JOIN orders o \
+                     ON u.id = o.user_id ORDER BY u.name, o.total",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![t("alice"), Value::Int64(50)],
+                vec![t("alice"), Value::Int64(100)],
+                vec![t("bob"), Value::Int64(70)],
+                vec![t("carol"), Value::Null],
+            ]
+        );
+    }
+
+    #[test]
+    fn right_join_keeps_unmatched_right_with_nulls() {
+        let env = env();
+        seed_join(&env);
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT u.name, o.total FROM users u RIGHT JOIN orders o \
+                     ON u.id = o.user_id ORDER BY o.total",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![Value::Null, Value::Int64(5)], // order 13: no matching user
+                vec![t("alice"), Value::Int64(50)],
+                vec![t("bob"), Value::Int64(70)],
+                vec![t("alice"), Value::Int64(100)],
+            ]
+        );
+    }
+
+    #[test]
+    fn full_join_keeps_both_unmatched_sides() {
+        let env = env();
+        seed_join(&env);
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT u.name, o.total FROM users u FULL JOIN orders o ON u.id = o.user_id",
+                )
+                .unwrap(),
+        );
+        assert_eq!(r.len(), 5); // 3 matched + carol (no order) + order 13 (no user)
+        assert!(r.contains(&vec![t("carol"), Value::Null]));
+        assert!(r.contains(&vec![Value::Null, Value::Int64(5)]));
+    }
+
+    #[test]
+    fn cross_join_is_the_cartesian_product() {
+        let env = env();
+        seed_join(&env);
+        let comma = rows(
+            env.engine
+                .execute_autocommit("SELECT u.id, o.id FROM users u, orders o")
+                .unwrap(),
+        );
+        let keyword = rows(
+            env.engine
+                .execute_autocommit("SELECT u.id FROM users u CROSS JOIN orders o")
+                .unwrap(),
+        );
+        assert_eq!(comma.len(), 12); // 3 users × 4 orders
+        assert_eq!(keyword.len(), 12);
+    }
+
+    #[test]
+    fn self_join_resolves_through_aliases() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE emp (id BIGINT PRIMARY KEY, name TEXT, mgr BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO emp VALUES (1,'ceo',NULL),(2,'alice',1),(3,'bob',1)")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT e.name, m.name FROM emp e JOIN emp m ON e.mgr = m.id ORDER BY e.name",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![vec![t("alice"), t("ceo")], vec![t("bob"), t("ceo")]]
+        );
+    }
+
+    #[test]
+    fn join_with_where_and_aggregate() {
+        let env = env();
+        seed_join(&env);
+        // GROUP BY over a join: total spend per user that has orders.
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT u.name, SUM(o.total) FROM users u JOIN orders o \
+                     ON u.id = o.user_id GROUP BY u.name",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r,
+            vec![
+                vec![t("alice"), Value::Int64(150)],
+                vec![t("bob"), Value::Int64(70)],
+            ]
+        );
+
+        // WHERE over a joined row.
+        let r2 = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT o.total FROM users u JOIN orders o ON u.id = o.user_id \
+                     WHERE u.name = 'alice' ORDER BY o.total",
+                )
+                .unwrap(),
+        );
+        assert_eq!(r2, vec![vec![Value::Int64(50)], vec![Value::Int64(100)]]);
+    }
+
+    #[test]
+    fn star_over_a_join_expands_all_columns() {
+        let env = env();
+        seed_join(&env);
+        let out = env
+            .engine
+            .execute_autocommit("SELECT * FROM users u JOIN orders o ON u.id = o.user_id")
+            .unwrap();
+        match out {
+            Outcome::Select { columns, .. } => assert_eq!(columns.len(), 5), // id,name,id,user_id,total
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn ambiguous_unqualified_column_is_rejected() {
+        let env = env();
+        seed_join(&env);
+        // `id` exists in both tables: a bare reference must error.
+        assert!(
+            env.engine
+                .execute_autocommit("SELECT id FROM users u JOIN orders o ON u.id = o.user_id")
+                .is_err()
         );
     }
 }
