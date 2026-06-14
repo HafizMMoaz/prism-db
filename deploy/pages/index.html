@@ -167,13 +167,18 @@
       <svg class="anim" viewBox="0 0 720 360" role="img" aria-label="A beam of light enters a prism and splits into three rays: relational, document, and key-value.">
         <defs>
           <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stop-color="#EAF0FF"/><stop offset="1" stop-color="#F8E9FB"/>
+            <stop offset="0" stop-color="#DBE3FF"/><stop offset=".5" stop-color="#E8E0FF"/><stop offset="1" stop-color="#FBDFF1"/>
           </linearGradient>
+          <filter id="prismShadow" x="-40%" y="-40%" width="180%" height="180%">
+            <feDropShadow dx="0" dy="7" stdDeviation="11" flood-color="#3a2a6a" flood-opacity="0.14"/>
+          </filter>
         </defs>
         <!-- one engine: the incoming beam -->
         <path class="beam" d="M48 180 H286" pathLength="1"/>
         <!-- the prism -->
-        <polygon class="glass" points="286,120 286,250 392,185"/>
+        <polygon class="glass" points="286,120 286,250 392,185" filter="url(#prismShadow)"/>
+        <!-- highlight on the lit (left) face -->
+        <line x1="286" y1="124" x2="286" y2="246" stroke="#fff" stroke-width="1.5" opacity=".7"/>
         <!-- refracted into three models -->
         <path class="ray r1" d="M389 183 L600 112" pathLength="1"/>
         <path class="ray r2" d="M392 185 L600 188" pathLength="1"/>
