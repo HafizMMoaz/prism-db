@@ -47,6 +47,28 @@ Targets: Linux `x86_64`/`aarch64`, macOS `x86_64`/`aarch64`, Windows `x86_64`.
 Use a pre-release tag (e.g. `v0.1.0-rc.1`) to validate the pipeline without a
 "latest" release; dist marks `-rc`/`-alpha`/`-beta` tags as pre-releases.
 
+## Publishing the Node SDK (npm)
+
+The TypeScript client in [`sdks/node`](../../sdks/node) (`@prismdb/client`) is
+published to npm by [`.github/workflows/npm-publish.yml`](../../.github/workflows/npm-publish.yml).
+It runs automatically when a GitHub Release is published, and can be dispatched
+manually (Actions → **Publish Node SDK** → Run workflow → enter the tag) to ship
+the SDK for an existing release. The job checks out the tag, sets the package
+version from it, builds, tests, and runs `npm publish --provenance --access public`.
+
+One-time setup:
+
+1. **npm org / scope.** `@prismdb/client` is a scoped package; create the
+   `prismdb` organization on npmjs.com (free for public packages). To publish
+   unscoped instead, rename `name` in `sdks/node/package.json` (e.g.
+   `prismdb-client`) and drop `publishConfig.access`.
+2. **`NPM_TOKEN` secret.** On npmjs.com create an **automation** access token with
+   publish rights to the `@prismdb` scope, and add it as a repo secret
+   `NPM_TOKEN` on `HafizMMoaz/prism-db`.
+
+The SDK version follows the release tag. To publish by hand instead:
+`cd sdks/node && npm publish --access public` (after `npm login`).
+
 ## Changing the build
 
 Edit `dist-workspace.toml` (installers, targets, tap, …) and **regenerate** CI —
