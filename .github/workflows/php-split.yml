@@ -1,0 +1,46 @@
+name: Split PHP SDK
+
+# Packagist reads composer.json from a repository root and has no subdirectory
+# support, so the PHP SDK (sdks/php) is mirrored to a dedicated read-only repo
+# whose root IS the package: HafizMMoaz/prism-db-php. Packagist watches that repo
+# (package name stays `prismdb/client`, from composer.json).
+#
+# Runs on every v* tag (propagating the tag, which is the version Packagist
+# publishes) and on manual dispatch (optionally with a tag to cut the first
+# release). Requires the PHP_SPLIT_TOKEN secret: a token with push access to
+# prism-db-php (fine-grained PAT with Contents: read/write, or a classic PAT with
+# the `repo` scope).
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to apply to the split repo (e.g. v0.1.0); blank just mirrors main"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  split:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history for the subtree split
+
+      - name: Split sdks/php -> HafizMMoaz/prism-db-php
+        uses: symplify/monorepo-split-github-action@v2.3.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
+        with:
+          tag: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
+          package-directory: "sdks/php"
+          split-repository-organization: "HafizMMoaz"
+          split-repository-name: "prism-db-php"
+          branch: "main"
+          user-name: "Hafiz Muhammad Moaz"
+          user-email: "hafizmoazkhalid@gmail.com"

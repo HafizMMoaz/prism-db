@@ -1,0 +1,5 @@
+# Keep the published Composer package lean: dev-only paths are excluded from
+# `composer install` dist archives (export-ignore).
+/tests           export-ignore
+/examples        export-ignore
+/.gitattributes  export-ignore
