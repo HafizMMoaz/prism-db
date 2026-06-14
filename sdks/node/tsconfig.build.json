@@ -1,0 +1,11 @@
+{
+  "// Publish build": "src/ only, emitted flat to dist/ so the package entry points (./dist/index.js, ./dist/index.d.ts) resolve. No test/example output, no source maps.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "dist",
+    "sourceMap": false,
+    "declarationMap": false
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -3,6 +3,27 @@
   "version": "0.1.0",
   "description": "Pure-TypeScript client for PrismDB over the binary wire protocol (no native build).",
   "license": "Apache-2.0",
+  "author": "The Prism authors",
+  "homepage": "https://github.com/HafizMMoaz/prism-db/tree/main/sdks/node#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HafizMMoaz/prism-db.git",
+    "directory": "sdks/node"
+  },
+  "bugs": {
+    "url": "https://github.com/HafizMMoaz/prism-db/issues"
+  },
+  "keywords": [
+    "prismdb",
+    "prism",
+    "database",
+    "client",
+    "driver",
+    "sql",
+    "document",
+    "key-value",
+    "multi-model"
+  ],
   "type": "module",
   "exports": {
     ".": {
@@ -14,15 +35,20 @@
   "types": "./dist/index.d.ts",
   "files": [
     "dist",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=20"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "test": "tsc -p tsconfig.json && node --test \"dist/test/*.test.js\"",
-    "example": "tsc -p tsconfig.json && node dist/examples/quickstart.js"
+    "build": "tsc -p tsconfig.build.json",
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/test/*.test.js\"",
+    "example": "tsc -p tsconfig.test.json && node dist-test/examples/quickstart.js",
+    "prepublishOnly": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

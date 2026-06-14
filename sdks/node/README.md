@@ -1,6 +1,6 @@
 # @prismdb/client
 
-A **pure-TypeScript** client for [PrismDB](../../README.md), speaking the binary
+A **pure-TypeScript** client for [PrismDB](https://github.com/HafizMMoaz/prism-db), speaking the binary
 wire protocol directly over a TCP (or TLS) socket. No native addon, no build
 toolchain beyond `tsc` — it runs anywhere Node does.
 

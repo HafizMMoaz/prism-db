@@ -1,0 +1,8 @@
+{
+  "// Test/example build": "compiles src + test + examples to dist-test/ (structure preserved), kept separate from the publish output in dist/.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-test"
+  },
+  "include": ["src/**/*.ts", "test/**/*.ts", "examples/**/*.ts"]
+}

@@ -1,0 +1,51 @@
+name: Publish Node SDK
+
+# Publishes sdks/node (@prismdb/client) to npm. Runs when a GitHub Release is
+# published (alongside the dist binaries), and can be dispatched manually to
+# publish a specific tag (e.g. to ship the SDK for an existing release).
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to publish from (e.g. v0.1.0)"
+        required: true
+
+permissions:
+  contents: read
+  id-token: write # npm provenance attestation
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag and version
+        id: v
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.v.outputs.tag }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Install, version, build, test
+        working-directory: sdks/node
+        run: |
+          npm ci
+          npm version "${{ steps.v.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm run build
+          npm test
+
+      - name: Publish to npm
+        working-directory: sdks/node
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
