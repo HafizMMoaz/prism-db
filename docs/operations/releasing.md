@@ -80,6 +80,21 @@ One-time setup:
 To publish by hand instead: `cd sdks/node && npm publish --access public` (after
 `npm login`).
 
+## Package repository (apt / yum)
+
+[`pages-repo.yml`](../../.github/workflows/pages-repo.yml) builds GPG-signed APT
+and YUM repositories from **every** released `.deb`/`.rpm` and publishes them to
+GitHub Pages (`https://hafizmmoaz.github.io/prism-db/`), so users can
+`apt install prismdb` / `dnf install prismdb`. It runs on `release: published`
+(after the packages are attached) and is dispatchable. A `verify-apt` job installs
+from the freshly published repo to confirm the signature and service.
+
+One-time setup (already done): GitHub Pages source set to **GitHub Actions**
+(`gh api -X POST repos/<owner>/<repo>/pages -f build_type=workflow`); a dedicated
+GPG signing key with its private half in the `GPG_PRIVATE_KEY` secret and its
+public half committed at `deploy/prismdb-archive-keyring.asc` (served as the repo
+key). To rotate the key, regenerate it, replace the secret and that file.
+
 ## Changing the build
 
 Edit `dist-workspace.toml` (installers, targets, tap, …) and **regenerate** CI —

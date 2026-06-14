@@ -30,16 +30,33 @@ the server as a managed service that starts on boot, see
 ### Debian / Ubuntu and Fedora / RHEL packages
 
 Native packages install the binaries **and** register `prismd` as a systemd
-service that starts on boot (bound to localhost) — no extra setup. Download the
-`.deb` or `.rpm` from the [latest release](https://github.com/HafizMMoaz/prism-db/releases/latest):
+service that starts on boot (bound to localhost) — no extra setup.
+
+**From the package repository** (recommended — `apt upgrade` / `dnf upgrade`
+keeps it current):
 
 ```bash
 # Debian / Ubuntu
-sudo apt install ./prismdb_0.1.0-1_amd64.deb
-
-# Fedora / RHEL / CentOS
-sudo dnf install ./prismdb-0.1.0-1.x86_64.rpm
+curl -fsSL https://hafizmmoaz.github.io/prism-db/prismdb-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
+echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] https://hafizmmoaz.github.io/prism-db/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
+sudo apt update && sudo apt install prismdb
 ```
+
+```bash
+# Fedora / RHEL / CentOS
+sudo tee /etc/yum.repos.d/prismdb.repo >/dev/null <<'EOF'
+[prismdb]
+name=PrismDB
+baseurl=https://hafizmmoaz.github.io/prism-db/rpm
+enabled=1
+gpgcheck=1
+gpgkey=https://hafizmmoaz.github.io/prism-db/prismdb-archive-keyring.asc
+EOF
+sudo dnf install prismdb
+```
+
+**Or install a single file** from the [latest release](https://github.com/HafizMMoaz/prism-db/releases/latest):
+`sudo apt install ./prismdb_*.deb` / `sudo dnf install ./prismdb-*.rpm`.
 
 The service is configured through `/etc/prismdb/prismd.conf` (a conffile, so your
 edits survive upgrades); `systemctl status prismd` and `journalctl -u prismd`

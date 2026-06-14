@@ -37,6 +37,19 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/HafizMMoaz/prism-d
 
 …or download the `.msi` from the [latest release](https://github.com/HafizMMoaz/prism-db/releases/latest).
 
+**Debian / Ubuntu / Fedora / RHEL** — the `apt`/`dnf` package installs the
+binaries **and** starts `prismd` as a systemd service:
+
+```sh
+# Debian / Ubuntu
+curl -fsSL https://hafizmmoaz.github.io/prism-db/prismdb-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
+echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] https://hafizmmoaz.github.io/prism-db/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
+sudo apt update && sudo apt install prismdb
+```
+
+(Fedora/RHEL repo and direct `.deb`/`.rpm` downloads in
+[docs/operations/install.md](docs/operations/install.md).)
+
 Prefer to build it yourself? `cargo install --git https://github.com/HafizMMoaz/prism-db prismdb`.
 
 See [docs/operations/install.md](docs/operations/install.md) for running `prismd`
