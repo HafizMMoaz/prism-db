@@ -1321,7 +1321,12 @@ impl SqlEngine {
     /// Evaluate a scalar function call (date/time, string, numeric helpers).
     /// Aggregate names are rejected here — they are handled by the aggregate
     /// path, not per-row evaluation.
-    fn eval_function(&self, f: &Function, row: &[Value], cols: &dyn ColumnResolver) -> Result<Value> {
+    fn eval_function(
+        &self,
+        f: &Function,
+        row: &[Value],
+        cols: &dyn ColumnResolver,
+    ) -> Result<Value> {
         let name = object_name(&f.name).to_ascii_uppercase();
         if is_aggregate_name(&name) {
             return Err(SqlError::Unsupported(format!(
@@ -1615,7 +1620,9 @@ fn resolve_col_expr(cols: &dyn ColumnResolver, expr: &Expr) -> Result<usize> {
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             cols.resolve(Some(&parts[0].value), &parts[1].value)
         }
-        other => Err(SqlError::Unsupported(format!("column reference: {other:?}"))),
+        other => Err(SqlError::Unsupported(format!(
+            "column reference: {other:?}"
+        ))),
     }
 }
 
@@ -1808,7 +1815,10 @@ fn like_match(text: &str, pattern: &str) -> bool {
 
 /// Resolve `ORDER BY` items to `(column index, ascending)` pairs. Only simple
 /// column references are supported (ascending by default; `DESC` flips it).
-fn resolve_order_keys(items: &[OrderByExpr], cols: &dyn ColumnResolver) -> Result<Vec<(usize, bool)>> {
+fn resolve_order_keys(
+    items: &[OrderByExpr],
+    cols: &dyn ColumnResolver,
+) -> Result<Vec<(usize, bool)>> {
     let mut keys = Vec::with_capacity(items.len());
     for item in items {
         // Supports `ORDER BY col` and `ORDER BY t.col`.
@@ -3579,7 +3589,9 @@ mod tests {
             .unwrap();
         // alice: two orders, bob: one, carol: none; order 13 references no user.
         env.engine
-            .execute_autocommit("INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,70),(13,99,5)")
+            .execute_autocommit(
+                "INSERT INTO orders VALUES (10,1,100),(11,1,50),(12,2,70),(13,99,5)",
+            )
             .unwrap();
     }
 
