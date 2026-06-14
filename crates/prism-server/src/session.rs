@@ -1203,6 +1203,7 @@ fn sql_type_name(ty: Type) -> &'static str {
     match ty {
         Type::Int64 => "BIGINT",
         Type::Double => "DOUBLE",
+        Type::Timestamp => "TIMESTAMP",
         Type::Text => "TEXT",
         Type::Bool => "BOOL",
     }
@@ -1427,6 +1428,7 @@ fn sql_cell(v: &SqlValue) -> Option<WireValue> {
         SqlValue::Bool(b) => Some(WireValue::Bool(*b)),
         SqlValue::Int64(n) => Some(WireValue::Int64(*n)),
         SqlValue::Double(d) => Some(WireValue::Double(*d)),
+        SqlValue::Timestamp(t) => Some(WireValue::Timestamp(*t)),
         SqlValue::Text(s) => Some(WireValue::Str(s.clone())),
     }
 }

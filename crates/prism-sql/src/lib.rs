@@ -10,8 +10,10 @@
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
 //! index seek for `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`AVG`/
 //! `MIN`/`MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
-//! `BOOL`/`BIGINT`/`DOUBLE`/`TEXT` (integers widen to doubles in mixed
-//! arithmetic and DOUBLE columns). Multi-table queries support `INNER` / `LEFT` /
+//! `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/`TEXT` (integers widen to doubles in
+//! mixed arithmetic; `TIMESTAMP` is epoch microseconds and parses from
+//! `'YYYY-MM-DD[ HH:MM:SS]'` strings; `CAST(x AS <type>)` converts between
+//! scalars). Multi-table queries support `INNER` / `LEFT` /
 //! `RIGHT` / `FULL OUTER` / `CROSS` joins (and comma-separated cartesian
 //! products and self-joins via aliases) by nested loop, with `t.col`-qualified
 //! column references throughout `SELECT`/`WHERE`/`ON`/`GROUP BY`/`HAVING`/
@@ -1388,6 +1390,16 @@ impl SqlEngine {
             // a floating-point type lands.
             Expr::Ceil { expr: inner, field } => self.ceil_floor(inner, field, row, cols, true),
             Expr::Floor { expr: inner, field } => self.ceil_floor(inner, field, row, cols, false),
+            // `CAST(expr AS <type>)` (and `expr::type`) — convert between scalar
+            // types, e.g. `CAST('2021-06-15' AS TIMESTAMP)` or `CAST(x AS DOUBLE)`.
+            Expr::Cast {
+                expr: inner,
+                data_type,
+                ..
+            } => {
+                let v = self.eval(inner, row, cols)?;
+                cast_value(v, map_data_type(data_type)?)
+            }
             other => Err(SqlError::Unsupported(format!("expression: {other:?}"))),
         }
     }
@@ -1480,6 +1492,7 @@ impl SqlEngine {
                         Value::Text(s) => out.push_str(&s),
                         Value::Int64(n) => out.push_str(&n.to_string()),
                         Value::Double(d) => out.push_str(&types::format_double(d)),
+                        Value::Timestamp(t) => out.push_str(&types::format_timestamp(t)),
                         Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
                     }
                 }
@@ -1664,6 +1677,7 @@ fn compare(op: &BinaryOperator, l: &Value, r: &Value) -> bool {
         (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
+        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
         // Numeric comparison across int/double (e.g. `d > 3`).
         _ => match (as_f64(l), as_f64(r)) {
             (Some(x), Some(y)) => match x.partial_cmp(&y) {
@@ -1946,10 +1960,12 @@ enum DatePart {
 fn date_part(v: Value, part: DatePart) -> Result<Value> {
     let secs = match v {
         Value::Int64(n) => n,
+        // A TIMESTAMP is microseconds; reduce to whole seconds for the calendar.
+        Value::Timestamp(micros) => micros.div_euclid(1_000_000),
         Value::Null => return Ok(Value::Null),
         other => {
             return Err(SqlError::Type(format!(
-                "date function expects an epoch-seconds integer, got {other:?}"
+                "date function expects a timestamp or epoch-seconds integer, got {other:?}"
             )));
         }
     };
@@ -2030,6 +2046,42 @@ fn arith(op: &BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
         other => return Err(SqlError::Unsupported(format!("operator: {other}"))),
     };
     Ok(Value::Double(out))
+}
+
+/// Convert a value to `target` (the `CAST` semantics). NULL passes through.
+fn cast_value(v: Value, target: Type) -> Result<Value> {
+    if matches!(v, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let bad = |from: &Value, to: &str| SqlError::Type(format!("cannot cast {from:?} to {to}"));
+    Ok(match target {
+        Type::Bool => match v {
+            Value::Bool(b) => Value::Bool(b),
+            Value::Int64(n) => Value::Bool(n != 0),
+            other => return Err(bad(&other, "BOOL")),
+        },
+        Type::Int64 => match v {
+            Value::Int64(n) => Value::Int64(n),
+            Value::Double(d) => Value::Int64(d as i64),
+            Value::Bool(b) => Value::Int64(i64::from(b)),
+            Value::Timestamp(t) => Value::Int64(t),
+            Value::Text(ref s) => Value::Int64(s.trim().parse().map_err(|_| bad(&v, "BIGINT"))?),
+            other => return Err(bad(&other, "BIGINT")),
+        },
+        Type::Double => match v {
+            Value::Double(d) => Value::Double(d),
+            Value::Int64(n) => Value::Double(n as f64),
+            Value::Text(ref s) => Value::Double(s.trim().parse().map_err(|_| bad(&v, "DOUBLE"))?),
+            other => return Err(bad(&other, "DOUBLE")),
+        },
+        Type::Timestamp => match v {
+            Value::Timestamp(t) => Value::Timestamp(t),
+            Value::Int64(n) => Value::Timestamp(n),
+            Value::Text(ref s) => Value::Timestamp(types::parse_timestamp(s)?),
+            other => return Err(bad(&other, "TIMESTAMP")),
+        },
+        Type::Text => Value::Text(v.display()),
+    })
 }
 
 /// SQL `LIKE` matching with `%` (any run, including empty) and `_` (exactly one
@@ -2128,6 +2180,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         // Numeric ordering across int/double (NaN sorts as Equal here).
         _ => match (as_f64(a), as_f64(b)) {
             (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
@@ -2409,7 +2462,7 @@ fn key_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
 /// sign-flipped big-endian form so the byte order matches numeric order.
 fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
     Ok(match value {
-        Value::Int64(n) => (*n as u64 ^ (1u64 << 63)).to_be_bytes().to_vec(),
+        Value::Int64(n) | Value::Timestamp(n) => (*n as u64 ^ (1u64 << 63)).to_be_bytes().to_vec(),
         // Order-preserving float key: flip the sign bit for positives, all bits
         // for negatives, so the big-endian bytes sort in numeric order.
         Value::Double(d) => {
@@ -2478,6 +2531,7 @@ fn map_data_type(dt: &DataType) -> Result<Type> {
         DataType::Float(_) | DataType::Real | DataType::Double(_) | DataType::DoublePrecision => {
             Ok(Type::Double)
         }
+        DataType::Timestamp(_, _) | DataType::Datetime(_) | DataType::Date => Ok(Type::Timestamp),
         DataType::Text
         | DataType::String(_)
         | DataType::Varchar(_)
@@ -4288,5 +4342,52 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(by_ordinal, by_alias);
+    }
+
+    #[test]
+    fn timestamp_type_parse_extract_and_cast() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE e (id BIGINT, at TIMESTAMP)")
+            .unwrap();
+        // A string in a TIMESTAMP column is parsed (date, or date + time).
+        env.engine
+            .execute_autocommit(
+                "INSERT INTO e VALUES (1, '2021-06-15 12:30:00'), (2, '2020-01-02'), \
+                 (3, '2022-12-31 23:59:59')",
+            )
+            .unwrap();
+
+        // YEAR/MONTH/DAY extract over a TIMESTAMP column.
+        let parts = rows(
+            env.engine
+                .execute_autocommit("SELECT YEAR(at), MONTH(at), DAY(at) FROM e WHERE id = 1")
+                .unwrap(),
+        );
+        assert_eq!(
+            parts[0],
+            vec![Value::Int64(2021), Value::Int64(6), Value::Int64(15)]
+        );
+
+        // WHERE against a CAST string literal, and ORDER BY a timestamp.
+        let after = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT id FROM e WHERE at >= CAST('2021-01-01' AS TIMESTAMP) ORDER BY at",
+                )
+                .unwrap(),
+        );
+        assert_eq!(after, vec![vec![Value::Int64(1)], vec![Value::Int64(3)]]);
+
+        // CAST a timestamp to text yields the canonical display form.
+        let text = rows(
+            env.engine
+                .execute_autocommit("SELECT CAST(at AS TEXT) FROM e WHERE id = 2")
+                .unwrap(),
+        );
+        assert_eq!(
+            text[0],
+            vec![Value::Text("2020-01-02 00:00:00".to_string())]
+        );
     }
 }
