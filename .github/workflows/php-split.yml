@@ -28,7 +28,7 @@ jobs:
   split:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0 # full history for the subtree split
 
@@ -38,9 +38,9 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.PHP_SPLIT_TOKEN }}
         with:
           tag: ${{ github.event_name == 'push' && github.ref_name || github.event.inputs.tag }}
-          package-directory: "sdks/php"
-          split-repository-organization: "HafizMMoaz"
-          split-repository-name: "prism-db-php"
+          package_directory: "sdks/php"
+          repository_organization: "HafizMMoaz"
+          repository_name: "prism-db-php"
           branch: "main"
-          user-name: "Hafiz Muhammad Moaz"
-          user-email: "hafizmoazkhalid@gmail.com"
+          user_name: "Hafiz Muhammad Moaz"
+          user_email: "hafizmoazkhalid@gmail.com"
