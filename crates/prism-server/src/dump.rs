@@ -213,6 +213,7 @@ fn render_insert(name: &str, columns: &[String], row: &[Value]) -> Result<String
 fn sql_type(ty: Type) -> &'static str {
     match ty {
         Type::Int64 => "BIGINT",
+        Type::Double => "DOUBLE",
         Type::Text => "TEXT",
         Type::Bool => "BOOL",
     }
@@ -223,6 +224,8 @@ fn sql_literal(v: &Value) -> String {
         Value::Null => "NULL".to_string(),
         Value::Bool(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
         Value::Int64(n) => n.to_string(),
+        // `{:?}` keeps a decimal point (e.g. `2.0`) so it re-parses as a double.
+        Value::Double(d) => format!("{d:?}"),
         Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }

@@ -6,8 +6,10 @@
 //! This is the payload the record store stores; the 24-byte MVCC header is added
 //! by the record store, not here.
 //!
-//! Scope (this slice): `Bool`, `Int64`, `Text`. More types (`Int32`, floats,
+//! Scope (this slice): `Bool`, `Int64`, `Double`, `Text`. More types (`Int32`,
 //! `Timestamp`, `Blob`) slot into the same layout later.
+
+use std::hash::{Hash, Hasher};
 
 use crate::error::{Result, SqlError};
 
@@ -18,6 +20,8 @@ pub enum Type {
     Bool,
     /// 64-bit signed integer.
     Int64,
+    /// 64-bit IEEE-754 floating point.
+    Double,
     /// UTF-8 text.
     Text,
 }
@@ -28,13 +32,19 @@ impl Type {
         match self {
             Type::Bool => Some(1),
             Type::Int64 => Some(8),
+            Type::Double => Some(8),
             Type::Text => None,
         }
     }
 }
 
 /// A SQL value.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+///
+/// `PartialEq`/`Eq`/`Hash` are implemented by hand because `f64` is neither
+/// `Eq` nor `Hash`; `Double` compares and hashes by its bit pattern, which gives
+/// a total, hashable equality suitable for `DISTINCT` / `GROUP BY` keys. SQL's
+/// numeric comparison operators go through `compare`/`value_cmp`, not this.
+#[derive(Clone, Debug)]
 pub enum Value {
     /// SQL NULL.
     Null,
@@ -42,8 +52,37 @@ pub enum Value {
     Bool(bool),
     /// 64-bit integer.
     Int64(i64),
+    /// 64-bit float.
+    Double(f64),
     /// UTF-8 text.
     Text(String),
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Null, Value::Null) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Int64(a), Value::Int64(b)) => a == b,
+            (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+            (Value::Text(a), Value::Text(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl Hash for Value {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Value::Null => 0u8.hash(state),
+            Value::Bool(b) => (1u8, b).hash(state),
+            Value::Int64(n) => (2u8, n).hash(state),
+            Value::Double(d) => (3u8, d.to_bits()).hash(state),
+            Value::Text(s) => (4u8, s).hash(state),
+        }
+    }
 }
 
 impl Value {
@@ -54,6 +93,7 @@ impl Value {
             (Value::Null, _)
                 | (Value::Bool(_), Type::Bool)
                 | (Value::Int64(_), Type::Int64)
+                | (Value::Double(_), Type::Double)
                 | (Value::Text(_), Type::Text)
         )
     }
@@ -64,8 +104,19 @@ impl Value {
             Value::Null => "NULL".to_string(),
             Value::Bool(b) => b.to_string(),
             Value::Int64(n) => n.to_string(),
+            Value::Double(d) => format_double(*d),
             Value::Text(s) => s.clone(),
         }
+    }
+}
+
+/// Render a double so whole values keep a trailing `.0` (e.g. `2` -> `2.0`),
+/// distinguishing them from integers in result output.
+pub(crate) fn format_double(d: f64) -> String {
+    if d.is_finite() && d == d.trunc() {
+        format!("{d:.1}")
+    } else {
+        d.to_string()
     }
 }
 
@@ -88,6 +139,15 @@ pub fn encode_row(types: &[Type], values: &[Value]) -> Result<Vec<u8>> {
         .collect();
 
     for (i, (&ty, value)) in types.iter().zip(values).enumerate() {
+        // Widen an integer literal to fill a DOUBLE column (e.g. `… VALUES (5)`).
+        let coerced;
+        let value = match (ty, value) {
+            (Type::Double, Value::Int64(n)) => {
+                coerced = Value::Double(*n as f64);
+                &coerced
+            }
+            _ => value,
+        };
         if !value.type_matches(ty) {
             return Err(SqlError::Type(format!(
                 "value {value:?} does not match {ty:?}"
@@ -186,6 +246,7 @@ fn encode_fixed(value: &Value, out: &mut Vec<u8>) {
     match value {
         Value::Bool(b) => out.push(u8::from(*b)),
         Value::Int64(n) => out.extend_from_slice(&n.to_le_bytes()),
+        Value::Double(d) => out.extend_from_slice(&d.to_le_bytes()),
         _ => unreachable!("encode_fixed called on a non-fixed value"),
     }
 }
@@ -197,6 +258,11 @@ fn decode_fixed(ty: Type, slice: &[u8]) -> Result<Value> {
             slice
                 .try_into()
                 .map_err(|_| SqlError::Corrupt("bad int64".into()))?,
+        )),
+        Type::Double => Value::Double(f64::from_le_bytes(
+            slice
+                .try_into()
+                .map_err(|_| SqlError::Corrupt("bad double".into()))?,
         )),
         Type::Text => unreachable!("decode_fixed called on Text"),
     })
@@ -252,13 +318,14 @@ mod tests {
     proptest! {
         #[test]
         fn arbitrary_rows_roundtrip(
-            cols in proptest::collection::vec(0u8..3, 1..8),
+            cols in proptest::collection::vec(0u8..4, 1..8),
             seed in any::<u64>(),
         ) {
             // Build a schema from the column-kind codes and a deterministic row.
             let types: Vec<Type> = cols.iter().map(|c| match c {
                 0 => Type::Bool,
                 1 => Type::Int64,
+                2 => Type::Double,
                 _ => Type::Text,
             }).collect();
             let mut s = seed;
@@ -270,6 +337,7 @@ mod tests {
                     match t {
                         Type::Bool => Value::Bool(next() % 2 == 0),
                         Type::Int64 => Value::Int64(next() as i64),
+                        Type::Double => Value::Double((next() % 1_000_000) as f64 / 7.0),
                         Type::Text => Value::Text(format!("v{}", next() % 1000)),
                     }
                 }

@@ -267,6 +267,7 @@ fn type_code(ty: Type) -> u8 {
         Type::Bool => 0,
         Type::Int64 => 1,
         Type::Text => 2,
+        Type::Double => 3,
     }
 }
 
@@ -275,6 +276,7 @@ fn type_from_code(code: u8) -> Result<Type> {
         0 => Ok(Type::Bool),
         1 => Ok(Type::Int64),
         2 => Ok(Type::Text),
+        3 => Ok(Type::Double),
         other => Err(ServerError::Corrupt(format!("bad column type {other}"))),
     }
 }

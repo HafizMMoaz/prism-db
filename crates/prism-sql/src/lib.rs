@@ -8,9 +8,10 @@
 //! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
-//! index seek for `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`MIN`/
-//! `MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
-//! `BOOL`/`BIGINT`/`TEXT`. Multi-table queries support `INNER` / `LEFT` /
+//! index seek for `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`AVG`/
+//! `MIN`/`MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
+//! `BOOL`/`BIGINT`/`DOUBLE`/`TEXT` (integers widen to doubles in mixed
+//! arithmetic and DOUBLE columns). Multi-table queries support `INNER` / `LEFT` /
 //! `RIGHT` / `FULL OUTER` / `CROSS` joins (and comma-separated cartesian
 //! products and self-joins via aliases) by nested loop, with `t.col`-qualified
 //! column references throughout `SELECT`/`WHERE`/`ON`/`GROUP BY`/`HAVING`/
@@ -23,7 +24,6 @@
 //! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
 //! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
 //! the select list, and `HAVING`. Deferred: `USING`/`NATURAL` join constraints,
-//! `AVG` and fractional `ROUND`/`CEIL`/`FLOOR` (need a floating-point type),
 //! `ORDER BY` over aggregate output, updating a primary-key column, join
 //! predicate pushdown / index nested-loop, the formal bind/rewrite/plan IR. The
 //! current executor interprets the parsed AST directly against the catalog; the
@@ -1216,7 +1216,8 @@ impl SqlEngine {
                     match (op, self.eval(inner, row, cols)?) {
                         (_, Value::Null) => Ok(Value::Null),
                         (UnaryOperator::Minus, Value::Int64(n)) => Ok(Value::Int64(-n)),
-                        (UnaryOperator::Plus, v @ Value::Int64(_)) => Ok(v),
+                        (UnaryOperator::Minus, Value::Double(d)) => Ok(Value::Double(-d)),
+                        (UnaryOperator::Plus, v @ (Value::Int64(_) | Value::Double(_))) => Ok(v),
                         (_, other) => Err(SqlError::Type(format!(
                             "cannot apply unary {op} to {other:?}"
                         ))),
@@ -1377,23 +1378,36 @@ impl SqlEngine {
             // `CEIL`/`FLOOR` parse to their own nodes (not function calls).
             // Integer operands are already whole, so both are the identity until
             // a floating-point type lands.
-            Expr::Ceil { expr: inner, field } | Expr::Floor { expr: inner, field } => {
-                match field {
-                    CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
-                    | CeilFloorKind::Scale(_) => {}
-                    CeilFloorKind::DateTimeField(_) => {
-                        return Err(SqlError::Unsupported("CEIL/FLOOR TO <unit>".into()));
-                    }
-                }
-                match self.eval(inner, row, cols)? {
-                    v @ Value::Int64(_) => Ok(v),
-                    Value::Null => Ok(Value::Null),
-                    other => Err(SqlError::Type(format!(
-                        "CEIL/FLOOR expects a number, got {other:?}"
-                    ))),
-                }
-            }
+            Expr::Ceil { expr: inner, field } => self.ceil_floor(inner, field, row, cols, true),
+            Expr::Floor { expr: inner, field } => self.ceil_floor(inner, field, row, cols, false),
             other => Err(SqlError::Unsupported(format!("expression: {other:?}"))),
+        }
+    }
+
+    /// Shared implementation of `CEIL`/`FLOOR` (which parse to their own AST
+    /// nodes). Integers pass through unchanged; doubles round toward +∞ (ceil)
+    /// or −∞ (floor).
+    fn ceil_floor(
+        &self,
+        inner: &Expr,
+        field: &CeilFloorKind,
+        row: &[Value],
+        cols: &dyn ColumnResolver,
+        is_ceil: bool,
+    ) -> Result<Value> {
+        match field {
+            CeilFloorKind::DateTimeField(DateTimeField::NoDateTime) | CeilFloorKind::Scale(_) => {}
+            CeilFloorKind::DateTimeField(_) => {
+                return Err(SqlError::Unsupported("CEIL/FLOOR TO <unit>".into()));
+            }
+        }
+        match self.eval(inner, row, cols)? {
+            v @ Value::Int64(_) => Ok(v),
+            Value::Double(d) => Ok(Value::Double(if is_ceil { d.ceil() } else { d.floor() })),
+            Value::Null => Ok(Value::Null),
+            other => Err(SqlError::Type(format!(
+                "CEIL/FLOOR expects a number, got {other:?}"
+            ))),
         }
     }
 
@@ -1432,9 +1446,10 @@ impl SqlEngine {
             // ── numeric ──
             "ABS" => match arg(0)? {
                 Value::Int64(n) => Ok(Value::Int64(n.abs())),
+                Value::Double(d) => Ok(Value::Double(d.abs())),
                 Value::Null => Ok(Value::Null),
                 other => Err(SqlError::Type(format!(
-                    "ABS expects an integer, got {other:?}"
+                    "ABS expects a number, got {other:?}"
                 ))),
             },
             "MOD" => arith(&BinaryOperator::Modulo, &arg(0)?, &arg(1)?),
@@ -1456,6 +1471,7 @@ impl SqlEngine {
                         Value::Null => {}
                         Value::Text(s) => out.push_str(&s),
                         Value::Int64(n) => out.push_str(&n.to_string()),
+                        Value::Double(d) => out.push_str(&types::format_double(d)),
                         Value::Bool(b) => out.push_str(if b { "true" } else { "false" }),
                     }
                 }
@@ -1564,23 +1580,42 @@ impl SqlEngine {
                     };
                     Ok(Value::Int64(rounded))
                 }
+                Value::Double(d) => {
+                    // ROUND(x[, scale]) to `scale` decimal places (default 0).
+                    let scale = if nargs >= 2 {
+                        match arg(1)? {
+                            Value::Int64(s) => s,
+                            other => {
+                                return Err(SqlError::Type(format!(
+                                    "ROUND scale must be an integer, got {other:?}"
+                                )));
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    let factor = 10f64.powi(scale as i32);
+                    Ok(Value::Double((d * factor).round() / factor))
+                }
                 other => Err(SqlError::Type(format!(
                     "ROUND expects a number, got {other:?}"
                 ))),
             },
             "POW" | "POWER" => match (arg(0)?, arg(1)?) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Int64(base), Value::Int64(exp)) => {
-                    let e = u32::try_from(exp).map_err(|_| {
-                        SqlError::Type("POW exponent must be a non-negative integer".into())
-                    })?;
+                (Value::Int64(base), Value::Int64(exp)) if exp >= 0 => {
+                    let e = u32::try_from(exp).expect("exp >= 0");
                     base.checked_pow(e)
                         .map(Value::Int64)
                         .ok_or_else(|| SqlError::Type("POW overflow".into()))
                 }
-                (a, b) => Err(SqlError::Type(format!(
-                    "POW expects integers, got {a:?}, {b:?}"
-                ))),
+                // A negative exponent or any double operand yields a double.
+                (a, b) => match (as_f64(&a), as_f64(&b)) {
+                    (Some(base), Some(exp)) => Ok(Value::Double(base.powf(exp))),
+                    _ => Err(SqlError::Type(format!(
+                        "POW expects numbers, got {a:?}, {b:?}"
+                    ))),
+                },
             },
             // ── control flow ──
             "IF" => {
@@ -1621,7 +1656,14 @@ fn compare(op: &BinaryOperator, l: &Value, r: &Value) -> bool {
         (Value::Int64(a), Value::Int64(b)) => a.cmp(b),
         (Value::Text(a), Value::Text(b)) => a.cmp(b),
         (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        _ => return false, // type mismatch: never matches
+        // Numeric comparison across int/double (e.g. `d > 3`).
+        _ => match (as_f64(l), as_f64(r)) {
+            (Some(x), Some(y)) => match x.partial_cmp(&y) {
+                Some(o) => o,
+                None => return false, // NaN: never matches
+            },
+            _ => return false, // type mismatch: never matches
+        },
     };
     match op {
         BinaryOperator::Eq => ord == Ordering::Equal,
@@ -1941,23 +1983,45 @@ fn arith(op: &BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
     if matches!(l, Value::Null) || matches!(r, Value::Null) {
         return Ok(Value::Null);
     }
-    let (Value::Int64(a), Value::Int64(b)) = (l, r) else {
+    // Two integers stay integers (checked); anything with a double promotes to
+    // floating point.
+    if let (Value::Int64(a), Value::Int64(b)) = (l, r) {
+        let out = match op {
+            BinaryOperator::Plus => a.checked_add(*b),
+            BinaryOperator::Minus => a.checked_sub(*b),
+            BinaryOperator::Multiply => a.checked_mul(*b),
+            BinaryOperator::Divide if *b == 0 => {
+                return Err(SqlError::Type("division by zero".into()));
+            }
+            BinaryOperator::Modulo if *b == 0 => {
+                return Err(SqlError::Type("modulo by zero".into()));
+            }
+            BinaryOperator::Divide => a.checked_div(*b),
+            BinaryOperator::Modulo => a.checked_rem(*b),
+            other => return Err(SqlError::Unsupported(format!("operator: {other}"))),
+        };
+        return out
+            .map(Value::Int64)
+            .ok_or_else(|| SqlError::Type("integer overflow".into()));
+    }
+    let (Some(a), Some(b)) = (as_f64(l), as_f64(r)) else {
         return Err(SqlError::Type(format!(
-            "arithmetic requires integers: {l:?} {op} {r:?}"
+            "arithmetic requires numbers: {l:?} {op} {r:?}"
         )));
     };
     let out = match op {
-        BinaryOperator::Plus => a.checked_add(*b),
-        BinaryOperator::Minus => a.checked_sub(*b),
-        BinaryOperator::Multiply => a.checked_mul(*b),
-        BinaryOperator::Divide if *b == 0 => return Err(SqlError::Type("division by zero".into())),
-        BinaryOperator::Modulo if *b == 0 => return Err(SqlError::Type("modulo by zero".into())),
-        BinaryOperator::Divide => a.checked_div(*b),
-        BinaryOperator::Modulo => a.checked_rem(*b),
+        BinaryOperator::Plus => a + b,
+        BinaryOperator::Minus => a - b,
+        BinaryOperator::Multiply => a * b,
+        BinaryOperator::Divide if b == 0.0 => {
+            return Err(SqlError::Type("division by zero".into()));
+        }
+        BinaryOperator::Modulo if b == 0.0 => return Err(SqlError::Type("modulo by zero".into())),
+        BinaryOperator::Divide => a / b,
+        BinaryOperator::Modulo => a % b,
         other => return Err(SqlError::Unsupported(format!("operator: {other}"))),
     };
-    out.map(Value::Int64)
-        .ok_or_else(|| SqlError::Type("integer overflow".into()))
+    Ok(Value::Double(out))
 }
 
 /// SQL `LIKE` matching with `%` (any run, including empty) and `_` (exactly one
@@ -2032,7 +2096,21 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Int64(x), Value::Int64(y)) => x.cmp(y),
         (Value::Text(x), Value::Text(y)) => x.cmp(y),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => Ordering::Equal,
+        // Numeric ordering across int/double (NaN sorts as Equal here).
+        _ => match (as_f64(a), as_f64(b)) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(Ordering::Equal),
+            _ => Ordering::Equal,
+        },
+    }
+}
+
+/// The numeric value of an `Int64`/`Double`, for cross-type comparison and
+/// arithmetic; `None` for non-numeric values.
+fn as_f64(v: &Value) -> Option<f64> {
+    match v {
+        Value::Int64(n) => Some(*n as f64),
+        Value::Double(d) => Some(*d),
+        _ => None,
     }
 }
 
@@ -2059,6 +2137,7 @@ enum OutputCol {
 enum AggFunc {
     Count,
     Sum,
+    Avg,
     Min,
     Max,
 }
@@ -2085,26 +2164,74 @@ impl Aggregate {
                 };
                 Ok(Value::Int64(n as i64))
             }
-            // SUM over integers, skipping NULLs; an empty/all-NULL group is NULL.
+            // SUM over numbers, skipping NULLs; an empty/all-NULL group is NULL.
+            // An all-integer group sums to an integer; any double promotes the
+            // running total (and result) to a double.
             AggFunc::Sum => {
                 let c = self.col.expect("SUM has a column");
-                let mut sum: i64 = 0;
+                let mut int_sum: i64 = 0;
+                let mut float_sum: f64 = 0.0;
+                let mut is_float = false;
                 let mut seen = false;
                 for &i in members {
                     match &rows[i][c] {
                         Value::Null => {}
                         Value::Int64(n) => {
-                            sum += n;
+                            if is_float {
+                                float_sum += *n as f64;
+                            } else {
+                                int_sum += n;
+                            }
+                            seen = true;
+                        }
+                        Value::Double(d) => {
+                            if !is_float {
+                                is_float = true;
+                                float_sum = int_sum as f64;
+                            }
+                            float_sum += d;
                             seen = true;
                         }
                         other => {
                             return Err(SqlError::Type(format!(
-                                "SUM over a non-integer value: {other:?}"
+                                "SUM over a non-numeric value: {other:?}"
                             )));
                         }
                     }
                 }
-                Ok(if seen { Value::Int64(sum) } else { Value::Null })
+                Ok(match (seen, is_float) {
+                    (false, _) => Value::Null,
+                    (true, true) => Value::Double(float_sum),
+                    (true, false) => Value::Int64(int_sum),
+                })
+            }
+            // AVG over numbers, skipping NULLs; the result is always a double
+            // (an empty/all-NULL group is NULL).
+            AggFunc::Avg => {
+                let c = self.col.expect("AVG has a column");
+                let mut sum = 0.0;
+                let mut count: i64 = 0;
+                for &i in members {
+                    match &rows[i][c] {
+                        Value::Null => {}
+                        v => match as_f64(v) {
+                            Some(x) => {
+                                sum += x;
+                                count += 1;
+                            }
+                            None => {
+                                return Err(SqlError::Type(format!(
+                                    "AVG over a non-numeric value: {v:?}"
+                                )));
+                            }
+                        },
+                    }
+                }
+                Ok(if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Double(sum / count as f64)
+                })
             }
             // MIN/MAX over any comparable type, skipping NULLs; empty group NULL.
             AggFunc::Min | AggFunc::Max => {
@@ -2221,13 +2348,9 @@ fn parse_aggregate(f: &Function, cols: &dyn ColumnResolver) -> Result<Aggregate>
             });
         }
         "SUM" => AggFunc::Sum,
+        "AVG" => AggFunc::Avg,
         "MIN" => AggFunc::Min,
         "MAX" => AggFunc::Max,
-        "AVG" => {
-            return Err(SqlError::Unsupported(
-                "AVG needs a floating-point column type (deferred)".into(),
-            ));
-        }
         other => {
             return Err(SqlError::Unsupported(format!("aggregate function {other}")));
         }
@@ -2255,6 +2378,17 @@ fn key_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
 fn encode_index_key(value: &Value) -> Result<Vec<u8>> {
     Ok(match value {
         Value::Int64(n) => (*n as u64 ^ (1u64 << 63)).to_be_bytes().to_vec(),
+        // Order-preserving float key: flip the sign bit for positives, all bits
+        // for negatives, so the big-endian bytes sort in numeric order.
+        Value::Double(d) => {
+            let bits = d.to_bits();
+            let ordered = if bits & (1u64 << 63) != 0 {
+                !bits
+            } else {
+                bits ^ (1u64 << 63)
+            };
+            ordered.to_be_bytes().to_vec()
+        }
         Value::Text(s) => s.as_bytes().to_vec(),
         Value::Bool(b) => vec![u8::from(*b)],
         Value::Null => return Err(SqlError::Constraint("primary key cannot be NULL".into())),
@@ -2270,6 +2404,7 @@ fn literal(expr: &Expr) -> Result<Value> {
             expr,
         } => match literal(expr)? {
             Value::Int64(n) => Ok(Value::Int64(-n)),
+            Value::Double(d) => Ok(Value::Double(-d)),
             other => Err(SqlError::Type(format!("cannot negate {other:?}"))),
         },
         other => Err(SqlError::Unsupported(format!("literal: {other:?}"))),
@@ -2278,10 +2413,19 @@ fn literal(expr: &Expr) -> Result<Value> {
 
 fn sql_value(v: &SqlValue) -> Result<Value> {
     match v {
-        SqlValue::Number(n, _) => n
-            .parse::<i64>()
-            .map(Value::Int64)
-            .map_err(|_| SqlError::Type(format!("not an integer: {n}"))),
+        // A bare integer stays an integer; a literal with a decimal point or
+        // exponent (e.g. `9.5`, `1e3`) is a double.
+        SqlValue::Number(n, _) => {
+            if n.contains(['.', 'e', 'E']) {
+                n.parse::<f64>()
+                    .map(Value::Double)
+                    .map_err(|_| SqlError::Type(format!("not a number: {n}")))
+            } else {
+                n.parse::<i64>()
+                    .map(Value::Int64)
+                    .map_err(|_| SqlError::Type(format!("not an integer: {n}")))
+            }
+        }
         SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
             Ok(Value::Text(s.clone()))
         }
@@ -2299,6 +2443,9 @@ fn map_data_type(dt: &DataType) -> Result<Type> {
         | DataType::Int(_)
         | DataType::Integer(_)
         | DataType::BigInt(_) => Ok(Type::Int64),
+        DataType::Float(_) | DataType::Real | DataType::Double(_) | DataType::DoublePrecision => {
+            Ok(Type::Double)
+        }
         DataType::Text
         | DataType::String(_)
         | DataType::Varchar(_)
@@ -3328,11 +3475,15 @@ mod tests {
                 .execute_autocommit("SELECT g, v, COUNT(*) FROM t GROUP BY g"),
             Err(SqlError::Unsupported(_))
         ));
-        // AVG is explicitly deferred.
-        assert!(matches!(
-            env.engine.execute_autocommit("SELECT AVG(v) FROM t"),
-            Err(SqlError::Unsupported(_))
-        ));
+        // AVG now yields a double.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT AVG(v) FROM t")
+                    .unwrap()
+            ),
+            vec![vec![Value::Double(10.0)]]
+        );
     }
 
     fn seed_ops(env: &Env) {
@@ -4004,6 +4155,73 @@ mod tests {
                 Value::Int64(1),
                 Value::Int64(172_800),
                 Value::Int64(86_400),
+            ]
+        );
+    }
+
+    #[test]
+    fn double_type_aggregates_and_arithmetic() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE n (id BIGINT, x BIGINT, d DOUBLE)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO n VALUES (1, 10, 2.5), (2, 20, 7.5), (3, 30, NULL)")
+            .unwrap();
+
+        // AVG always yields a double (over an int column too); SUM keeps the
+        // column's type; NULLs are skipped.
+        let agg = rows(
+            env.engine
+                .execute_autocommit("SELECT AVG(x), AVG(d), SUM(d), SUM(x), MIN(d), MAX(d) FROM n")
+                .unwrap(),
+        );
+        assert_eq!(
+            agg[0],
+            vec![
+                Value::Double(20.0),
+                Value::Double(5.0),
+                Value::Double(10.0),
+                Value::Int64(60),
+                Value::Double(2.5),
+                Value::Double(7.5),
+            ]
+        );
+
+        // double * int -> double; ORDER BY a double; WHERE double > int literal.
+        let q = rows(
+            env.engine
+                .execute_autocommit("SELECT d * 2 FROM n WHERE d > 3 ORDER BY d")
+                .unwrap(),
+        );
+        assert_eq!(q, vec![vec![Value::Double(15.0)]]);
+
+        // An integer literal widens into a DOUBLE column on insert.
+        env.engine
+            .execute_autocommit("INSERT INTO n VALUES (4, 40, 8)")
+            .unwrap();
+        let coerced = rows(
+            env.engine
+                .execute_autocommit("SELECT d FROM n WHERE id = 4")
+                .unwrap(),
+        );
+        assert_eq!(coerced, vec![vec![Value::Double(8.0)]]);
+
+        // Float scalar functions.
+        let f = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT ROUND(2.5, 0), CEIL(1.2), FLOOR(1.8), ABS(-3.5) FROM n WHERE id = 1",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            f[0],
+            vec![
+                Value::Double(3.0),
+                Value::Double(2.0),
+                Value::Double(1.0),
+                Value::Double(3.5),
             ]
         );
     }
