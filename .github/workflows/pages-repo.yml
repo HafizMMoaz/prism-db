@@ -112,3 +112,24 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  # Prove the client flow against the just-published repo: apt verifies the GPG
+  # signature on `update`, then installs and the service comes up.
+  verify-apt:
+    needs: deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install prismdb from the published APT repo
+        run: |
+          set -x
+          for i in $(seq 1 12); do
+            curl -fsS "$PAGES_BASE/deb/InRelease" -o /dev/null && break || sleep 10
+          done
+          curl -fsSL "$PAGES_BASE/prismdb-archive-keyring.asc" | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
+          echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] $PAGES_BASE/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
+          sudo apt-get update
+          sudo apt-get install -y prismdb
+          for b in prismd prism-shell prism-fsck prism-dump; do command -v "$b"; done
+          sleep 3
+          systemctl is-active --quiet prismd || { sudo journalctl -u prismd --no-pager | tail -40; exit 1; }
+          printf 'SHOW DATABASES\n\\quit\n' | prism-shell 127.0.0.1:4444 --user admin --password admin
