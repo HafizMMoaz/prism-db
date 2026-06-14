@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PrismDB — install</title>
+<meta name="description" content="Install PrismDB: one storage engine, three data models (SQL, document, key-value). Packages for Linux, macOS, Windows, and a Node SDK." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --paper:#F6F7F9; --surface:#FFFFFF; --ink:#15171C; --muted:#5A6273;
+    --line:#E4E7EC; --line-strong:#D3D8E0;
+    --sql:#3F5BD8; --doc:#C32CC0; --kv:#E0962A;          /* the three models = the spectrum */
+    --beam:#0F1116;
+    --shadow:0 1px 2px rgba(20,22,28,.04), 0 8px 24px -12px rgba(20,22,28,.14);
+    --r:14px;
+    --display:"Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+    --body:"IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --mono:"IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--paper); color:var(--ink); font-family:var(--body);
+    font-size:16px; line-height:1.6; -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit}
+  .wrap{max-width:1040px; margin:0 auto; padding:0 24px}
+
+  /* spectrum hairline at the very top — the one ambient use of full color */
+  .spectrum-edge{height:3px; border:0; margin:0;
+    background:linear-gradient(90deg,var(--sql),#7B43D6,var(--doc),#E0556E,var(--kv));}
+
+  /* top bar */
+  .top{display:flex; align-items:center; justify-content:space-between; padding:22px 0}
+  .brand{display:flex; align-items:center; gap:10px; font-family:var(--display); font-weight:700; letter-spacing:-.01em; font-size:18px; text-decoration:none}
+  .brand .glyph{width:18px; height:18px}
+  .nav{display:flex; gap:26px; font-size:14.5px}
+  .nav a{color:var(--muted); text-decoration:none; transition:color .15s}
+  .nav a:hover{color:var(--ink)}
+
+  /* hero */
+  .hero{display:grid; grid-template-columns:1.05fr .95fr; gap:32px; align-items:center; padding:34px 0 14px}
+  .eyebrow{font-family:var(--mono); font-size:12.5px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin:0 0 18px}
+  .hero h1{font-family:var(--display); font-weight:700; font-size:clamp(38px,6vw,62px); line-height:1.02; letter-spacing:-.025em; margin:0}
+  .spectrum-text{background:linear-gradient(95deg,var(--sql),#8a36cf 42%,var(--doc) 66%,var(--kv)); -webkit-background-clip:text; background-clip:text; color:transparent}
+  .hero p.lede{font-size:18px; color:var(--muted); max-width:38ch; margin:18px 0 26px}
+  .cta-row{display:flex; gap:12px; flex-wrap:wrap}
+  .btn{display:inline-flex; align-items:center; gap:8px; font:500 15px/1 var(--body); text-decoration:none;
+    padding:12px 18px; border-radius:10px; border:1px solid var(--line-strong); background:var(--surface); color:var(--ink); transition:transform .12s, box-shadow .15s, border-color .15s}
+  .btn:hover{transform:translateY(-1px); box-shadow:var(--shadow)}
+  .btn.primary{background:var(--ink); color:#fff; border-color:var(--ink)}
+  .btn.primary:hover{box-shadow:0 10px 24px -10px rgba(20,22,28,.5)}
+
+  /* the prism signature */
+  .prism-stage{position:relative}
+  .prism-stage svg{width:100%; height:auto; display:block; overflow:visible}
+  .beam, .ray{fill:none; stroke-linecap:round}
+  .beam{stroke:var(--beam); stroke-width:2.5}
+  .ray{stroke-width:3}
+  .ray.r1{stroke:var(--sql)} .ray.r2{stroke:var(--doc)} .ray.r3{stroke:var(--kv)}
+  .glass{fill:url(#glass); stroke:#11131A; stroke-width:1.4; stroke-linejoin:round}
+  .rlabel{font-family:var(--mono); font-size:13px; fill:var(--ink)}
+  .rlabel .dim{fill:var(--muted)}
+
+  @keyframes draw{to{stroke-dashoffset:0}}
+  @keyframes fadein{from{opacity:0} to{opacity:1}}
+  @keyframes pop{from{opacity:0; transform:scale(.9)} to{opacity:1; transform:scale(1)}}
+  .anim .beam{stroke-dasharray:1; stroke-dashoffset:1; animation:draw .5s ease-out .15s forwards}
+  .anim .glass{transform-box:fill-box; transform-origin:center; opacity:0; animation:pop .45s cubic-bezier(.2,.7,.3,1) .45s forwards}
+  .anim .ray{stroke-dasharray:1; stroke-dashoffset:1; animation:draw .55s ease-out forwards}
+  .anim .ray.r1{animation-delay:.7s} .anim .ray.r2{animation-delay:.82s} .anim .ray.r3{animation-delay:.94s}
+  .anim .rlabel{opacity:0; animation:fadein .4s ease-out forwards}
+  .anim .rlabel.l1{animation-delay:1.0s} .anim .rlabel.l2{animation-delay:1.12s} .anim .rlabel.l3{animation-delay:1.24s}
+
+  /* install */
+  .install{padding:30px 0 10px}
+  .sec-head{display:flex; align-items:baseline; justify-content:space-between; gap:16px; border-top:1px solid var(--line); padding-top:26px}
+  .sec-head h2{font-family:var(--display); font-weight:500; font-size:22px; letter-spacing:-.01em; margin:0}
+  .sec-head .hint{font-family:var(--mono); font-size:12.5px; color:var(--muted)}
+
+  .tabs{display:flex; gap:6px; margin:22px 0 20px; flex-wrap:wrap}
+  .tab{appearance:none; font:500 14.5px/1 var(--body); color:var(--muted); background:transparent;
+    border:1px solid transparent; border-radius:999px; padding:9px 16px; cursor:pointer; display:inline-flex; align-items:center; gap:8px; transition:.15s}
+  .tab:hover{color:var(--ink)}
+  .tab[aria-selected="true"]{color:var(--ink); background:var(--surface); border-color:var(--line-strong); box-shadow:var(--shadow)}
+  .tab .dot{width:7px; height:7px; border-radius:999px; background:currentColor; opacity:.55}
+
+  .panel{display:none; animation:fadein .25s ease-out}
+  .panel[data-active]{display:block}
+  .cards{display:grid; gap:14px}
+
+  .card{background:var(--surface); border:1px solid var(--line); border-radius:var(--r); padding:18px 18px 16px; box-shadow:var(--shadow)}
+  .card .label{display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 0 12px}
+  .card .label .name{font-family:var(--display); font-weight:500; font-size:15.5px}
+  .card .label .tag{font-family:var(--mono); font-size:11.5px; color:var(--muted); border:1px solid var(--line-strong); border-radius:999px; padding:3px 9px; white-space:nowrap}
+  .card .note{margin:10px 2px 0; font-size:13.5px; color:var(--muted)}
+  .card .note a{color:var(--sql); text-decoration:none} .card .note a:hover{text-decoration:underline}
+
+  .code{position:relative; background:#0F1116; color:#EDEFF4; border-radius:10px; overflow:hidden}
+  .code pre{margin:0; padding:15px 52px 15px 16px; overflow-x:auto; font-family:var(--mono); font-size:13.5px; line-height:1.65}
+  .code pre code{white-space:pre}
+  .code .tok-c{color:#8B93A7} /* comments / dim */
+  .copy{position:absolute; top:10px; right:10px; appearance:none; cursor:pointer; font:500 12px/1 var(--mono);
+    color:#C9CEDA; background:#1B1E26; border:1px solid #2A2E39; border-radius:7px; padding:7px 9px; transition:.15s}
+  .copy:hover{color:#fff; background:#262b35}
+  .copy.ok{color:#7EE0A6; border-color:#2f5b43}
+
+  /* secondary installs row */
+  .more{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:14px}
+  @media (max-width:720px){ .more{grid-template-columns:1fr} }
+
+  /* quick start */
+  .quick{padding:30px 0 8px}
+  .quick .grid{display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:18px}
+  @media (max-width:720px){ .quick .grid{grid-template-columns:1fr} }
+  .step .k{font-family:var(--mono); font-size:12px; color:var(--muted); margin:0 0 8px; letter-spacing:.04em}
+
+  footer{border-top:1px solid var(--line); margin-top:44px; padding:26px 0 60px; color:var(--muted); font-size:14px;
+    display:flex; gap:18px; flex-wrap:wrap; align-items:center; justify-content:space-between}
+  footer a{color:var(--muted); text-decoration:none} footer a:hover{color:var(--ink)}
+  footer .links{display:flex; gap:20px; flex-wrap:wrap}
+
+  @media (max-width:860px){
+    .hero{grid-template-columns:1fr; gap:8px} .prism-stage{order:-1; max-width:460px}
+    .nav{display:none}
+  }
+  :focus-visible{outline:2px solid var(--sql); outline-offset:2px; border-radius:6px}
+  @media (prefers-reduced-motion:reduce){
+    .anim *{animation:none !important}
+    .anim .beam,.anim .ray{stroke-dashoffset:0} .anim .glass,.anim .rlabel{opacity:1}
+    .panel{animation:none}
+  }
+</style>
+</head>
+<body>
+<hr class="spectrum-edge" />
+<div class="wrap">
+
+  <header class="top">
+    <a class="brand" href="https://github.com/HafizMMoaz/prism-db">
+      <svg class="glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2 22 20H2L12 2Z" fill="none" stroke="#15171C" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 2 12 20" stroke="#15171C" stroke-width="1" opacity=".4"/></svg>
+      PrismDB
+    </a>
+    <nav class="nav">
+      <a href="#install">Install</a>
+      <a href="https://github.com/HafizMMoaz/prism-db#readme">Docs</a>
+      <a href="https://www.npmjs.com/package/@prismdb/client">npm</a>
+      <a href="https://github.com/HafizMMoaz/prism-db">GitHub</a>
+    </nav>
+  </header>
+
+  <section class="hero">
+    <div>
+      <p class="eyebrow">single-node · multi-model</p>
+      <h1>One engine.<br />Three&nbsp;<span class="spectrum-text">models</span>.</h1>
+      <p class="lede">PrismDB speaks SQL, documents, and key–value over one storage engine — and one transaction spans all three.</p>
+      <div class="cta-row">
+        <a class="btn primary" href="#install">Install for <span id="os-name">your OS</span></a>
+        <a class="btn" href="https://github.com/HafizMMoaz/prism-db">View on GitHub</a>
+      </div>
+    </div>
+
+    <div class="prism-stage">
+      <svg class="anim" viewBox="0 0 720 360" role="img" aria-label="A beam of light enters a prism and splits into three rays: relational, document, and key-value.">
+        <defs>
+          <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#EAF0FF"/><stop offset="1" stop-color="#F8E9FB"/>
+          </linearGradient>
+        </defs>
+        <!-- one engine: the incoming beam -->
+        <path class="beam" d="M48 180 H286" pathLength="1"/>
+        <!-- the prism -->
+        <polygon class="glass" points="286,120 286,250 392,185"/>
+        <!-- refracted into three models -->
+        <path class="ray r1" d="M389 183 L600 112" pathLength="1"/>
+        <path class="ray r2" d="M392 185 L600 188" pathLength="1"/>
+        <path class="ray r3" d="M389 187 L600 262" pathLength="1"/>
+        <text class="rlabel l1" x="612" y="116">relational <tspan class="dim">· SQL</tspan></text>
+        <text class="rlabel l2" x="612" y="192">document <tspan class="dim">· JSON</tspan></text>
+        <text class="rlabel l3" x="612" y="266">key–value</text>
+      </svg>
+    </div>
+  </section>
+
+  <section class="install" id="install">
+    <div class="sec-head">
+      <h2>Install</h2>
+      <span class="hint">one install — server, shell, and tools</span>
+    </div>
+
+    <div class="tabs" role="tablist" aria-label="Operating system">
+      <button class="tab" role="tab" data-os="linux"   aria-selected="false"><span class="dot"></span>Linux</button>
+      <button class="tab" role="tab" data-os="macos"   aria-selected="false"><span class="dot"></span>macOS</button>
+      <button class="tab" role="tab" data-os="windows" aria-selected="false"><span class="dot"></span>Windows</button>
+    </div>
+
+    <!-- LINUX -->
+    <div class="panel" data-os="linux" role="tabpanel">
+      <div class="cards">
+        <div class="card">
+          <div class="label"><span class="name">APT — Debian / Ubuntu</span><span class="tag">apt upgrade keeps it current</span></div>
+          <div class="code"><button class="copy">Copy</button><pre><code>curl -fsSL https://hafizmmoaz.github.io/prism-db/prismdb-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
+echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] https://hafizmmoaz.github.io/prism-db/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
+sudo apt update &amp;&amp; sudo apt install prismdb</code></pre></div>
+          <p class="note">Installs the binaries and starts <code>prismd</code> as a systemd service.</p>
+        </div>
+        <div class="card">
+          <div class="label"><span class="name">DNF — Fedora / RHEL / CentOS</span><span class="tag">signed repo</span></div>
+          <div class="code"><button class="copy">Copy</button><pre><code>sudo tee /etc/yum.repos.d/prismdb.repo &gt;/dev/null &lt;&lt;'EOF'
+[prismdb]
+name=PrismDB
+baseurl=https://hafizmmoaz.github.io/prism-db/rpm
+enabled=1
+gpgcheck=1
+gpgkey=https://hafizmmoaz.github.io/prism-db/prismdb-archive-keyring.asc
+EOF
+sudo dnf install prismdb</code></pre></div>
+        </div>
+        <div class="card">
+          <div class="label"><span class="name">Shell installer</span><span class="tag">no service · any distro</span></div>
+          <div class="code"><button class="copy">Copy</button><pre><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.sh | sh</code></pre></div>
+          <p class="note">Prefer a file? Grab the <a href="https://github.com/HafizMMoaz/prism-db/releases/latest">.deb / .rpm / tarball</a> from the latest release.</p>
+        </div>
+      </div>
+    </div>
+
+    <!-- macOS -->
+    <div class="panel" data-os="macos" role="tabpanel">
+      <div class="cards">
+        <div class="card">
+          <div class="label"><span class="name">Homebrew</span><span class="tag">recommended</span></div>
+          <div class="code"><button class="copy">Copy</button><pre><code>brew install HafizMMoaz/prism/prismdb</code></pre></div>
+          <p class="note">Run it as a service with <code>brew services start prismdb</code>.</p>
+        </div>
+        <div class="card">
+          <div class="label"><span class="name">Shell installer</span><span class="tag">Intel &amp; Apple silicon</span></div>
+          <div class="code"><button class="copy">Copy</button><pre><code>curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.sh | sh</code></pre></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- WINDOWS -->
+    <div class="panel" data-os="windows" role="tabpanel">
+      <div class="cards">
+        <div class="card">
+          <div class="label"><span class="name">Installer (.msi)</span><span class="tag">x86-64</span></div>
+          <p class="note" style="margin-top:0">Download and run the installer:</p>
+          <a class="btn primary" style="margin-top:4px" href="https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-x86_64-pc-windows-msvc.msi">Download prismdb&nbsp;.msi</a>
+        </div>
+        <div class="card">
+          <div class="label"><span class="name">PowerShell</span><span class="tag">no admin needed</span></div>
+          <div class="code"><button class="copy">Copy</button><pre><code>powershell -ExecutionPolicy Bypass -c "irm https://github.com/HafizMMoaz/prism-db/releases/latest/download/prismdb-installer.ps1 | iex"</code></pre></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="more">
+      <div class="card">
+        <div class="label"><span class="name">Node.js SDK</span><span class="tag">@prismdb/client</span></div>
+        <div class="code"><button class="copy">Copy</button><pre><code>npm install @prismdb/client</code></pre></div>
+        <p class="note">A pure-TypeScript client — <a href="https://www.npmjs.com/package/@prismdb/client">npmjs.com</a>.</p>
+      </div>
+      <div class="card">
+        <div class="label"><span class="name">From source</span><span class="tag">Rust 1.85+</span></div>
+        <div class="code"><button class="copy">Copy</button><pre><code>cargo install --git https://github.com/HafizMMoaz/prism-db prismdb</code></pre></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="quick">
+    <div class="sec-head"><h2>Quick start</h2><span class="hint">default account: admin / admin — change before exposing</span></div>
+    <div class="grid">
+      <div class="step">
+        <p class="k">// start the server</p>
+        <div class="code"><button class="copy">Copy</button><pre><code>prismd init
+prismd run --bind 127.0.0.1:4444</code></pre></div>
+      </div>
+      <div class="step">
+        <p class="k">// connect and query</p>
+        <div class="code"><button class="copy">Copy</button><pre><code>prism-shell 127.0.0.1:4444 --user admin --password admin
+<span class="tok-c">prism&gt;</span> CREATE DATABASE shop;
+<span class="tok-c">prism&gt;</span> USE shop;
+<span class="tok-c">prism&gt;</span> CREATE TABLE items (id BIGINT PRIMARY KEY, name TEXT);</code></pre></div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <span>PrismDB · Apache-2.0</span>
+    <span class="links">
+      <a href="https://github.com/HafizMMoaz/prism-db">GitHub</a>
+      <a href="https://github.com/HafizMMoaz/prism-db/releases">Releases</a>
+      <a href="https://github.com/HafizMMoaz/prism-db#readme">Docs</a>
+      <a href="https://www.npmjs.com/package/@prismdb/client">npm</a>
+    </span>
+  </footer>
+</div>
+
+<script>
+(function(){
+  var tabs = Array.prototype.slice.call(document.querySelectorAll('.tab'));
+  var panels = Array.prototype.slice.call(document.querySelectorAll('.panel'));
+  var osName = document.getElementById('os-name');
+  var pretty = { linux:'Linux', macos:'macOS', windows:'Windows' };
+
+  function select(os){
+    tabs.forEach(function(t){ t.setAttribute('aria-selected', String(t.dataset.os === os)); });
+    panels.forEach(function(p){ if(p.dataset.os === os){ p.setAttribute('data-active',''); } else { p.removeAttribute('data-active'); } });
+    if (osName) osName.textContent = pretty[os] || 'your OS';
+  }
+
+  function detect(){
+    var s = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || navigator.userAgent || '').toLowerCase();
+    if (s.indexOf('win') > -1) return 'windows';
+    if (s.indexOf('mac') > -1) return 'macos';
+    return 'linux';
+  }
+
+  tabs.forEach(function(t){ t.addEventListener('click', function(){ select(t.dataset.os); }); });
+  // arrow-key navigation across tabs
+  document.querySelector('.tabs').addEventListener('keydown', function(e){
+    var i = tabs.findIndex(function(t){ return t.getAttribute('aria-selected') === 'true'; });
+    if (e.key === 'ArrowRight'){ select(tabs[(i+1)%tabs.length].dataset.os); tabs[(i+1)%tabs.length].focus(); }
+    if (e.key === 'ArrowLeft'){ select(tabs[(i-1+tabs.length)%tabs.length].dataset.os); tabs[(i-1+tabs.length)%tabs.length].focus(); }
+  });
+
+  select(detect());
+
+  // copy buttons
+  document.addEventListener('click', function(e){
+    var btn = e.target.closest('.copy'); if(!btn) return;
+    var code = btn.parentElement.querySelector('code');
+    var text = code ? code.innerText : '';
+    navigator.clipboard.writeText(text).then(function(){
+      var prev = btn.textContent; btn.textContent = 'Copied'; btn.classList.add('ok');
+      setTimeout(function(){ btn.textContent = prev; btn.classList.remove('ok'); }, 1400);
+    });
+  });
+})();
+</script>
+</body>
+</html>

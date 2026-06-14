@@ -78,29 +78,7 @@ jobs:
 
       - name: Landing page
         run: |
-          cat > site/index.html <<HTML
-          <!doctype html><html lang="en"><meta charset="utf-8">
-          <title>PrismDB package repository</title>
-          <meta name="viewport" content="width=device-width,initial-scale=1">
-          <style>body{font:16px/1.6 system-ui,sans-serif;max-width:48rem;margin:3rem auto;padding:0 1rem;color:#111}code,pre{background:#f4f4f5;border-radius:6px}pre{padding:1rem;overflow-x:auto}code{padding:.1em .35em}h1{margin-bottom:.2em}</style>
-          <h1>PrismDB package repository</h1>
-          <p>Signed APT and YUM repositories. Installing the package also starts <code>prismd</code> as a systemd service. See the <a href="https://github.com/HafizMMoaz/prism-db">project</a>.</p>
-          <h2>Debian / Ubuntu</h2>
-          <pre>curl -fsSL ${PAGES_BASE}/prismdb-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
-          echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] ${PAGES_BASE}/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
-          sudo apt update && sudo apt install prismdb</pre>
-          <h2>Fedora / RHEL / CentOS</h2>
-          <pre>sudo tee /etc/yum.repos.d/prismdb.repo &lt;&lt;'EOF'
-          [prismdb]
-          name=PrismDB
-          baseurl=${PAGES_BASE}/rpm
-          enabled=1
-          gpgcheck=1
-          gpgkey=${PAGES_BASE}/prismdb-archive-keyring.asc
-          EOF
-          sudo dnf install prismdb</pre>
-          </html>
-          HTML
+          cp deploy/pages/index.html site/index.html
           ls -R site | head -40
 
       - uses: actions/upload-pages-artifact@v3
