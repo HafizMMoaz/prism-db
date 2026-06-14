@@ -1,0 +1,114 @@
+name: Package repository
+
+# Builds GPG-signed APT + YUM repositories from every released .deb/.rpm and
+# publishes them (plus the signing key and a landing page) to GitHub Pages, so
+# users can `apt install prismdb` / `dnf install prismdb` from a URL. Runs after a
+# release is published; also dispatchable. Requires Pages source = "GitHub
+# Actions" and the GPG_PRIVATE_KEY secret.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  PAGES_BASE: https://hafizmmoaz.github.io/prism-db
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install packaging tools
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev apt-utils createrepo-c
+
+      - name: Collect every released .deb / .rpm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p site/deb site/rpm
+          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName'); do
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir site/deb --clobber 2>/dev/null || true
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.rpm' --dir site/rpm --clobber 2>/dev/null || true
+          done
+          echo "deb:"; ls -l site/deb; echo "rpm:"; ls -l site/rpm
+          test -n "$(ls site/deb/*.deb 2>/dev/null)" || { echo "no .deb found"; exit 1; }
+          test -n "$(ls site/rpm/*.rpm 2>/dev/null)" || { echo "no .rpm found"; exit 1; }
+
+      - name: Import signing key
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          printf '%s' "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --list-secret-keys --keyid-format long
+
+      - name: Build signed APT repository (flat)
+        run: |
+          cp deploy/prismdb-archive-keyring.asc site/prismdb-archive-keyring.asc
+          cd site/deb
+          dpkg-scanpackages --multiversion . > Packages
+          gzip -9kf Packages
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin=PrismDB \
+            -o APT::FTPArchive::Release::Label=PrismDB \
+            -o APT::FTPArchive::Release::Suite=stable \
+            -o APT::FTPArchive::Release::Architectures=amd64 \
+            -o APT::FTPArchive::Release::Components=main \
+            release . > Release
+          gpg --batch --yes --pinentry-mode loopback --clearsign -o InRelease Release
+          gpg --batch --yes --pinentry-mode loopback -abs -o Release.gpg Release
+
+      - name: Build signed YUM repository
+        run: |
+          cd site/rpm
+          createrepo_c .
+          gpg --batch --yes --pinentry-mode loopback --detach-sign --armor repodata/repomd.xml
+
+      - name: Landing page
+        run: |
+          cat > site/index.html <<HTML
+          <!doctype html><html lang="en"><meta charset="utf-8">
+          <title>PrismDB package repository</title>
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <style>body{font:16px/1.6 system-ui,sans-serif;max-width:48rem;margin:3rem auto;padding:0 1rem;color:#111}code,pre{background:#f4f4f5;border-radius:6px}pre{padding:1rem;overflow-x:auto}code{padding:.1em .35em}h1{margin-bottom:.2em}</style>
+          <h1>PrismDB package repository</h1>
+          <p>Signed APT and YUM repositories. Installing the package also starts <code>prismd</code> as a systemd service. See the <a href="https://github.com/HafizMMoaz/prism-db">project</a>.</p>
+          <h2>Debian / Ubuntu</h2>
+          <pre>curl -fsSL ${PAGES_BASE}/prismdb-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
+          echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] ${PAGES_BASE}/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
+          sudo apt update && sudo apt install prismdb</pre>
+          <h2>Fedora / RHEL / CentOS</h2>
+          <pre>sudo tee /etc/yum.repos.d/prismdb.repo &lt;&lt;'EOF'
+          [prismdb]
+          name=PrismDB
+          baseurl=${PAGES_BASE}/rpm
+          enabled=1
+          gpgcheck=1
+          gpgkey=${PAGES_BASE}/prismdb-archive-keyring.asc
+          EOF
+          sudo dnf install prismdb</pre>
+          </html>
+          HTML
+          ls -R site | head -40
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
