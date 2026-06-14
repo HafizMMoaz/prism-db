@@ -23,9 +23,10 @@
 //! Unix epoch seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/
 //! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
 //! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
-//! the select list, and `HAVING`. Deferred: `USING`/`NATURAL` join constraints,
-//! `ORDER BY` over aggregate output, updating a primary-key column, join
-//! predicate pushdown / index nested-loop, the formal bind/rewrite/plan IR. The
+//! the select list, and `HAVING` (and `ORDER BY` over aggregate output, by name,
+//! 1-based ordinal, or expression text). Deferred: `USING`/`NATURAL` join
+//! constraints, updating a primary-key column, join predicate pushdown / index
+//! nested-loop, the formal bind/rewrite/plan IR. The
 //! current executor interprets the parsed AST directly against the catalog; the
 //! full parse→bind→plan→execute pipeline is a follow-up.
 
@@ -877,14 +878,6 @@ impl SqlEngine {
         query: &Query,
         distinct: bool,
     ) -> Result<Outcome> {
-        // ORDER BY over aggregate output is not supported yet (it would need to
-        // reference computed columns); LIMIT/OFFSET still apply below.
-        if query.order_by.is_some() {
-            return Err(SqlError::Unsupported(
-                "ORDER BY with aggregates or GROUP BY".into(),
-            ));
-        }
-
         // Resolve each projection item to either a group-key column or an
         // aggregate, along with its output column name.
         let mut outputs: Vec<(String, OutputCol)> = Vec::with_capacity(projection.len());
@@ -959,6 +952,21 @@ impl SqlEngine {
                 cells.push(value);
             }
             out_rows.push(cells);
+        }
+
+        // ORDER BY over the computed output: a key is an output column by name,
+        // by 1-based ordinal (`ORDER BY 2`), or by its expression text
+        // (`ORDER BY COUNT(*)`).
+        if let Some(order_by) = &query.order_by {
+            let names: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
+            let mut keys: Vec<(usize, bool)> = Vec::with_capacity(order_by.exprs.len());
+            for item in &order_by.exprs {
+                keys.push((
+                    resolve_output_col(&item.expr, &names)?,
+                    item.asc != Some(false),
+                ));
+            }
+            out_rows.sort_by(|a, b| order_cmp(&keys, a, b));
         }
 
         // LIMIT / OFFSET over the grouped output.
@@ -2056,6 +2064,30 @@ fn like_match(text: &str, pattern: &str) -> bool {
 
 /// Resolve `ORDER BY` items to `(column index, ascending)` pairs. Only simple
 /// column references are supported (ascending by default; `DESC` flips it).
+/// Resolve an `ORDER BY` key for an aggregate/`GROUP BY` query to an output
+/// column index: a 1-based ordinal, an output name, or the column's expression
+/// text (so `ORDER BY COUNT(*)` matches the `COUNT(*)` output).
+fn resolve_output_col(expr: &Expr, names: &[&str]) -> Result<usize> {
+    if matches!(expr, Expr::Value(_)) {
+        if let Value::Int64(n) = literal(expr)? {
+            return usize::try_from(n)
+                .ok()
+                .filter(|&p| p >= 1 && p <= names.len())
+                .map(|p| p - 1)
+                .ok_or_else(|| SqlError::Type(format!("ORDER BY position {n} is out of range")));
+        }
+    }
+    let key = match expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts.last().unwrap().value.clone(),
+        other => other.to_string(),
+    };
+    names
+        .iter()
+        .position(|n| *n == key)
+        .ok_or_else(|| SqlError::Unsupported(format!("ORDER BY {expr} is not an output column")))
+}
+
 fn resolve_order_keys(
     items: &[OrderByExpr],
     cols: &dyn ColumnResolver,
@@ -4224,5 +4256,37 @@ mod tests {
                 Value::Double(3.5),
             ]
         );
+    }
+
+    #[test]
+    fn order_by_over_aggregate_output() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE s (g TEXT, v BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO s VALUES ('a',1),('b',5),('a',2),('c',3)")
+            .unwrap();
+        // Order groups by the aggregate alias, descending (ties keep group order).
+        let by_alias = rows(
+            env.engine
+                .execute_autocommit("SELECT g, SUM(v) total FROM s GROUP BY g ORDER BY total DESC")
+                .unwrap(),
+        );
+        assert_eq!(
+            by_alias,
+            vec![
+                vec![t("b"), Value::Int64(5)],
+                vec![t("a"), Value::Int64(3)],
+                vec![t("c"), Value::Int64(3)],
+            ]
+        );
+        // The same, by 1-based output ordinal.
+        let by_ordinal = rows(
+            env.engine
+                .execute_autocommit("SELECT g, SUM(v) FROM s GROUP BY g ORDER BY 2 DESC")
+                .unwrap(),
+        );
+        assert_eq!(by_ordinal, by_alias);
     }
 }
