@@ -6,8 +6,11 @@ name: Package repository
 # release is published; also dispatchable. Requires Pages source = "GitHub
 # Actions" and the GPG_PRIVATE_KEY secret.
 on:
-  release:
-    types: [published]
+  # Run after Linux packages finishes (it attaches the new .deb/.rpm to the
+  # release first); also dispatchable to rebuild on demand.
+  workflow_run:
+    workflows: ["Linux packages"]
+    types: [completed]
   workflow_dispatch:
 
 permissions:
@@ -25,6 +28,7 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v4
       - name: Install packaging tools
