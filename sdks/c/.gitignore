@@ -1,0 +1,5 @@
+*.o
+*.a
+*.exe
+/quickstart
+/test_codec

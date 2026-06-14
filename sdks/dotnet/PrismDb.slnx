@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/examples/">
+    <Project Path="examples/Quickstart/Quickstart.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/PrismDb/PrismDb.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/PrismDb.Tests/PrismDb.Tests.csproj" />
+  </Folder>
+</Solution>

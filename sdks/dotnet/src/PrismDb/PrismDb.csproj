@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>CS1591</NoWarn>
+
+    <PackageId>PrismDb.Client</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>The Prism authors</Authors>
+    <Description>Pure-C# client for PrismDB over the binary wire protocol (no native build).</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/HafizMMoaz/prism-db/tree/main/sdks/dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/HafizMMoaz/prism-db</RepositoryUrl>
+    <PackageTags>prismdb;prism;database;client;driver;sql;document;key-value;multi-model</PackageTags>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="PrismDb.Tests" />
+  </ItemGroup>
+
+</Project>

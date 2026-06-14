@@ -1,0 +1,42 @@
+name: Publish .NET SDK
+
+# Publishes sdks/dotnet (PrismDb.Client) to NuGet with the version in its
+# PrismDb.csproj. Runs when a GitHub Release is published (bump <Version> in
+# sdks/dotnet/src/PrismDb/PrismDb.csproj as part of cutting the release), and can
+# be dispatched manually. Requires the NUGET_API_KEY secret.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch or tag to publish from"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Test (no server needed)
+        working-directory: sdks/dotnet
+        run: dotnet run --project tests/PrismDb.Tests -c Release
+
+      - name: Pack
+        working-directory: sdks/dotnet
+        run: dotnet pack src/PrismDb/PrismDb.csproj -c Release -o nupkg
+
+      - name: Publish to NuGet
+        working-directory: sdks/dotnet
+        run: dotnet nuget push "nupkg/*.nupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate

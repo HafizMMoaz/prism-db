@@ -101,10 +101,31 @@ All three models share one transaction: `\begin`, mutate across models, `\commit
 - **Multi-tenant server.** Many named databases under one instance, scrypt-hashed
   accounts, role-based access with **per-database grants**, TLS, connection limits,
   idempotent commits, structured audit logging.
-- **Clients:** the `prism-shell` REPL, a typed async Rust client, and a
-  pure-TypeScript Node SDK (`@prismdb/client`).
+- **Clients:** the `prism-shell` REPL, a typed async Rust client, and pure
+  client SDKs for **seven languages** (Node, Python, Java, .NET, C++, C, PHP) —
+  see [Client SDKs](#client-sdks).
 - **Operations:** offline integrity checker (`prism-fsck`), logical export/import
   (`prism-dump`), and a workload benchmark harness.
+
+## Client SDKs
+
+Official client libraries live in [`sdks/`](sdks/). Every SDK is a **pure
+implementation of the [binary wire protocol](docs/specs/wire-protocol.md)** — no
+native add-ons, nothing to compile on the user's machine beyond the language's
+own toolchain. They share one surface: SQL (with `$1` params), documents (with
+`Q`/`U` builders), key–value, and cross-model transactions.
+
+| Language | Package | Install |
+|----------|---------|---------|
+| Node / TypeScript | [`@prismdb/client`](https://www.npmjs.com/package/@prismdb/client) | `npm install @prismdb/client` |
+| Python | [`prismdb`](sdks/python) | `pip install prismdb` |
+| Java | [`dev.prism:prism-client`](sdks/java) | Maven dependency |
+| C# / .NET | [`PrismDb.Client`](sdks/dotnet) | `dotnet add package PrismDb.Client` |
+| C++ (17) | [header + `prism.cpp`](sdks/cpp) | vendor or `make` |
+| C (99/11) | [`prism.h` + `prism.c`](sdks/c) | vendor or `make` |
+| PHP | [`prismdb/client`](sdks/php) | `composer require prismdb/client` |
+
+See [sdks/README.md](sdks/README.md) for the common surface and per-language guides.
 
 ## Building from source
 

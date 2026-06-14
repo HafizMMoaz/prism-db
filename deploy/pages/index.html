@@ -4,7 +4,7 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>PrismDB — install</title>
-<meta name="description" content="Install PrismDB: one storage engine, three data models (SQL, document, key-value). Packages for Linux, macOS, Windows, and a Node SDK." />
+<meta name="description" content="Install PrismDB: one storage engine, three data models (SQL, document, key-value). Packages for Linux, macOS, Windows, and client SDKs for seven languages." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -151,7 +151,7 @@
     <nav class="nav">
       <a href="#install">Install</a>
       <a href="https://github.com/HafizMMoaz/prism-db#readme">Docs</a>
-      <a href="https://www.npmjs.com/package/@prismdb/client">npm</a>
+      <a href="https://github.com/HafizMMoaz/prism-db/tree/main/sdks">SDKs</a>
       <a href="https://github.com/HafizMMoaz/prism-db">GitHub</a>
     </nav>
   </header>
@@ -268,9 +268,12 @@ sudo dnf install prismdb</code></pre></div>
 
     <div class="more">
       <div class="card">
-        <div class="label"><span class="name">Node.js SDK</span><span class="tag">@prismdb/client</span></div>
-        <div class="code"><button class="copy">Copy</button><pre><code>npm install @prismdb/client</code></pre></div>
-        <p class="note">A pure-TypeScript client — <a href="https://www.npmjs.com/package/@prismdb/client">npmjs.com</a>.</p>
+        <div class="label"><span class="name">Client SDKs</span><span class="tag">7 languages</span></div>
+        <div class="code"><button class="copy">Copy</button><pre><code>npm      install @prismdb/client     <span class="tok-c"># Node / TypeScript</span>
+pip      install prismdb             <span class="tok-c"># Python</span>
+dotnet   add package PrismDb.Client  <span class="tok-c"># C# / .NET</span>
+composer require prismdb/client      <span class="tok-c"># PHP</span></code></pre></div>
+        <p class="note">Pure wire-protocol clients — also Java, C, and C++. <a href="https://github.com/HafizMMoaz/prism-db/tree/main/sdks">All SDKs →</a></p>
       </div>
       <div class="card">
         <div class="label"><span class="name">From source</span><span class="tag">Rust 1.85+</span></div>
@@ -303,7 +306,7 @@ prismd run --bind 127.0.0.1:4444</code></pre></div>
       <a href="https://github.com/HafizMMoaz/prism-db">GitHub</a>
       <a href="https://github.com/HafizMMoaz/prism-db/releases">Releases</a>
       <a href="https://github.com/HafizMMoaz/prism-db#readme">Docs</a>
-      <a href="https://www.npmjs.com/package/@prismdb/client">npm</a>
+      <a href="https://github.com/HafizMMoaz/prism-db/tree/main/sdks">SDKs</a>
     </span>
   </footer>
 </div>
