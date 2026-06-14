@@ -31,7 +31,7 @@ use prism_storage::{DiskManager, PageId};
 use prism_wal::{Config as WalConfig, SyncMode, Wal};
 
 use crate::auth::{Privileges, UserStore};
-use crate::catalog::{CatalogEntry, CatalogOp, ObjectKind, UserEntry, UserOp};
+use crate::catalog::{CatalogEntry, CatalogOp, IndexMeta, ObjectKind, UserEntry, UserOp};
 use crate::error::Result;
 
 // Heap-id ranges, kept disjoint per model so the registries never collide. The
@@ -444,6 +444,7 @@ impl Database {
             root_page: root.as_u64(),
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         })?;
         map.insert(name.to_string(), (heap, root));
         Ok(coll)
@@ -472,6 +473,7 @@ impl Database {
             root_page: ns.index_root().as_u64(),
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         })?;
         map.insert(name.to_string(), ns.clone());
         Ok(ns)
@@ -496,6 +498,7 @@ impl Database {
                 root_page: table.index_root.map_or(0, |p| p.as_u64()),
                 primary_key: table.primary_key.map(|p| p as u32),
                 columns: table.columns.clone(),
+                indexes: index_metas(&table),
             };
             self.persist_entry(&entry)?;
             persisted.insert(table.name);
@@ -515,6 +518,7 @@ impl Database {
             root_page: 0,
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         })?;
         self.persisted_tables
             .lock()
@@ -528,6 +532,7 @@ impl Database {
     /// this overwrites the prior definition.
     pub fn persist_table_schema(&self, name: &str) -> Result<()> {
         let table = self.sql.catalog().table(name)?;
+        let indexes = index_metas(&table);
         self.persist_entry(&CatalogEntry {
             op: CatalogOp::Upsert,
             kind: ObjectKind::Table,
@@ -536,6 +541,7 @@ impl Database {
             root_page: table.index_root.map_or(0, |p| p.as_u64()),
             primary_key: table.primary_key.map(|p| p as u32),
             columns: table.columns,
+            indexes,
         })?;
         self.persisted_tables
             .lock()
@@ -555,6 +561,7 @@ impl Database {
             root_page: 0,
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         })?;
         self.persist_table_schema(new)?;
         self.persisted_tables
@@ -584,6 +591,7 @@ impl Database {
             root_page: 0,
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         })?;
         self.doc_heaps
             .lock()
@@ -611,6 +619,7 @@ impl Database {
             root_page: 0,
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         })?;
         self.kv_namespaces
             .lock()
@@ -678,12 +687,23 @@ impl Database {
                 ObjectKind::Table => {
                     let primary_key = entry.primary_key.map(|p| p as usize);
                     let index_root = primary_key.map(|_| PageId(entry.root_page));
+                    let indexes = entry
+                        .indexes
+                        .iter()
+                        .map(|ix| prism_sql::IndexDef {
+                            name: ix.name.clone(),
+                            column: ix.column as usize,
+                            unique: true,
+                            root: PageId(ix.root),
+                        })
+                        .collect();
                     self.sql.catalog().register_table(
                         &entry.name,
                         entry.columns,
                         heap,
                         primary_key,
                         index_root,
+                        indexes,
                     )?;
                     persisted.insert(entry.name);
                 }
@@ -707,4 +727,17 @@ impl Database {
         reader.commit()?;
         Ok(())
     }
+}
+
+/// The persistable form of a table's secondary indexes.
+fn index_metas(table: &prism_sql::Table) -> Vec<IndexMeta> {
+    table
+        .indexes
+        .iter()
+        .map(|ix| IndexMeta {
+            name: ix.name.clone(),
+            column: ix.column as u32,
+            root: ix.root.as_u64(),
+        })
+        .collect()
 }

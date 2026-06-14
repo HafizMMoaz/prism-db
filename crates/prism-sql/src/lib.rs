@@ -4,7 +4,9 @@
 //! shares MVCC, locking, recovery, and cross-model transactions with KV and
 //! documents. See `docs/components/sql-engine.md`.
 //!
-//! **Scope (this slice):** `CREATE TABLE`, `INSERT … VALUES`,
+//! **Scope (this slice):** `CREATE TABLE`, `CREATE UNIQUE INDEX … ON t (col)` /
+//! `DROP INDEX` (single-column UNIQUE secondary indexes that enforce uniqueness
+//! on `INSERT`/`UPDATE`), `INSERT … VALUES`,
 //! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
@@ -36,7 +38,7 @@ pub mod catalog;
 pub mod error;
 pub mod types;
 
-pub use catalog::{Catalog, Column, Table};
+pub use catalog::{Catalog, Column, IndexDef, Table};
 pub use error::{Result, SqlError};
 pub use types::{Type, Value};
 
@@ -99,6 +101,16 @@ pub enum Outcome {
         /// in-place schema change. Lets the catalog tombstone the old name.
         renamed_from: Option<String>,
     },
+    /// A `CREATE [UNIQUE] INDEX` added a secondary index to `table`.
+    CreateIndex {
+        /// The table the index was added to (for re-persisting its schema).
+        table: String,
+    },
+    /// A `DROP INDEX` removed a secondary index from `table`.
+    DropIndex {
+        /// The table the index belonged to.
+        table: String,
+    },
 }
 
 /// The relational engine: parses and executes SQL over the record store.
@@ -150,6 +162,7 @@ impl SqlEngine {
         }
         match stmts.pop().unwrap() {
             Statement::CreateTable(ct) => self.exec_create_table(ct),
+            Statement::CreateIndex(ci) => self.exec_create_index(txn, ci),
             Statement::Insert(ins) => self.exec_insert(txn, ins),
             Statement::Query(q) => self.exec_select(txn, *q),
             Statement::Update {
@@ -184,22 +197,97 @@ impl SqlEngine {
         if_exists: bool,
         names: Vec<sqlparser::ast::ObjectName>,
     ) -> Result<Outcome> {
-        if object_type != ObjectType::Table {
-            return Err(SqlError::Unsupported(format!("DROP {object_type}")));
-        }
         if names.len() != 1 {
             return Err(SqlError::Unsupported(
-                "DROP TABLE supports one table at a time".into(),
+                "DROP supports one object at a time".into(),
             ));
         }
         let name = object_name(&names[0]);
-        match self.catalog.drop_table(&name) {
-            Ok(()) => Ok(Outcome::DropTable { name }),
-            // `IF EXISTS` makes a missing table a no-op (still reported so the
-            // server can persist an idempotent tombstone).
-            Err(SqlError::NoSuchTable(_)) if if_exists => Ok(Outcome::DropTable { name }),
-            Err(e) => Err(e),
+        match object_type {
+            ObjectType::Table => match self.catalog.drop_table(&name) {
+                Ok(()) => Ok(Outcome::DropTable { name }),
+                // `IF EXISTS` makes a missing table a no-op (still reported so the
+                // server can persist an idempotent tombstone).
+                Err(SqlError::NoSuchTable(_)) if if_exists => Ok(Outcome::DropTable { name }),
+                Err(e) => Err(e),
+            },
+            ObjectType::Index => match self.catalog.drop_index(&name) {
+                Ok(table) => Ok(Outcome::DropIndex { table }),
+                Err(_) if if_exists => Ok(Outcome::DropIndex {
+                    table: String::new(),
+                }),
+                Err(e) => Err(e),
+            },
+            other => Err(SqlError::Unsupported(format!("DROP {other}"))),
         }
+    }
+
+    /// `CREATE [UNIQUE] INDEX <name> ON <table> (<column>)`. Builds a durable
+    /// B+tree mapping the column's value to each row's id, checking that existing
+    /// values are already unique. Only single-column UNIQUE indexes are supported.
+    fn exec_create_index(
+        &self,
+        txn: &TxnHandle,
+        ci: sqlparser::ast::CreateIndex,
+    ) -> Result<Outcome> {
+        if !ci.unique {
+            return Err(SqlError::Unsupported(
+                "only CREATE UNIQUE INDEX is supported".into(),
+            ));
+        }
+        if ci.columns.len() != 1 {
+            return Err(SqlError::Unsupported(
+                "only single-column indexes are supported".into(),
+            ));
+        }
+        let table_name = object_name(&ci.table_name);
+        let table = self.catalog.table(&table_name)?;
+        let col_idx = resolve_col_expr(&table, &ci.columns[0].expr)?;
+        let name = match &ci.name {
+            Some(n) => object_name(n),
+            None => format!("{table_name}_{}_idx", table.columns[col_idx].name),
+        };
+
+        // Build the tree from the live rows, enforcing uniqueness as we go.
+        let tree = BTree::create(self.store.buffer(), self.store.wal())?;
+        let types = table.types();
+        for (rid, payload) in self.store.scan(txn, table.heap)? {
+            let row = types::decode_row(&types, &payload)?;
+            if matches!(row[col_idx], Value::Null) {
+                continue; // NULLs are not indexed (and don't collide for UNIQUE)
+            }
+            let key = encode_index_key(&row[col_idx])?;
+            if tree.search(&key)?.is_some() {
+                return Err(SqlError::Constraint(format!(
+                    "column {} has duplicate values; cannot create a UNIQUE index",
+                    table.columns[col_idx].name
+                )));
+            }
+            tree.insert(&key, rid)?;
+        }
+
+        self.catalog.add_index(
+            &table_name,
+            IndexDef {
+                name,
+                column: col_idx,
+                unique: true,
+                root: tree.root_page(),
+            },
+        )?;
+        Ok(Outcome::CreateIndex { table: table_name })
+    }
+
+    /// Open the B+trees of `table`'s secondary indexes, paired with their defs.
+    fn secondary_indexes(&self, table: &Table) -> Vec<(IndexDef, BTree)> {
+        table
+            .indexes
+            .iter()
+            .map(|def| {
+                let tree = BTree::open(self.store.buffer(), self.store.wal(), def.root, usize::MAX);
+                (def.clone(), tree)
+            })
+            .collect()
     }
 
     /// `ALTER TABLE <name> <op>`: one operation per statement. ADD/DROP COLUMN
@@ -477,6 +565,7 @@ impl SqlEngine {
 
         let types = table.types();
         let index = self.pk_index(&table);
+        let sec = self.secondary_indexes(&table);
         let mut count = 0;
         for row_exprs in &values.rows {
             if row_exprs.len() != target.len() {
@@ -516,10 +605,32 @@ impl SqlEngine {
                 _ => None,
             };
 
+            // Secondary UNIQUE indexes: reject a visible duplicate, then collect
+            // the keys to insert once the row has a RID. NULLs are not indexed.
+            let mut sec_keys: Vec<(usize, Vec<u8>)> = Vec::new();
+            for (si, (def, tree)) in sec.iter().enumerate() {
+                if matches!(row[def.column], Value::Null) {
+                    continue;
+                }
+                let key = encode_index_key(&row[def.column])?;
+                if let Some(existing) = tree.search(&key)? {
+                    if self.store.read(txn, existing)?.is_some() {
+                        return Err(SqlError::Constraint(format!(
+                            "duplicate value for UNIQUE index {}",
+                            def.name
+                        )));
+                    }
+                }
+                sec_keys.push((si, key));
+            }
+
             let bytes = types::encode_row(&types, &row)?;
             let rid = self.store.insert(txn, table.heap, &bytes)?;
             if let (Some(tree), Some(key)) = (&index, pk_key) {
                 tree.insert(&key, rid)?;
+            }
+            for (si, key) in sec_keys {
+                sec[si].1.insert(&key, rid)?;
             }
             count += 1;
         }
@@ -1153,6 +1264,7 @@ impl SqlEngine {
 
         let types = table.types();
         let index = self.pk_index(&table);
+        let sec = self.secondary_indexes(&table);
         let mut count = 0;
         // scan() materializes the visible rows up front, so writing new
         // versions in this loop cannot disturb the iteration.
@@ -1163,6 +1275,7 @@ impl SqlEngine {
                     continue;
                 }
             }
+            let original = row.clone();
             // Evaluate every assignment against the *original* row, then apply,
             // so `SET a = b, b = a` swaps rather than chaining.
             let mut updates = Vec::with_capacity(sets.len());
@@ -1186,6 +1299,26 @@ impl SqlEngine {
                 }
             }
 
+            // Secondary UNIQUE indexes: when an indexed value changes, reject a
+            // visible duplicate in another row before writing.
+            for (def, tree) in &sec {
+                let new_val = &row[def.column];
+                if matches!(new_val, Value::Null) {
+                    continue;
+                }
+                if original[def.column] != *new_val {
+                    let key = encode_index_key(new_val)?;
+                    if let Some(existing) = tree.search(&key)? {
+                        if existing != rid && self.store.read(txn, existing)?.is_some() {
+                            return Err(SqlError::Constraint(format!(
+                                "duplicate value for UNIQUE index {}",
+                                def.name
+                            )));
+                        }
+                    }
+                }
+            }
+
             let bytes = types::encode_row(&types, &row)?;
             let new_rid = self.store.update(txn, rid, &bytes)?;
             // update() writes a new version at a new RecordId; repoint the
@@ -1193,6 +1326,14 @@ impl SqlEngine {
             if let (Some(tree), Some(pk_col)) = (&index, table.primary_key) {
                 let key = encode_index_key(&row[pk_col])?;
                 tree.insert(&key, new_rid)?;
+            }
+            // Repoint each secondary index at the new version (a changed value
+            // adds a new key; the stale old key is hidden by MVCC on read).
+            for (def, tree) in &sec {
+                if !matches!(row[def.column], Value::Null) {
+                    let key = encode_index_key(&row[def.column])?;
+                    tree.insert(&key, new_rid)?;
+                }
             }
             count += 1;
         }
@@ -4601,5 +4742,73 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(nat, vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]);
+    }
+
+    #[test]
+    fn unique_secondary_index_enforces_and_drops() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, email TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (1,'a@x'),(2,'b@x')")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE UNIQUE INDEX u_email ON u (email)")
+            .unwrap();
+
+        // A duplicate value on the indexed column is rejected on INSERT.
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO u VALUES (3,'a@x')")
+                .is_err()
+        );
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("INSERT INTO u VALUES (3,'c@x')")
+                    .unwrap()
+            ),
+            1
+        );
+
+        // UPDATE into an existing value is rejected; into a fresh value is fine.
+        assert!(
+            env.engine
+                .execute_autocommit("UPDATE u SET email = 'b@x' WHERE id = 1")
+                .is_err()
+        );
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("UPDATE u SET email = 'z@x' WHERE id = 1")
+                    .unwrap()
+            ),
+            1
+        );
+
+        // Building a UNIQUE index over duplicate data fails.
+        env.engine
+            .execute_autocommit("CREATE TABLE d (id BIGINT, k BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO d VALUES (1,5),(2,5)")
+            .unwrap();
+        assert!(
+            env.engine
+                .execute_autocommit("CREATE UNIQUE INDEX d_k ON d (k)")
+                .is_err()
+        );
+
+        // After DROP INDEX the constraint is gone, so a duplicate is accepted.
+        env.engine.execute_autocommit("DROP INDEX u_email").unwrap();
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("INSERT INTO u VALUES (4,'c@x')")
+                    .unwrap()
+            ),
+            1
+        );
     }
 }

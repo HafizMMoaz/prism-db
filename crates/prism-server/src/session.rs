@@ -721,6 +721,12 @@ impl Session {
                         table,
                         renamed_from: None,
                     } => db.persist_table_schema(table),
+                    // CREATE/DROP INDEX changes a table's index list; re-persist
+                    // that table's schema so the index survives restart.
+                    Outcome::CreateIndex { table } => db.persist_table_schema(table),
+                    Outcome::DropIndex { table } if !table.is_empty() => {
+                        db.persist_table_schema(table)
+                    }
                     _ => Ok(()),
                 };
                 if let Err(e) = persisted {
@@ -1390,9 +1396,11 @@ fn empty_kv_body(command: &KvCommand) -> KvResultBody {
 
 fn outcome_to_sql_result(outcome: Outcome) -> Message {
     let (affected_rows, columns, rows) = match outcome {
-        Outcome::CreateTable | Outcome::DropTable { .. } | Outcome::AlterTable { .. } => {
-            (0, vec![], vec![])
-        }
+        Outcome::CreateTable
+        | Outcome::DropTable { .. }
+        | Outcome::AlterTable { .. }
+        | Outcome::CreateIndex { .. }
+        | Outcome::DropIndex { .. } => (0, vec![], vec![]),
         Outcome::Insert { count } => (count as u64, vec![], vec![]),
         Outcome::Select { columns, rows } => {
             let wire_rows: Vec<Row> = rows

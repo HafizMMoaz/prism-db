@@ -24,6 +24,21 @@ pub struct Column {
     pub nullable: bool,
 }
 
+/// A secondary index: a named, durable B+tree mapping one column's value to the
+/// row's id. Only `UNIQUE` indexes are supported (the tree is a unique key map),
+/// so the index both enforces uniqueness and accelerates equality lookups.
+#[derive(Clone, Debug)]
+pub struct IndexDef {
+    /// Index name (unique within a database).
+    pub name: String,
+    /// The indexed column's position in the row.
+    pub column: usize,
+    /// Always true for now (non-unique indexes are not yet supported).
+    pub unique: bool,
+    /// The index B+tree's root page.
+    pub root: PageId,
+}
+
 /// A table's schema and physical heap.
 #[derive(Clone, Debug)]
 pub struct Table {
@@ -37,6 +52,8 @@ pub struct Table {
     pub primary_key: Option<usize>,
     /// The root page of the primary-key B+tree index, if any.
     pub index_root: Option<PageId>,
+    /// Secondary (`UNIQUE`) indexes on this table.
+    pub indexes: Vec<IndexDef>,
 }
 
 impl Table {
@@ -91,6 +108,7 @@ impl Catalog {
             columns,
             primary_key,
             index_root,
+            indexes: Vec::new(),
         };
         tables.insert(name.to_string(), table.clone());
         Ok(table)
@@ -164,6 +182,7 @@ impl Catalog {
     /// Install a table at a known heap (used when reloading a persisted catalog
     /// after restart). Bumps the heap allocator past `heap` so new tables don't
     /// collide. Errors if the name is already registered.
+    #[allow(clippy::too_many_arguments)]
     pub fn register_table(
         &self,
         name: &str,
@@ -171,6 +190,7 @@ impl Catalog {
         heap: HeapId,
         primary_key: Option<usize>,
         index_root: Option<PageId>,
+        indexes: Vec<IndexDef>,
     ) -> Result<()> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
@@ -184,11 +204,42 @@ impl Catalog {
                 columns,
                 primary_key,
                 index_root,
+                indexes,
             },
         );
         let mut n = self.next_heap.lock().expect("catalog poisoned");
         *n = (*n).max(heap.0 + 1);
         Ok(())
+    }
+
+    /// Register a secondary index on an existing table. Errors if the table is
+    /// unknown or the index name is already taken (in any table).
+    pub fn add_index(&self, table: &str, def: IndexDef) -> Result<()> {
+        let mut tables = self.tables.lock().expect("catalog poisoned");
+        if tables
+            .values()
+            .any(|t| t.indexes.iter().any(|i| i.name == def.name))
+        {
+            return Err(SqlError::TableExists(def.name));
+        }
+        let t = tables
+            .get_mut(table)
+            .ok_or_else(|| SqlError::NoSuchTable(table.to_string()))?;
+        t.indexes.push(def);
+        Ok(())
+    }
+
+    /// Remove a secondary index by name, returning its table's name. Errors if
+    /// no such index exists.
+    pub fn drop_index(&self, name: &str) -> Result<String> {
+        let mut tables = self.tables.lock().expect("catalog poisoned");
+        for t in tables.values_mut() {
+            if let Some(pos) = t.indexes.iter().position(|i| i.name == name) {
+                t.indexes.remove(pos);
+                return Ok(t.name.clone());
+            }
+        }
+        Err(SqlError::NoSuchTable(format!("index {name}")))
     }
 
     /// A snapshot of all tables (for persisting the catalog).

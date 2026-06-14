@@ -72,6 +72,18 @@ impl CatalogOp {
     }
 }
 
+/// A persisted secondary (UNIQUE) index: its name, the indexed column position,
+/// and its B+tree root page.
+#[derive(Clone, Debug)]
+pub struct IndexMeta {
+    /// Index name.
+    pub name: String,
+    /// Indexed column position in the row.
+    pub column: u32,
+    /// The index B+tree's root page.
+    pub root: u64,
+}
+
 /// One catalog entry: a named object and its heap, plus a schema for tables and
 /// an index-tree root for KV namespaces.
 #[derive(Clone, Debug)]
@@ -92,6 +104,8 @@ pub struct CatalogEntry {
     pub primary_key: Option<u32>,
     /// Column schema (tables only; empty otherwise).
     pub columns: Vec<Column>,
+    /// Secondary (UNIQUE) indexes (tables only; empty otherwise).
+    pub indexes: Vec<IndexMeta>,
 }
 
 impl CatalogEntry {
@@ -118,6 +132,18 @@ impl CatalogEntry {
         // The op is appended last so an `Upsert` record stays byte-identical to
         // the original create-only format.
         w.put_u8(self.op.code());
+        // Secondary indexes follow the op (records without them decode as none).
+        let nidx: u16 = self
+            .indexes
+            .len()
+            .try_into()
+            .map_err(|_| ServerError::Corrupt("too many indexes".into()))?;
+        w.put_u16(nidx);
+        for ix in &self.indexes {
+            w.put_str_u16("catalog.index", &ix.name)?;
+            w.put_u64(u64::from(ix.column));
+            w.put_u64(ix.root);
+        }
         Ok(w.into_vec())
     }
 
@@ -148,6 +174,20 @@ impl CatalogEntry {
         } else {
             CatalogOp::from_code(r.get_u8("catalog.op")?)?
         };
+        // Secondary indexes follow the op; records without them decode as none.
+        let indexes = if r.is_empty() {
+            Vec::new()
+        } else {
+            let nidx = r.get_u16("catalog.nindexes")?;
+            let mut v = Vec::with_capacity(nidx as usize);
+            for _ in 0..nidx {
+                let name = r.get_str_u16("catalog.index")?;
+                let column = r.get_u64("catalog.index_col")? as u32;
+                let root = r.get_u64("catalog.index_root")?;
+                v.push(IndexMeta { name, column, root });
+            }
+            v
+        };
         Ok(Self {
             op,
             kind,
@@ -156,6 +196,7 @@ impl CatalogEntry {
             root_page,
             primary_key,
             columns,
+            indexes,
         })
     }
 }
@@ -308,6 +349,11 @@ mod tests {
                     nullable: true,
                 },
             ],
+            indexes: vec![IndexMeta {
+                name: "accounts_owner_idx".into(),
+                column: 1,
+                root: 99,
+            }],
         };
         let decoded = CatalogEntry::decode(&table.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
@@ -319,6 +365,10 @@ mod tests {
         assert_eq!(decoded.columns.len(), 2);
         assert_eq!(decoded.columns[1].name, "owner");
         assert_eq!(decoded.columns[1].ty, Type::Text);
+        assert_eq!(decoded.indexes.len(), 1);
+        assert_eq!(decoded.indexes[0].name, "accounts_owner_idx");
+        assert_eq!(decoded.indexes[0].column, 1);
+        assert_eq!(decoded.indexes[0].root, 99);
 
         let ns = CatalogEntry {
             op: CatalogOp::Delete,
@@ -328,6 +378,7 @@ mod tests {
             root_page: 77,
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Delete);
@@ -349,10 +400,13 @@ mod tests {
             root_page: 0,
             primary_key: None,
             columns: vec![],
+            indexes: vec![],
         }
         .encode()
         .unwrap();
-        bytes.pop(); // drop the op byte to mimic the pre-feature format
+        // The original create-only format ended after the columns; drop the op
+        // byte and the (empty) index-count u16 that follow it.
+        bytes.truncate(bytes.len() - 3);
         let decoded = CatalogEntry::decode(&bytes).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
         assert_eq!(decoded.name, "t");
