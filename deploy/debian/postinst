@@ -1,0 +1,10 @@
+#!/bin/sh
+# Enable and start prismd on install; restart it on upgrade. Best-effort so the
+# package still configures cleanly in environments without systemd (containers).
+set -e
+if [ "$1" = "configure" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable prismd.service >/dev/null 2>&1 || true
+    systemctl restart prismd.service >/dev/null 2>&1 || true
+fi
+exit 0

@@ -23,8 +23,9 @@ eula = false
 
 # Debian/Ubuntu package (cargo-deb). Asset source paths are relative to this
 # crate dir; `../../` reaches the workspace root. The systemd unit + config are
-# installed and the service is enabled/started on install (DynamicUser, so no
-# package account is created). Built in .github/workflows/linux-packages.yml.
+# installed and the service is enabled/started by explicit maintainer scripts
+# (deploy/debian/) — the unit uses DynamicUser, so no package account is needed.
+# Built in .github/workflows/linux-packages.yml.
 [package.metadata.deb]
 maintainer = "The Prism authors <hafizmoazkhalid@gmail.com>"
 copyright = "2026, The Prism authors"
@@ -37,21 +38,17 @@ prism-shell client, and the prism-fsck/prism-dump utilities, and runs prismd as 
 a systemd service (listening on localhost by default)."""
 section = "database"
 priority = "optional"
+maintainer-scripts = "../../deploy/debian"
 assets = [
     ["target/release/prismd", "usr/bin/", "755"],
     ["target/release/prism-shell", "usr/bin/", "755"],
     ["target/release/prism-fsck", "usr/bin/", "755"],
     ["target/release/prism-dump", "usr/bin/", "755"],
+    ["../../deploy/prismd.service", "lib/systemd/system/prismd.service", "644"],
     ["../../deploy/prismd.conf", "etc/prismdb/prismd.conf", "644"],
     ["../../README.md", "usr/share/doc/prismdb/README.md", "644"],
 ]
 conf-files = ["/etc/prismdb/prismd.conf"]
-
-[package.metadata.deb.systemd-units]
-unit-name = "prismd"
-unit-scripts = "../../deploy"
-enable = true
-start = true
 
 [dependencies]
 prism-server = { workspace = true }
