@@ -21,6 +21,15 @@ For each tag `vX.Y.Z`, the GitHub Release gets:
 
 Targets: Linux `x86_64`/`aarch64`, macOS `x86_64`/`aarch64`, Windows `x86_64`.
 
+A separate workflow,
+[`linux-packages.yml`](../../.github/workflows/linux-packages.yml), also builds
+the native **`.deb`** (cargo-deb) and **`.rpm`** (cargo-generate-rpm) — each
+registering `prismd` as a systemd service — and attaches them to the same
+release. It runs on `release: published`, and can be dispatched manually
+(`ref` = code to build, `release_tag` = release to upload to) to (re)build for an
+existing tag. The metadata lives in `crates/prism-cli/Cargo.toml`; the service
+unit/config and Debian maintainer scripts are in [`deploy/`](../../deploy).
+
 ## One-time setup
 
 1. **Homebrew tap repo.** Create an empty public repo `HafizMMoaz/homebrew-prism`.

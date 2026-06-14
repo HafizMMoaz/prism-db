@@ -27,6 +27,24 @@ Windows users can instead run the `.msi` from the
 the server as a managed service that starts on boot, see
 [Run as a service](#run-as-a-service) below.
 
+### Debian / Ubuntu and Fedora / RHEL packages
+
+Native packages install the binaries **and** register `prismd` as a systemd
+service that starts on boot (bound to localhost) — no extra setup. Download the
+`.deb` or `.rpm` from the [latest release](https://github.com/HafizMMoaz/prism-db/releases/latest):
+
+```bash
+# Debian / Ubuntu
+sudo apt install ./prismdb_0.1.0-1_amd64.deb
+
+# Fedora / RHEL / CentOS
+sudo dnf install ./prismdb-0.1.0-1.x86_64.rpm
+```
+
+The service is configured through `/etc/prismdb/prismd.conf` (a conffile, so your
+edits survive upgrades); `systemctl status prismd` and `journalctl -u prismd`
+show its state and logs.
+
 ## The data directory
 
 `prismd` stores everything under one data directory — never in your project
