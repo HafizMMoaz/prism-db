@@ -13,11 +13,12 @@
 //! `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/`TEXT` (integers widen to doubles in
 //! mixed arithmetic; `TIMESTAMP` is epoch microseconds and parses from
 //! `'YYYY-MM-DD[ HH:MM:SS]'` strings; `CAST(x AS <type>)` converts between
-//! scalars). Multi-table queries support `INNER` / `LEFT` /
-//! `RIGHT` / `FULL OUTER` / `CROSS` joins (and comma-separated cartesian
-//! products and self-joins via aliases) by nested loop, with `t.col`-qualified
-//! column references throughout `SELECT`/`WHERE`/`ON`/`GROUP BY`/`HAVING`/
-//! `ORDER BY`. Expressions support arithmetic (`+ - * / %`),
+//! scalars). Multi-table queries support `INNER` / `LEFT` / `RIGHT` /
+//! `FULL OUTER` / `CROSS` joins (and comma-separated cartesian products and
+//! self-joins via aliases) by nested loop, with `ON`, `USING (…)`, and `NATURAL`
+//! constraints (`USING`/`NATURAL` coalesce the join columns), and `t.col`-
+//! qualified column references throughout `SELECT`/`WHERE`/`ON`/`GROUP BY`/
+//! `HAVING`/`ORDER BY`. Expressions support arithmetic (`+ - * / %`),
 //! comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)`,
 //! `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`), `CASE`, and scalar
 //! functions: date/time (`NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/
@@ -26,11 +27,10 @@
 //! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
 //! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
 //! the select list, and `HAVING` (and `ORDER BY` over aggregate output, by name,
-//! 1-based ordinal, or expression text). Deferred: `USING`/`NATURAL` join
-//! constraints, updating a primary-key column, join predicate pushdown / index
-//! nested-loop, the formal bind/rewrite/plan IR. The
-//! current executor interprets the parsed AST directly against the catalog; the
-//! full parse→bind→plan→execute pipeline is a follow-up.
+//! 1-based ordinal, or expression text). Deferred: updating a primary-key
+//! column, join predicate pushdown / index nested-loop, the formal
+//! bind/rewrite/plan IR. The current executor interprets the parsed AST directly
+//! against the catalog; the full parse→bind→plan→execute pipeline is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -753,8 +753,6 @@ impl SqlEngine {
     ) -> Result<(JoinSchema, Vec<Vec<Value>>)> {
         let left_w = left_schema.cols.len();
         let right_w = right_schema.cols.len();
-        let mut combined = left_schema;
-        combined.cols.extend(right_schema.cols);
 
         enum Kind {
             Inner,
@@ -763,14 +761,51 @@ impl SqlEngine {
             Full,
             Cross,
         }
-        let (kind, on) = match op {
-            JoinOperator::Inner(c) => (Kind::Inner, constraint_on(c)?),
-            JoinOperator::LeftOuter(c) => (Kind::Left, constraint_on(c)?),
-            JoinOperator::RightOuter(c) => (Kind::Right, constraint_on(c)?),
-            JoinOperator::FullOuter(c) => (Kind::Full, constraint_on(c)?),
+        let (kind, constraint): (Kind, Option<&JoinConstraint>) = match op {
+            JoinOperator::Inner(c) => (Kind::Inner, Some(c)),
+            JoinOperator::LeftOuter(c) => (Kind::Left, Some(c)),
+            JoinOperator::RightOuter(c) => (Kind::Right, Some(c)),
+            JoinOperator::FullOuter(c) => (Kind::Full, Some(c)),
             JoinOperator::CrossJoin => (Kind::Cross, None),
             other => return Err(SqlError::Unsupported(format!("join type: {other:?}"))),
         };
+
+        // Resolve the join condition. USING/NATURAL become equi-pairs of
+        // (left index, right index) and coalesce their columns afterward.
+        let cond = match constraint {
+            None | Some(JoinConstraint::None) => JoinCond::Always,
+            Some(JoinConstraint::On(e)) => JoinCond::On(e),
+            Some(JoinConstraint::Using(cols)) => {
+                let mut pairs = Vec::with_capacity(cols.len());
+                for name in cols {
+                    let n = object_name(name);
+                    let li = left_schema.resolve(None, &n).map_err(|_| {
+                        SqlError::Unsupported(format!("USING column {n} is not in the left side"))
+                    })?;
+                    let ri = right_schema.resolve(None, &n).map_err(|_| {
+                        SqlError::Unsupported(format!("USING column {n} is not in the right side"))
+                    })?;
+                    pairs.push((li, ri));
+                }
+                JoinCond::Pairs(pairs)
+            }
+            Some(JoinConstraint::Natural) => {
+                let mut pairs = Vec::new();
+                for (li, lc) in left_schema.cols.iter().enumerate() {
+                    if let Ok(ri) = right_schema.resolve(None, &lc.name) {
+                        pairs.push((li, ri));
+                    }
+                }
+                JoinCond::Pairs(pairs)
+            }
+        };
+        let coalesce_pairs = match &cond {
+            JoinCond::Pairs(p) => Some(p.clone()),
+            _ => None,
+        };
+
+        let mut combined = left_schema;
+        combined.cols.extend(right_schema.cols);
 
         let cat = |l: &[Value], r: &[Value]| -> Vec<Value> {
             let mut row = Vec::with_capacity(l.len() + r.len());
@@ -786,7 +821,7 @@ impl SqlEngine {
             Kind::Inner | Kind::Cross => {
                 for l in &left_rows {
                     for r in &right_rows {
-                        if self.eval_on(on, &combined, l, r)? {
+                        if self.join_match(&cond, &combined, l, r)? {
                             out.push(cat(l, r));
                         }
                     }
@@ -796,7 +831,7 @@ impl SqlEngine {
                 for l in &left_rows {
                     let mut matched = false;
                     for r in &right_rows {
-                        if self.eval_on(on, &combined, l, r)? {
+                        if self.join_match(&cond, &combined, l, r)? {
                             out.push(cat(l, r));
                             matched = true;
                         }
@@ -810,7 +845,7 @@ impl SqlEngine {
                 for r in &right_rows {
                     let mut matched = false;
                     for l in &left_rows {
-                        if self.eval_on(on, &combined, l, r)? {
+                        if self.join_match(&cond, &combined, l, r)? {
                             out.push(cat(l, r));
                             matched = true;
                         }
@@ -825,7 +860,7 @@ impl SqlEngine {
                 for l in &left_rows {
                     let mut matched = false;
                     for (ri, r) in right_rows.iter().enumerate() {
-                        if self.eval_on(on, &combined, l, r)? {
+                        if self.join_match(&cond, &combined, l, r)? {
                             out.push(cat(l, r));
                             matched = true;
                             right_hit[ri] = true;
@@ -842,7 +877,34 @@ impl SqlEngine {
                 }
             }
         }
+
+        // USING/NATURAL: emit each join column once (coalescing the two sides).
+        if let Some(pairs) = coalesce_pairs {
+            return Ok(coalesce_join(combined, out, &pairs, left_w));
+        }
         Ok((combined, out))
+    }
+
+    /// Test a join condition against a left and a right row.
+    fn join_match(
+        &self,
+        cond: &JoinCond,
+        combined: &JoinSchema,
+        l: &[Value],
+        r: &[Value],
+    ) -> Result<bool> {
+        match cond {
+            JoinCond::Always => Ok(true),
+            JoinCond::On(e) => self.eval_on(Some(e), combined, l, r),
+            JoinCond::Pairs(pairs) => {
+                for &(li, ri) in pairs {
+                    if !compare(&BinaryOperator::Eq, &l[li], &r[ri]) {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
     }
 
     /// Evaluate each projection item against `row`.
@@ -1890,12 +1952,83 @@ fn cross_join(
 
 /// The `ON <expr>` of a join constraint, `None` for a constraint-free (cross)
 /// join. `USING` / `NATURAL` are not supported yet.
-fn constraint_on(c: &JoinConstraint) -> Result<Option<&Expr>> {
-    match c {
-        JoinConstraint::On(e) => Ok(Some(e)),
-        JoinConstraint::None => Ok(None),
-        other => Err(SqlError::Unsupported(format!("join constraint: {other:?}"))),
+/// A resolved join condition. `Pairs` holds `(left index, right index)` equalities
+/// from `USING`/`NATURAL`, which also drives column coalescing.
+enum JoinCond<'e> {
+    Always,
+    On(&'e Expr),
+    Pairs(Vec<(usize, usize)>),
+}
+
+/// Coalesce the columns of a `USING`/`NATURAL` join: each join column appears
+/// once (taking the non-null side), followed by the remaining left then right
+/// columns. `pairs` are `(left index, right index)`; `left_w` is the left width.
+fn coalesce_join(
+    combined: JoinSchema,
+    rows: Vec<Vec<Value>>,
+    pairs: &[(usize, usize)],
+    left_w: usize,
+) -> (JoinSchema, Vec<Vec<Value>>) {
+    use std::collections::HashSet;
+    let left_join: HashSet<usize> = pairs.iter().map(|&(li, _)| li).collect();
+    let right_join: HashSet<usize> = pairs.iter().map(|&(_, ri)| ri).collect();
+
+    // A plan describing each output column's source in the combined row.
+    enum Src {
+        Copy(usize),
+        Coalesce(usize, usize),
     }
+    let mut cols: Vec<JoinCol> = Vec::new();
+    let mut plan: Vec<Src> = Vec::new();
+
+    // Join columns first, coalesced, keeping the left side's qualifier + name.
+    for &(li, ri) in pairs {
+        let c = &combined.cols[li];
+        cols.push(JoinCol {
+            qualifier: c.qualifier.clone(),
+            name: c.name.clone(),
+        });
+        plan.push(Src::Coalesce(li, left_w + ri));
+    }
+    // Remaining left columns, then remaining right columns.
+    for i in 0..left_w {
+        if !left_join.contains(&i) {
+            cols.push(JoinCol {
+                qualifier: combined.cols[i].qualifier.clone(),
+                name: combined.cols[i].name.clone(),
+            });
+            plan.push(Src::Copy(i));
+        }
+    }
+    for ri in 0..(combined.cols.len() - left_w) {
+        if !right_join.contains(&ri) {
+            let i = left_w + ri;
+            cols.push(JoinCol {
+                qualifier: combined.cols[i].qualifier.clone(),
+                name: combined.cols[i].name.clone(),
+            });
+            plan.push(Src::Copy(i));
+        }
+    }
+
+    let new_rows = rows
+        .into_iter()
+        .map(|row| {
+            plan.iter()
+                .map(|s| match s {
+                    Src::Copy(i) => row[*i].clone(),
+                    Src::Coalesce(li, ri) => {
+                        if matches!(row[*li], Value::Null) {
+                            row[*ri].clone()
+                        } else {
+                            row[*li].clone()
+                        }
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    (JoinSchema { cols }, new_rows)
 }
 
 /// Remove duplicate rows in place, preserving first-seen order (for DISTINCT).
@@ -4389,5 +4522,84 @@ mod tests {
             text[0],
             vec![Value::Text("2020-01-02 00:00:00".to_string())]
         );
+    }
+
+    #[test]
+    fn using_and_natural_joins_coalesce_columns() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE l (id BIGINT, lname TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE TABLE r (id BIGINT, rname TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO l VALUES (1,'a'),(2,'b'),(3,'c')")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO r VALUES (2,'x'),(3,'y'),(4,'z')")
+            .unwrap();
+
+        // USING(id): the join column appears once; bare `id` is unambiguous.
+        let u = rows(
+            env.engine
+                .execute_autocommit("SELECT id, lname, rname FROM l JOIN r USING (id) ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            u,
+            vec![
+                vec![Value::Int64(2), t("b"), t("x")],
+                vec![Value::Int64(3), t("c"), t("y")],
+            ]
+        );
+
+        // SELECT * shows the coalesced column once: id, then left, then right.
+        match env
+            .engine
+            .execute_autocommit("SELECT * FROM l JOIN r USING (id)")
+            .unwrap()
+        {
+            Outcome::Select { columns, .. } => assert_eq!(columns, vec!["id", "lname", "rname"]),
+            other => panic!("{other:?}"),
+        }
+
+        // LEFT JOIN USING keeps the left id (coalesced), right side NULL.
+        let lj = rows(
+            env.engine
+                .execute_autocommit("SELECT id, rname FROM l LEFT JOIN r USING (id) ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            lj,
+            vec![
+                vec![Value::Int64(1), Value::Null],
+                vec![Value::Int64(2), t("x")],
+                vec![Value::Int64(3), t("y")],
+            ]
+        );
+
+        // RIGHT JOIN USING coalesces id from the right when the left is missing.
+        let rj = rows(
+            env.engine
+                .execute_autocommit("SELECT id, lname FROM l RIGHT JOIN r USING (id) ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(
+            rj,
+            vec![
+                vec![Value::Int64(2), t("b")],
+                vec![Value::Int64(3), t("c")],
+                vec![Value::Int64(4), Value::Null],
+            ]
+        );
+
+        // NATURAL JOIN uses all common columns (here, just `id`).
+        let nat = rows(
+            env.engine
+                .execute_autocommit("SELECT id FROM l NATURAL JOIN r ORDER BY id")
+                .unwrap(),
+        );
+        assert_eq!(nat, vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]);
     }
 }
