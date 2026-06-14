@@ -1,0 +1,42 @@
+name: Linux packages
+
+# Builds the native Debian/RPM packages and attaches them to the GitHub Release.
+# Runs when a Release is published; dispatch manually to (re)build for an existing
+# tag — `ref` is the code to build from, `release_tag` the release to upload to.
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build from"
+        required: false
+        default: "main"
+      release_tag:
+        description: "Release tag to upload packages to"
+        required: true
+
+permissions:
+  contents: write # upload release assets
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref }}
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Build the .deb (release binaries + systemd service)
+        run: cargo deb -p prismdb
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
+          ls -l target/debian/
+          gh release upload "$TAG" target/debian/*.deb --clobber
