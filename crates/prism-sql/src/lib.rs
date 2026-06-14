@@ -16,15 +16,18 @@
 //! column references throughout `SELECT`/`WHERE`/`ON`/`GROUP BY`/`HAVING`/
 //! `ORDER BY`. Expressions support arithmetic (`+ - * / %`),
 //! comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)`,
-//! `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`), and scalar functions —
-//! date/time (`NOW`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND` over Unix
-//! epoch seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`),
-//! and numeric (`ABS`/`MOD`/`COALESCE`) — usable in `WHERE`, `SET`, the select
-//! list, and `HAVING`. Deferred: `USING`/`NATURAL` join constraints, `AVG`
-//! (needs a floating-point type), `ORDER BY` over aggregate output, updating a
-//! primary-key column, join predicate pushdown / index nested-loop, the formal
-//! bind/rewrite/plan IR. The current executor interprets the parsed AST directly
-//! against the catalog; the full parse→bind→plan→execute pipeline is a follow-up.
+//! `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`), `CASE`, and scalar
+//! functions: date/time (`NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/
+//! `SECOND`, `DATEDIFF`, `DATE_ADD`/`DATE_SUB` with `INTERVAL n DAY|HOUR|…`, over
+//! Unix epoch seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/
+//! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
+//! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
+//! the select list, and `HAVING`. Deferred: `USING`/`NATURAL` join constraints,
+//! `AVG` and fractional `ROUND`/`CEIL`/`FLOOR` (need a floating-point type),
+//! `ORDER BY` over aggregate output, updating a primary-key column, join
+//! predicate pushdown / index nested-loop, the formal bind/rewrite/plan IR. The
+//! current executor interprets the parsed AST directly against the catalog; the
+//! full parse→bind→plan→execute pipeline is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -41,11 +44,11 @@ use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
-    AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, ColumnDef, ColumnOption,
-    DataType, Delete, Distinct, DuplicateTreatment, Expr, FromTable, Function, FunctionArg,
-    FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint, JoinOperator, ObjectName,
-    ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableObject, TableWithJoins, UnaryOperator, Value as SqlValue,
+    AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, CeilFloorKind, ColumnDef,
+    ColumnOption, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment, Expr, FromTable,
+    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
+    JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr,
+    Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1314,6 +1317,82 @@ impl SqlEngine {
                 }
                 str_map(self.eval(inner, row, cols)?, |s| s.trim().to_string())
             }
+            // `CASE [op] WHEN c THEN r … [ELSE e] END`. Searched form (no
+            // operand) tests each `c` as a boolean; simple form compares `op`
+            // against each `c`. Falls back to `ELSE` (or NULL).
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                match operand {
+                    None => {
+                        for (cond, res) in conditions.iter().zip(results) {
+                            if self.matches(cond, row, cols)? {
+                                return self.eval(res, row, cols);
+                            }
+                        }
+                    }
+                    Some(op) => {
+                        let target = self.eval(op, row, cols)?;
+                        for (cond, res) in conditions.iter().zip(results) {
+                            if self.eval(cond, row, cols)? == target {
+                                return self.eval(res, row, cols);
+                            }
+                        }
+                    }
+                }
+                match else_result {
+                    Some(e) => self.eval(e, row, cols),
+                    None => Ok(Value::Null),
+                }
+            }
+            // `INTERVAL n <unit>` → a count of seconds (dates are epoch seconds),
+            // so it composes with `DATE_ADD`/`DATE_SUB` and plain arithmetic.
+            Expr::Interval(iv) => {
+                let n = match self.eval(&iv.value, row, cols)? {
+                    Value::Int64(n) => n,
+                    Value::Null => return Ok(Value::Null),
+                    other => {
+                        return Err(SqlError::Type(format!(
+                            "INTERVAL value must be an integer, got {other:?}"
+                        )));
+                    }
+                };
+                let unit_secs: i64 = match &iv.leading_field {
+                    None | Some(DateTimeField::Second | DateTimeField::Seconds) => 1,
+                    Some(DateTimeField::Minute | DateTimeField::Minutes) => 60,
+                    Some(DateTimeField::Hour | DateTimeField::Hours) => 3_600,
+                    Some(DateTimeField::Day | DateTimeField::Days) => 86_400,
+                    Some(DateTimeField::Week(_) | DateTimeField::Weeks) => 7 * 86_400,
+                    Some(other) => {
+                        return Err(SqlError::Unsupported(format!("INTERVAL unit {other:?}")));
+                    }
+                };
+                n.checked_mul(unit_secs)
+                    .map(Value::Int64)
+                    .ok_or_else(|| SqlError::Type("INTERVAL overflow".into()))
+            }
+            // `CEIL`/`FLOOR` parse to their own nodes (not function calls).
+            // Integer operands are already whole, so both are the identity until
+            // a floating-point type lands.
+            Expr::Ceil { expr: inner, field } | Expr::Floor { expr: inner, field } => {
+                match field {
+                    CeilFloorKind::DateTimeField(DateTimeField::NoDateTime)
+                    | CeilFloorKind::Scale(_) => {}
+                    CeilFloorKind::DateTimeField(_) => {
+                        return Err(SqlError::Unsupported("CEIL/FLOOR TO <unit>".into()));
+                    }
+                }
+                match self.eval(inner, row, cols)? {
+                    v @ Value::Int64(_) => Ok(v),
+                    Value::Null => Ok(Value::Null),
+                    other => Err(SqlError::Type(format!(
+                        "CEIL/FLOOR expects a number, got {other:?}"
+                    ))),
+                }
+            }
             other => Err(SqlError::Unsupported(format!("expression: {other:?}"))),
         }
     }
@@ -1427,6 +1506,104 @@ impl SqlEngine {
                     }
                 }
                 Ok(Value::Null)
+            }
+            "REPLACE" => match (arg(0)?, arg(1)?, arg(2)?) {
+                (Value::Text(s), Value::Text(from), Value::Text(to)) => {
+                    Ok(Value::Text(s.replace(&from, &to)))
+                }
+                (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+                _ => Err(SqlError::Type("REPLACE requires text operands".into())),
+            },
+            // ── more date / time (epoch seconds; see NOW/YEAR above) ──
+            "CURDATE" | "CURRENT_DATE" => {
+                let now = now_epoch_secs();
+                Ok(Value::Int64(now - now.rem_euclid(86_400)))
+            }
+            "DATEDIFF" => match (arg(0)?, arg(1)?) {
+                (Value::Int64(a), Value::Int64(b)) => Ok(Value::Int64((a - b).div_euclid(86_400))),
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, b) => Err(SqlError::Type(format!(
+                    "DATEDIFF expects integer epoch seconds, got {a:?}, {b:?}"
+                ))),
+            },
+            // The second operand is typically `INTERVAL n <unit>`, which evaluates
+            // to a count of seconds; a bare integer (seconds) also works.
+            "DATE_ADD" | "ADDDATE" => arith(&BinaryOperator::Plus, &arg(0)?, &arg(1)?),
+            "DATE_SUB" | "SUBDATE" => arith(&BinaryOperator::Minus, &arg(0)?, &arg(1)?),
+            // ── more numeric (integer semantics until a float type lands) ──
+            "ROUND" => match arg(0)? {
+                Value::Null => Ok(Value::Null),
+                Value::Int64(n) => {
+                    // Integers are already whole; a negative scale rounds to a
+                    // power of ten (e.g. ROUND(1234, -2) = 1200).
+                    let scale = if nargs >= 2 {
+                        match arg(1)? {
+                            Value::Int64(d) => d,
+                            other => {
+                                return Err(SqlError::Type(format!(
+                                    "ROUND scale must be an integer, got {other:?}"
+                                )));
+                            }
+                        }
+                    } else {
+                        0
+                    };
+                    if scale >= 0 {
+                        return Ok(Value::Int64(n));
+                    }
+                    let exp = u32::try_from(scale.unsigned_abs())
+                        .map_err(|_| SqlError::Type("ROUND scale too large".into()))?;
+                    let factor = 10i64
+                        .checked_pow(exp)
+                        .ok_or_else(|| SqlError::Type("ROUND scale too large".into()))?;
+                    let half = factor / 2;
+                    let rounded = if n >= 0 {
+                        (n + half) / factor * factor
+                    } else {
+                        (n - half) / factor * factor
+                    };
+                    Ok(Value::Int64(rounded))
+                }
+                other => Err(SqlError::Type(format!(
+                    "ROUND expects a number, got {other:?}"
+                ))),
+            },
+            "POW" | "POWER" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Int64(base), Value::Int64(exp)) => {
+                    let e = u32::try_from(exp).map_err(|_| {
+                        SqlError::Type("POW exponent must be a non-negative integer".into())
+                    })?;
+                    base.checked_pow(e)
+                        .map(Value::Int64)
+                        .ok_or_else(|| SqlError::Type("POW overflow".into()))
+                }
+                (a, b) => Err(SqlError::Type(format!(
+                    "POW expects integers, got {a:?}, {b:?}"
+                ))),
+            },
+            // ── control flow ──
+            "IF" => {
+                if nargs != 3 {
+                    return Err(SqlError::Type("IF takes exactly three arguments".into()));
+                }
+                if self.matches(arg_exprs[0], row, cols)? {
+                    self.eval(arg_exprs[1], row, cols)
+                } else {
+                    self.eval(arg_exprs[2], row, cols)
+                }
+            }
+            "IFNULL" => {
+                let a = arg(0)?;
+                if matches!(a, Value::Null) {
+                    arg(1)
+                } else {
+                    Ok(a)
+                }
+            }
+            "NULLIF" => {
+                let a = arg(0)?;
+                if a == arg(1)? { Ok(Value::Null) } else { Ok(a) }
             }
             other => Err(SqlError::Unsupported(format!("function {other}"))),
         }
@@ -3779,6 +3956,55 @@ mod tests {
             env.engine
                 .execute_autocommit("SELECT id FROM users u JOIN orders o ON u.id = o.user_id")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn control_flow_and_scalar_functions() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (5, 'hello')")
+            .unwrap();
+        let r = rows(
+            env.engine
+                .execute_autocommit(
+                    "SELECT \
+                     CASE WHEN id > 3 THEN 'big' ELSE 'small' END, \
+                     CASE id WHEN 5 THEN 'five' ELSE 'other' END, \
+                     IF(id > 3, 'yes', 'no'), \
+                     IFNULL(NULL, 'fallback'), \
+                     NULLIF(id, 5), \
+                     REPLACE(name, 'l', 'L'), \
+                     ROUND(1234, -2), \
+                     CEIL(7), FLOOR(7), \
+                     POW(2, 10), \
+                     DATEDIFF(172800, 86400), \
+                     DATE_ADD(0, INTERVAL 2 DAY), \
+                     DATE_SUB(172800, INTERVAL 1 DAY) \
+                     FROM t",
+                )
+                .unwrap(),
+        );
+        assert_eq!(
+            r[0],
+            vec![
+                t("big"),
+                t("five"),
+                t("yes"),
+                t("fallback"),
+                Value::Null,
+                t("heLLo"),
+                Value::Int64(1200),
+                Value::Int64(7),
+                Value::Int64(7),
+                Value::Int64(1024),
+                Value::Int64(1),
+                Value::Int64(172_800),
+                Value::Int64(86_400),
+            ]
         );
     }
 }
