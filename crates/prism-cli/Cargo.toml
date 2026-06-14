@@ -50,6 +50,47 @@ assets = [
 ]
 conf-files = ["/etc/prismdb/prismd.conf"]
 
+# Fedora/RHEL package (cargo-generate-rpm). Run from the workspace root, so asset
+# source paths are workspace-root-relative. systemd is wired by explicit
+# scriptlets (RPM has no maintainer-script dir like Debian). Built in
+# .github/workflows/linux-packages.yml.
+[package.metadata.generate-rpm]
+name = "prismdb"
+summary = "Single-node multi-model database (SQL + document + key-value)."
+assets = [
+    { source = "target/release/prismd", dest = "/usr/bin/prismd", mode = "755" },
+    { source = "target/release/prism-shell", dest = "/usr/bin/prism-shell", mode = "755" },
+    { source = "target/release/prism-fsck", dest = "/usr/bin/prism-fsck", mode = "755" },
+    { source = "target/release/prism-dump", dest = "/usr/bin/prism-dump", mode = "755" },
+    { source = "deploy/prismd.service", dest = "/usr/lib/systemd/system/prismd.service", mode = "644" },
+    { source = "deploy/prismd.conf", dest = "/etc/prismdb/prismd.conf", mode = "644", config = "noreplace" },
+    { source = "README.md", dest = "/usr/share/doc/prismdb/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/doc/prismdb/LICENSE", mode = "644", doc = true },
+]
+auto-req = "no"
+post_install_script = """\
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ "$1" = "1" ]; then
+        systemctl enable prismd.service >/dev/null 2>&1 || true
+        systemctl start prismd.service >/dev/null 2>&1 || true
+    else
+        systemctl try-restart prismd.service >/dev/null 2>&1 || true
+    fi
+fi
+"""
+pre_uninstall_script = """\
+if [ "$1" = "0" ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl stop prismd.service >/dev/null 2>&1 || true
+    systemctl disable prismd.service >/dev/null 2>&1 || true
+fi
+"""
+post_uninstall_script = """\
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+"""
+
 [dependencies]
 prism-server = { workspace = true }
 prism-client = { workspace = true }

@@ -53,3 +53,33 @@ jobs:
           TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
           ls -l target/debian/
           gh release upload "$TAG" target/debian/*.deb --clobber
+
+  rpm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.ref }}
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-generate-rpm
+      - name: Build release binaries
+        run: cargo build --release -p prismdb
+      - name: Strip binaries
+        run: strip target/release/prismd target/release/prism-shell target/release/prism-fsck target/release/prism-dump
+      - name: Build the .rpm
+        run: cargo generate-rpm -p crates/prism-cli
+      - name: Inspect the .rpm (files + systemd scriptlets)
+        run: |
+          sudo apt-get update && sudo apt-get install -y rpm
+          ls -l target/generate-rpm/
+          echo "--- files ---"; rpm -qlp target/generate-rpm/*.rpm
+          echo "--- scriptlets ---"; rpm -qp --scripts target/generate-rpm/*.rpm
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.release.tag_name || inputs.release_tag }}"
+          gh release upload "$TAG" target/generate-rpm/*.rpm --clobber
