@@ -3,7 +3,12 @@ name: Publish .NET SDK
 # Publishes sdks/dotnet (PrismDb.Client) to NuGet with the version in its
 # PrismDb.csproj. Runs when a GitHub Release is published (bump <Version> in
 # sdks/dotnet/src/PrismDb/PrismDb.csproj as part of cutting the release), and can
-# be dispatched manually. Requires the NUGET_API_KEY secret.
+# be dispatched manually.
+#
+# Authentication is NuGet Trusted Publishing (OpenID Connect) — no API key. The
+# matching policy on nuget.org must be configured as:
+#   Package Owner=hafizmmoaz  Repository Owner=HafizMMoaz  Repository=prism-db
+#   Workflow File=nuget-publish.yml  Environment=nuget
 on:
   release:
     types: [published]
@@ -20,6 +25,9 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    environment: nuget
+    permissions:
+      id-token: write # OIDC token for NuGet Trusted Publishing
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,6 +45,16 @@ jobs:
         working-directory: sdks/dotnet
         run: dotnet pack src/PrismDb/PrismDb.csproj -c Release -o nupkg
 
+      - name: NuGet login (Trusted Publishing)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          user: hafizmmoaz
+
       - name: Publish to NuGet
         working-directory: sdks/dotnet
-        run: dotnet nuget push "nupkg/*.nupkg" --api-key "${{ secrets.NUGET_API_KEY }}" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        run: >-
+          dotnet nuget push "nupkg/*.nupkg"
+          --api-key "${{ steps.login.outputs.NUGET_API_KEY }}"
+          --source https://api.nuget.org/v3/index.json
+          --skip-duplicate
