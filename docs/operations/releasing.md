@@ -51,10 +51,12 @@ Use a pre-release tag (e.g. `v0.1.0-rc.1`) to validate the pipeline without a
 
 The TypeScript client in [`sdks/node`](../../sdks/node) (`@prismdb/client`) is
 published to npm by [`.github/workflows/npm-publish.yml`](../../.github/workflows/npm-publish.yml).
-It runs automatically when a GitHub Release is published, and can be dispatched
-manually (Actions → **Publish Node SDK** → Run workflow → enter the tag) to ship
-the SDK for an existing release. The job checks out the tag, sets the package
-version from it, builds, tests, and runs `npm publish --provenance --access public`.
+It publishes the version in `sdks/node/package.json`, so **bump that version
+alongside the Cargo version when cutting a release**. It runs when a GitHub
+Release is published, and can be dispatched manually (Actions → **Publish Node
+SDK** → Run workflow → ref `main`) — useful for the first publish, or when a
+release tag predates a packaging fix. The job builds, tests, and runs `npm
+publish --provenance --access public`.
 
 One-time setup:
 
@@ -66,8 +68,8 @@ One-time setup:
    publish rights to the `@prismdb` scope, and add it as a repo secret
    `NPM_TOKEN` on `HafizMMoaz/prism-db`.
 
-The SDK version follows the release tag. To publish by hand instead:
-`cd sdks/node && npm publish --access public` (after `npm login`).
+To publish by hand instead: `cd sdks/node && npm publish --access public` (after
+`npm login`).
 
 ## Changing the build
 

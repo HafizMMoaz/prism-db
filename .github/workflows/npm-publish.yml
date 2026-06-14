@@ -1,16 +1,19 @@
 name: Publish Node SDK
 
-# Publishes sdks/node (@prismdb/client) to npm. Runs when a GitHub Release is
-# published (alongside the dist binaries), and can be dispatched manually to
-# publish a specific tag (e.g. to ship the SDK for an existing release).
+# Publishes sdks/node (@prismdb/client) to npm with the version in its
+# package.json. Runs when a GitHub Release is published (bump the SDK version in
+# sdks/node/package.json as part of cutting the release), and can be dispatched
+# manually — e.g. to ship the SDK for the current main when a release tag predates
+# a packaging fix.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Git tag to publish from (e.g. v0.1.0)"
-        required: true
+      ref:
+        description: "Branch or tag to publish from"
+        required: false
+        default: "main"
 
 permissions:
   contents: read
@@ -20,27 +23,19 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - name: Resolve tag and version
-        id: v
-        run: |
-          TAG="${{ github.event.release.tag_name || inputs.tag }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
-
       - uses: actions/checkout@v4
         with:
-          ref: ${{ steps.v.outputs.tag }}
+          ref: ${{ github.event.release.tag_name || inputs.ref }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Install, version, build, test
+      - name: Build and test
         working-directory: sdks/node
         run: |
           npm ci
-          npm version "${{ steps.v.outputs.version }}" --no-git-tag-version --allow-same-version
           npm run build
           npm test
 
