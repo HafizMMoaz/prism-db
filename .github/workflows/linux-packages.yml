@@ -33,6 +33,19 @@ jobs:
           tool: cargo-deb
       - name: Build the .deb (release binaries + systemd service)
         run: cargo deb -p prismdb
+      - name: Smoke-test (install, service starts, query over the wire)
+        run: |
+          set -x
+          sudo apt-get install -y ./target/debian/prismdb_*.deb
+          for b in prismd prism-shell prism-fsck prism-dump; do command -v "$b"; done
+          sleep 3
+          if ! systemctl is-active --quiet prismd; then
+            sudo systemctl status prismd --no-pager || true
+            sudo journalctl -u prismd --no-pager | tail -50 || true
+            exit 1
+          fi
+          systemctl is-enabled prismd
+          printf 'SHOW DATABASES\n\\quit\n' | prism-shell 127.0.0.1:4444 --user admin --password admin
       - name: Upload to the release
         env:
           GH_TOKEN: ${{ github.token }}
