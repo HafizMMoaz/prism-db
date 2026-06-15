@@ -445,6 +445,7 @@ impl Database {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         })?;
         map.insert(name.to_string(), (heap, root));
         Ok(coll)
@@ -474,6 +475,7 @@ impl Database {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         })?;
         map.insert(name.to_string(), ns.clone());
         Ok(ns)
@@ -499,6 +501,7 @@ impl Database {
                 primary_key: table.primary_key.map(|p| p as u32),
                 columns: table.columns.clone(),
                 indexes: index_metas(&table),
+                checks: table.checks.clone(),
             };
             self.persist_entry(&entry)?;
             persisted.insert(table.name);
@@ -519,6 +522,7 @@ impl Database {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         })?;
         self.persisted_tables
             .lock()
@@ -542,6 +546,7 @@ impl Database {
             primary_key: table.primary_key.map(|p| p as u32),
             columns: table.columns,
             indexes,
+            checks: table.checks,
         })?;
         self.persisted_tables
             .lock()
@@ -562,6 +567,7 @@ impl Database {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         })?;
         self.persist_table_schema(new)?;
         self.persisted_tables
@@ -592,6 +598,7 @@ impl Database {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         })?;
         self.doc_heaps
             .lock()
@@ -620,6 +627,7 @@ impl Database {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         })?;
         self.kv_namespaces
             .lock()
@@ -704,6 +712,7 @@ impl Database {
                         primary_key,
                         index_root,
                         indexes,
+                        entry.checks,
                     )?;
                     persisted.insert(entry.name);
                 }

@@ -108,6 +108,8 @@ pub struct CatalogEntry {
     pub columns: Vec<Column>,
     /// Secondary (UNIQUE) indexes (tables only; empty otherwise).
     pub indexes: Vec<IndexMeta>,
+    /// `CHECK` constraint predicates, as SQL text (tables only; empty otherwise).
+    pub checks: Vec<String>,
 }
 
 impl CatalogEntry {
@@ -172,6 +174,17 @@ impl CatalogEntry {
         for (i, v) in defaults {
             w.put_u16(i as u16);
             encode_value(&mut w, v)?;
+        }
+        // CHECK predicates follow the defaults (records without this section
+        // decode as none).
+        let nchk: u16 = self
+            .checks
+            .len()
+            .try_into()
+            .map_err(|_| ServerError::Corrupt("too many checks".into()))?;
+        w.put_u16(nchk);
+        for c in &self.checks {
+            w.put_str_u16("catalog.check", c)?;
         }
         Ok(w.into_vec())
     }
@@ -239,6 +252,17 @@ impl CatalogEntry {
                 }
             }
         }
+        // CHECK predicates follow the defaults; absent in older records.
+        let checks = if r.is_empty() {
+            Vec::new()
+        } else {
+            let nchk = r.get_u16("catalog.nchecks")?;
+            let mut v = Vec::with_capacity(nchk as usize);
+            for _ in 0..nchk {
+                v.push(r.get_str_u16("catalog.check")?);
+            }
+            v
+        };
         Ok(Self {
             op,
             kind,
@@ -248,6 +272,7 @@ impl CatalogEntry {
             primary_key,
             columns,
             indexes,
+            checks,
         })
     }
 }
@@ -453,6 +478,7 @@ mod tests {
                 unique: true,
                 root: 99,
             }],
+            checks: vec!["id > 0".into()],
         };
         let decoded = CatalogEntry::decode(&table.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
@@ -471,6 +497,7 @@ mod tests {
         assert_eq!(decoded.indexes[0].root, 99);
         assert_eq!(decoded.columns[0].default, None);
         assert_eq!(decoded.columns[1].default, Some(Value::Text("anon".into())));
+        assert_eq!(decoded.checks, vec!["id > 0".to_string()]);
 
         let ns = CatalogEntry {
             op: CatalogOp::Delete,
@@ -481,6 +508,7 @@ mod tests {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Delete);
@@ -503,13 +531,14 @@ mod tests {
             primary_key: None,
             columns: vec![],
             indexes: vec![],
+            checks: vec![],
         }
         .encode()
         .unwrap();
         // The original create-only format ended after the columns; drop the
-        // trailing op byte, the (empty) index-count u16, and the (empty)
-        // default-count u16 that now follow it.
-        bytes.truncate(bytes.len() - 5);
+        // trailing op byte and the (empty) index / default / check count u16s
+        // that now follow it.
+        bytes.truncate(bytes.len() - 7);
         let decoded = CatalogEntry::decode(&bytes).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
         assert_eq!(decoded.name, "t");

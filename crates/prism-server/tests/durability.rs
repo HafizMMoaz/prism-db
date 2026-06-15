@@ -174,6 +174,41 @@ fn column_defaults_survive_restart() {
 }
 
 #[test]
+fn check_constraints_survive_restart() {
+    let tmp = TempDir::new("durability_checks").unwrap();
+
+    // ---- Session 1: declare a table with a CHECK, then close. ----
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, age BIGINT CHECK (age >= 0))",
+        ));
+        drop(s);
+        drop(db);
+    }
+
+    // ---- Session 2: reopen; the CHECK must still be enforced (recovered from
+    // the catalog), rejecting a violating row but accepting a valid one. ----
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    match s.handle(sql("INSERT INTO t VALUES (1, -5)")) {
+        Message::SqlResult { status, .. } => assert_ne!(status, 0, "CHECK rejects age = -5"),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+    match s.handle(sql("INSERT INTO t VALUES (2, 5)")) {
+        Message::SqlResult { status: 0, .. } => {}
+        other => panic!("expected ok SqlResult, got {other:?}"),
+    }
+    match s.handle(sql("SELECT COUNT(*) FROM t")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => assert_eq!(rows[0][0], Some(WireValue::Int64(1))),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn checkpoint_then_more_writes_all_survive_durable_restart() {
     // A durable database: write, checkpoint (flush to disk), write more, then
     // reopen. Both the checkpointed and the post-checkpoint data must be there.

@@ -58,6 +58,8 @@ pub struct Table {
     pub index_root: Option<PageId>,
     /// Secondary (`UNIQUE`) indexes on this table.
     pub indexes: Vec<IndexDef>,
+    /// `CHECK` constraint predicates (SQL text), evaluated on `INSERT`/`UPDATE`.
+    pub checks: Vec<String>,
 }
 
 impl Table {
@@ -95,6 +97,7 @@ impl Catalog {
         columns: Vec<Column>,
         primary_key: Option<usize>,
         index_root: Option<PageId>,
+        checks: Vec<String>,
     ) -> Result<Table> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
@@ -113,6 +116,7 @@ impl Catalog {
             primary_key,
             index_root,
             indexes: Vec::new(),
+            checks,
         };
         tables.insert(name.to_string(), table.clone());
         Ok(table)
@@ -195,6 +199,7 @@ impl Catalog {
         primary_key: Option<usize>,
         index_root: Option<PageId>,
         indexes: Vec<IndexDef>,
+        checks: Vec<String>,
     ) -> Result<()> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
@@ -209,6 +214,7 @@ impl Catalog {
                 primary_key,
                 index_root,
                 indexes,
+                checks,
             },
         );
         let mut n = self.next_heap.lock().expect("catalog poisoned");

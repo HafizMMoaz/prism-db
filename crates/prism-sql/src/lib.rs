@@ -4,7 +4,9 @@
 //! shares MVCC, locking, recovery, and cross-model transactions with KV and
 //! documents. See `docs/components/sql-engine.md`.
 //!
-//! **Scope (this slice):** `CREATE TABLE`, `CREATE [UNIQUE] INDEX … ON t (c, …)`
+//! **Scope (this slice):** `CREATE TABLE` (with `PRIMARY KEY`, `NOT NULL`,
+//! `UNIQUE`, literal `DEFAULT`, and column- or table-level `CHECK (…)`
+//! constraints), `CREATE [UNIQUE] INDEX … ON t (c, …)`
 //! / `DROP INDEX` (single- or multi-column secondary indexes, UNIQUE or
 //! non-unique; UNIQUE enforces on `INSERT`/`UPDATE`, and an equality `WHERE` over
 //! all of an index's columns seeks it), `INSERT … VALUES` and `INSERT … SELECT`,
@@ -71,8 +73,8 @@ use sqlparser::ast::{
     ColumnOption, ColumnOptionDef, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment,
     Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableObject,
-    TableWithJoins, UnaryOperator, Value as SqlValue, WindowType,
+    SetExpr, SetOperator, SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor,
+    TableObject, TableWithJoins, UnaryOperator, Value as SqlValue, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -505,6 +507,7 @@ impl SqlEngine {
         let name = object_name(&ct.name);
         let mut columns = Vec::with_capacity(ct.columns.len());
         let mut primary_key = None;
+        let mut checks: Vec<String> = Vec::new();
         for (idx, col) in ct.columns.iter().enumerate() {
             let ty = map_data_type(&col.data_type)?;
             let nullable = !col.options.iter().any(|o| {
@@ -539,6 +542,18 @@ impl SqlEngine {
                 nullable,
                 default: column_default(&col.options)?,
             });
+            // Column-level CHECK (…) is stored as a table check predicate.
+            for o in &col.options {
+                if let ColumnOption::Check(expr) = &o.option {
+                    checks.push(expr.to_string());
+                }
+            }
+        }
+        // Table-level CHECK (…) constraints.
+        for c in &ct.constraints {
+            if let TableConstraint::Check { expr, .. } = c {
+                checks.push(expr.to_string());
+            }
         }
 
         // A PRIMARY KEY column gets a durable B+tree index (key -> row RID).
@@ -550,7 +565,7 @@ impl SqlEngine {
         };
 
         self.catalog
-            .create_table(&name, columns, primary_key, index_root)?;
+            .create_table(&name, columns, primary_key, index_root, checks)?;
         Ok(Outcome::CreateTable)
     }
 
@@ -650,6 +665,8 @@ impl SqlEngine {
         let sec = self.secondary_indexes(&table);
         // Columns supplied by the statement; the rest fall back to their DEFAULT.
         let targeted: std::collections::HashSet<usize> = target.iter().copied().collect();
+        let check_exprs = parse_checks(&table)?;
+        let check_schema = JoinSchema::single(&table.name, &table);
         let mut count = 0;
         for mut row in input_rows {
             // Fill a column DEFAULT for any column the statement omitted (an
@@ -667,6 +684,7 @@ impl SqlEngine {
                     return Err(SqlError::Type(format!("column {} is NOT NULL", col.name)));
                 }
             }
+            self.enforce_checks(&check_exprs, &row, &check_schema, &table.name)?;
 
             // Maintain the primary-key index, rejecting a duplicate that is
             // visible to this transaction (committed, or our own).
@@ -2337,6 +2355,7 @@ impl SqlEngine {
         let types = table.types();
         let index = self.pk_index(&table);
         let sec = self.secondary_indexes(&table);
+        let check_exprs = parse_checks(&table)?;
         let mut count = 0;
         // scan() materializes the visible rows up front, so writing new
         // versions in this loop cannot disturb the iteration.
@@ -2370,6 +2389,7 @@ impl SqlEngine {
                     return Err(SqlError::Type(format!("column {} is NOT NULL", col.name)));
                 }
             }
+            self.enforce_checks(&check_exprs, &row, &table, &table.name)?;
 
             // Secondary UNIQUE indexes: when the composite value changes, reject
             // a visible duplicate in another row before writing.
@@ -2455,6 +2475,27 @@ impl SqlEngine {
     /// Whether `row` satisfies the boolean predicate `expr`.
     fn matches(&self, expr: &Expr, row: &[Value], cols: &dyn ColumnResolver) -> Result<bool> {
         Ok(matches!(self.eval(expr, row, cols)?, Value::Bool(true)))
+    }
+
+    /// Enforce a table's `CHECK` predicates against a row about to be written.
+    /// The write is rejected unless every predicate evaluates to true; a result
+    /// of false *or* NULL/unknown fails (stricter than the SQL standard, which
+    /// passes on unknown — write `col IS NULL OR …` to allow NULLs).
+    fn enforce_checks(
+        &self,
+        checks: &[Expr],
+        row: &[Value],
+        cols: &dyn ColumnResolver,
+        table: &str,
+    ) -> Result<()> {
+        for expr in checks {
+            if !self.matches(expr, row, cols)? {
+                return Err(SqlError::Constraint(format!(
+                    "CHECK constraint violated on {table}: {expr}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Evaluate `expr` against `row`, resolving column references through `cols`.
@@ -4621,6 +4662,28 @@ fn map_data_type(dt: &DataType) -> Result<Type> {
         | DataType::CharVarying(_) => Ok(Type::Text),
         other => Err(SqlError::Unsupported(format!("column type: {other:?}"))),
     }
+}
+
+/// Parse a table's `CHECK` predicate texts into expressions (once per
+/// statement, then reused for every row).
+fn parse_checks(table: &Table) -> Result<Vec<Expr>> {
+    table.checks.iter().map(|t| parse_predicate(t)).collect()
+}
+
+/// Parse a standalone predicate (e.g. a stored `CHECK` text) into an `Expr` by
+/// parsing it as the projection of a trivial `SELECT`.
+fn parse_predicate(text: &str) -> Result<Expr> {
+    let sql = format!("SELECT {text}");
+    let stmts =
+        Parser::parse_sql(&GenericDialect {}, &sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+    if let Some(Statement::Query(q)) = stmts.into_iter().next() {
+        if let SetExpr::Select(s) = q.body.as_ref() {
+            if let Some(SelectItem::UnnamedExpr(e)) = s.projection.first() {
+                return Ok(e.clone());
+            }
+        }
+    }
+    Err(SqlError::Parse(format!("invalid CHECK expression: {text}")))
 }
 
 /// The literal `DEFAULT` value declared on a column, if any. Only literal
@@ -7447,6 +7510,60 @@ mod tests {
             env.engine
                 .execute_autocommit("CREATE TABLE bad (id BIGINT, ts TIMESTAMP DEFAULT NOW())")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn check_constraints() {
+        let env = env();
+        env.engine
+            .execute_autocommit(
+                "CREATE TABLE t (id BIGINT PRIMARY KEY, age BIGINT CHECK (age >= 0), \
+                 CHECK (id < 1000))",
+            )
+            .unwrap();
+
+        // A row satisfying both checks is accepted.
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1, 5)")
+            .unwrap();
+        // The column-level CHECK (age >= 0) rejects a negative age.
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO t VALUES (2, -1)")
+                .is_err()
+        );
+        // The table-level CHECK (id < 1000) rejects an out-of-range id.
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO t VALUES (1000, 5)")
+                .is_err()
+        );
+        // UPDATE is checked too: a violating update is rejected and rolls back.
+        assert!(
+            env.engine
+                .execute_autocommit("UPDATE t SET age = -3 WHERE id = 1")
+                .is_err()
+        );
+        env.engine
+            .execute_autocommit("UPDATE t SET age = 10 WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT age FROM t WHERE id = 1")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(10)]]
+        );
+        // Only the one valid row was ever inserted.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT COUNT(*) FROM t")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)]]
         );
     }
 }
