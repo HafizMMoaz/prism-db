@@ -31,11 +31,13 @@
 //! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
 //! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
 //! the select list, and `HAVING` (and `ORDER BY` over aggregate output, by name,
-//! 1-based ordinal, or expression text). Uncorrelated subqueries are supported:
-//! scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and
-//! derived tables `FROM (SELECT …) AS alias`. Deferred: correlated subqueries,
-//! updating a primary-key column, join predicate pushdown / index nested-loop,
-//! the formal bind/rewrite/plan IR. The current executor interprets the parsed
+//! 1-based ordinal, or expression text). Subqueries are supported: scalar
+//! `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and derived
+//! tables `FROM (SELECT …) AS alias`; uncorrelated ones run once up front, and
+//! `WHERE` subqueries may be correlated (run per outer row). Deferred: correlated
+//! subqueries outside `WHERE` (e.g. in the select list), updating a primary-key
+//! column, join predicate pushdown / index nested-loop, the formal
+//! bind/rewrite/plan IR. The current executor interprets the parsed
 //! AST directly against the catalog; the full parse→bind→plan→execute pipeline
 //! is a follow-up.
 
@@ -693,6 +695,10 @@ impl SqlEngine {
             Some(other) => return Err(SqlError::Unsupported(format!("{other:?}"))),
         };
 
+        // Any subquery still in WHERE after the up-front pass is correlated, and
+        // is evaluated per row against the current row.
+        let where_correlated = select.selection.as_ref().is_some_and(expr_has_subquery);
+
         // A single base table (no joins) keeps the primary-key index-seek fast
         // path; joins, several FROM items, or a derived table (subquery in FROM)
         // go through the nested-loop join materializer.
@@ -702,15 +708,22 @@ impl SqlEngine {
         {
             let (qualifier, table) = self.relation_of(&select.from[0].relation)?;
             let schema = JoinSchema::single(&qualifier, &table);
-            return self.select_single(txn, select, &query, &table, &schema, distinct);
+            return self.select_single(
+                txn,
+                select,
+                &query,
+                &table,
+                &schema,
+                distinct,
+                where_correlated,
+            );
         }
 
         let (schema, combined) = self.materialize_from(txn, &select.from)?;
         let mut filtered: Vec<Vec<Value>> = Vec::new();
         for row in combined {
-            match &select.selection {
-                Some(pred) if !self.matches(pred, &row, &schema)? => continue,
-                _ => filtered.push(row),
+            if self.matches_row(txn, &select.selection, &row, &schema, where_correlated)? {
+                filtered.push(row);
             }
         }
         self.finish_select(select, &query, &schema, filtered, distinct)
@@ -720,6 +733,7 @@ impl SqlEngine {
     /// indexed column to a literal, otherwise a full scan with the predicate
     /// applied per row. Produces the WHERE-filtered rows and hands off to
     /// [`Self::finish_select`].
+    #[allow(clippy::too_many_arguments)]
     fn select_single(
         &self,
         txn: &TxnHandle,
@@ -728,19 +742,22 @@ impl SqlEngine {
         table: &Table,
         schema: &JoinSchema,
         distinct: bool,
+        where_correlated: bool,
     ) -> Result<Outcome> {
-        // Index seek (primary key or a UNIQUE secondary index) when applicable.
-        if let Some(rows) = self.index_seek(txn, table, schema, &select.selection)? {
-            return self.finish_select(select, query, schema, rows, distinct);
+        // Index seek (primary key or a UNIQUE secondary index) when applicable —
+        // skipped when the predicate still holds a correlated subquery.
+        if !where_correlated {
+            if let Some(rows) = self.index_seek(txn, table, schema, &select.selection)? {
+                return self.finish_select(select, query, schema, rows, distinct);
+            }
         }
         // Otherwise a full sequential scan applying the predicate per row.
         let types = table.types();
         let mut filtered: Vec<Vec<Value>> = Vec::new();
         for (_, payload) in self.store.scan(txn, table.heap)? {
             let full = types::decode_row(&types, &payload)?;
-            match &select.selection {
-                Some(pred) if !self.matches(pred, &full, schema)? => continue,
-                _ => filtered.push(full),
+            if self.matches_row(txn, &select.selection, &full, schema, where_correlated)? {
+                filtered.push(full);
             }
         }
         self.finish_select(select, query, schema, filtered, distinct)
@@ -998,42 +1015,255 @@ impl SqlEngine {
     /// subqueries replaced by their computed values (run once each).
     fn resolve_select_subqueries(&self, txn: &TxnHandle, sel: &mut Select) -> Result<()> {
         if let Some(e) = sel.selection.take() {
-            sel.selection = Some(self.resolve_subqueries(txn, e)?);
+            sel.selection = Some(self.resolve_subqueries(txn, e, None)?);
         }
         for item in &mut sel.projection {
             if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
-                *e = self.resolve_subqueries(txn, e.clone())?;
+                *e = self.resolve_subqueries(txn, e.clone(), None)?;
             }
         }
         if let Some(e) = sel.having.take() {
-            sel.having = Some(self.resolve_subqueries(txn, e)?);
+            sel.having = Some(self.resolve_subqueries(txn, e, None)?);
         }
         Ok(())
     }
 
+    /// Evaluate the `WHERE` predicate for one row. When `correlated` is set the
+    /// predicate still holds correlated subqueries; they are decorrelated against
+    /// this row, run, and substituted before the predicate is evaluated.
+    fn matches_row(
+        &self,
+        txn: &TxnHandle,
+        selection: &Option<Expr>,
+        row: &[Value],
+        schema: &JoinSchema,
+        correlated: bool,
+    ) -> Result<bool> {
+        match selection {
+            None => Ok(true),
+            Some(pred) if correlated => {
+                let resolved = self.resolve_subqueries(txn, pred.clone(), Some((schema, row)))?;
+                self.matches(&resolved, row, schema)
+            }
+            Some(pred) => self.matches(pred, row, schema),
+        }
+    }
+
+    /// Whether a query references a column its own `FROM` does not provide — i.e.
+    /// it is correlated with an enclosing query.
+    fn query_is_correlated(&self, q: &Query) -> bool {
+        let SetExpr::Select(s) = q.body.as_ref() else {
+            return false;
+        };
+        let local = self.subquery_local_columns(q);
+        let outside = |e: &Expr| {
+            column_refs(e)
+                .into_iter()
+                .any(|(qual, name)| !is_local_column(&local, qual.as_deref(), &name))
+        };
+        if s.selection.as_ref().is_some_and(outside) || s.having.as_ref().is_some_and(outside) {
+            return true;
+        }
+        for twj in &s.from {
+            for join in &twj.joins {
+                if let JoinOperator::Inner(JoinConstraint::On(e))
+                | JoinOperator::LeftOuter(JoinConstraint::On(e))
+                | JoinOperator::RightOuter(JoinConstraint::On(e))
+                | JoinOperator::FullOuter(JoinConstraint::On(e)) = &join.join_operator
+                {
+                    if outside(e) {
+                        return true;
+                    }
+                }
+            }
+        }
+        s.projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => outside(e),
+            _ => false,
+        })
+    }
+
+    /// The `(qualifier, column)` pairs a query's `FROM` base tables provide.
+    /// Derived tables are skipped (their columns aren't known without running
+    /// them), so a reference into one is conservatively treated as correlated.
+    fn subquery_local_columns(&self, q: &Query) -> Vec<(String, String)> {
+        let mut cols = Vec::new();
+        if let SetExpr::Select(s) = q.body.as_ref() {
+            for twj in &s.from {
+                self.collect_factor_columns(&twj.relation, &mut cols);
+                for join in &twj.joins {
+                    self.collect_factor_columns(&join.relation, &mut cols);
+                }
+            }
+        }
+        cols
+    }
+
+    fn collect_factor_columns(&self, factor: &TableFactor, out: &mut Vec<(String, String)>) {
+        if let TableFactor::Table { name, alias, .. } = factor {
+            if let Ok(t) = self.catalog.table(&object_name(name)) {
+                let qualifier = match alias {
+                    Some(a) => a.name.value.clone(),
+                    None => t.name.clone(),
+                };
+                for c in &t.columns {
+                    out.push((qualifier.clone(), c.name.clone()));
+                }
+            }
+        }
+    }
+
+    /// Rewrite a correlated subquery into an uncorrelated one for `(schema, row)`
+    /// by replacing each reference to an outer column with that row's value.
+    fn decorrelate(&self, mut q: Query, schema: &JoinSchema, row: &[Value]) -> Result<Query> {
+        let local = self.subquery_local_columns(&q);
+        if let SetExpr::Select(s) = q.body.as_mut() {
+            let s = s.as_mut();
+            if let Some(e) = s.selection.take() {
+                s.selection = Some(self.decorrelate_expr(e, &local, schema, row)?);
+            }
+            if let Some(e) = s.having.take() {
+                s.having = Some(self.decorrelate_expr(e, &local, schema, row)?);
+            }
+            for item in &mut s.projection {
+                if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item
+                {
+                    *e = self.decorrelate_expr(e.clone(), &local, schema, row)?;
+                }
+            }
+        }
+        Ok(q)
+    }
+
+    /// Replace outer-column references (those not in `local`) in `expr` with the
+    /// outer row's literal values. Does not descend into nested subqueries.
+    fn decorrelate_expr(
+        &self,
+        expr: Expr,
+        local: &[(String, String)],
+        schema: &JoinSchema,
+        row: &[Value],
+    ) -> Result<Expr> {
+        let rec = |this: &Self, e: Expr| this.decorrelate_expr(e, local, schema, row);
+        Ok(match expr {
+            Expr::Identifier(id) if !is_local_column(local, None, &id.value) => {
+                match schema.resolve(None, &id.value) {
+                    Ok(idx) => value_to_expr(row[idx].clone()),
+                    Err(_) => Expr::Identifier(id),
+                }
+            }
+            Expr::CompoundIdentifier(ref parts) if parts.len() == 2 => {
+                let (q, n) = (&parts[0].value, &parts[1].value);
+                if is_local_column(local, Some(q), n) {
+                    expr
+                } else {
+                    match schema.resolve(Some(q), n) {
+                        Ok(idx) => value_to_expr(row[idx].clone()),
+                        Err(_) => expr,
+                    }
+                }
+            }
+            Expr::Nested(e) => Expr::Nested(Box::new(rec(self, *e)?)),
+            Expr::IsNull(e) => Expr::IsNull(Box::new(rec(self, *e)?)),
+            Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(rec(self, *e)?)),
+            Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
+                op,
+                expr: Box::new(rec(self, *e)?),
+            },
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(rec(self, *left)?),
+                op,
+                right: Box::new(rec(self, *right)?),
+            },
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(rec(self, *expr)?),
+                negated,
+                low: Box::new(rec(self, *low)?),
+                high: Box::new(rec(self, *high)?),
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(rec(self, *expr)?),
+                list: list
+                    .into_iter()
+                    .map(|e| rec(self, e))
+                    .collect::<Result<_>>()?,
+                negated,
+            },
+            other => other,
+        })
+    }
+
     /// Replace `(SELECT …)` / `x IN (SELECT …)` / `EXISTS (SELECT …)` in `expr`
     /// with their results (uncorrelated only — the subquery runs standalone).
-    fn resolve_subqueries(&self, txn: &TxnHandle, expr: Expr) -> Result<Expr> {
-        let rec = |this: &Self, e: Expr| this.resolve_subqueries(txn, e);
+    /// `outer = None`: resolve uncorrelated subqueries up front (correlated ones
+    /// are left in place for the per-row pass). `outer = Some((schema, row))`:
+    /// the per-row pass — every subquery is decorrelated against the outer row
+    /// and run.
+    fn resolve_subqueries(
+        &self,
+        txn: &TxnHandle,
+        expr: Expr,
+        outer: Option<(&JoinSchema, &[Value])>,
+    ) -> Result<Expr> {
+        let rec = |this: &Self, e: Expr| this.resolve_subqueries(txn, e, outer);
         Ok(match expr {
-            Expr::Subquery(q) => value_to_expr(self.run_scalar_subquery(txn, *q)?),
-            Expr::Exists { subquery, negated } => {
-                let (_, rows) = self.run_subquery(txn, *subquery)?;
-                Expr::Value(SqlValue::Boolean(!rows.is_empty() ^ negated))
-            }
+            Expr::Subquery(q) => match outer {
+                Some((os, r)) => {
+                    let dq = self.decorrelate(*q, os, r)?;
+                    value_to_expr(self.run_scalar_subquery(txn, dq)?)
+                }
+                None if self.query_is_correlated(&q) => Expr::Subquery(q),
+                None => value_to_expr(self.run_scalar_subquery(txn, *q)?),
+            },
+            Expr::Exists { subquery, negated } => match outer {
+                Some((os, r)) => {
+                    let dq = self.decorrelate(*subquery, os, r)?;
+                    let (_, rows) = self.run_subquery(txn, dq)?;
+                    Expr::Value(SqlValue::Boolean(!rows.is_empty() ^ negated))
+                }
+                None if self.query_is_correlated(&subquery) => Expr::Exists { subquery, negated },
+                None => {
+                    let (_, rows) = self.run_subquery(txn, *subquery)?;
+                    Expr::Value(SqlValue::Boolean(!rows.is_empty() ^ negated))
+                }
+            },
             Expr::InSubquery {
                 expr,
                 subquery,
                 negated,
-            } => Expr::InList {
-                expr: Box::new(rec(self, *expr)?),
-                list: self
-                    .run_column_subquery(txn, *subquery)?
-                    .into_iter()
-                    .map(value_to_expr)
-                    .collect(),
-                negated,
-            },
+            } => {
+                let correlated_keep = outer.is_none() && self.query_is_correlated(&subquery);
+                if correlated_keep {
+                    Expr::InSubquery {
+                        expr: Box::new(rec(self, *expr)?),
+                        subquery,
+                        negated,
+                    }
+                } else {
+                    let q = match outer {
+                        Some((os, r)) => self.decorrelate(*subquery, os, r)?,
+                        None => *subquery,
+                    };
+                    Expr::InList {
+                        expr: Box::new(rec(self, *expr)?),
+                        list: self
+                            .run_column_subquery(txn, q)?
+                            .into_iter()
+                            .map(value_to_expr)
+                            .collect(),
+                        negated,
+                    }
+                }
+            }
             Expr::Nested(e) => Expr::Nested(Box::new(rec(self, *e)?)),
             Expr::IsNull(e) => Expr::IsNull(Box::new(rec(self, *e)?)),
             Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(rec(self, *e)?)),
@@ -2340,6 +2570,85 @@ fn select_has_subquery(s: &Select) -> bool {
             }
             _ => false,
         })
+}
+
+/// Whether `(qualifier, name)` is among a query's local `FROM` columns. A bare
+/// name matches any qualifier.
+fn is_local_column(local: &[(String, String)], qualifier: Option<&str>, name: &str) -> bool {
+    local
+        .iter()
+        .any(|(q, n)| n == name && qualifier.is_none_or(|qq| qq == q))
+}
+
+/// Collect the column references in `expr` (not descending into subqueries), as
+/// `(qualifier, name)`. Used to detect correlation.
+fn column_refs(expr: &Expr) -> Vec<(Option<String>, String)> {
+    let mut out = Vec::new();
+    column_refs_into(expr, &mut out);
+    out
+}
+
+fn column_refs_into(expr: &Expr, out: &mut Vec<(Option<String>, String)>) {
+    match expr {
+        Expr::Identifier(id) => out.push((None, id.value.clone())),
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            out.push((Some(parts[0].value.clone()), parts[1].value.clone()));
+        }
+        Expr::Nested(e)
+        | Expr::IsNull(e)
+        | Expr::IsNotNull(e)
+        | Expr::UnaryOp { expr: e, .. }
+        | Expr::Cast { expr: e, .. }
+        | Expr::Trim { expr: e, .. }
+        | Expr::InSubquery { expr: e, .. } => column_refs_into(e, out),
+        Expr::BinaryOp { left, right, .. } => {
+            column_refs_into(left, out);
+            column_refs_into(right, out);
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            column_refs_into(expr, out);
+            column_refs_into(low, out);
+            column_refs_into(high, out);
+        }
+        Expr::Like { expr, pattern, .. } => {
+            column_refs_into(expr, out);
+            column_refs_into(pattern, out);
+        }
+        Expr::InList { expr, list, .. } => {
+            column_refs_into(expr, out);
+            for e in list {
+                column_refs_into(e, out);
+            }
+        }
+        Expr::Function(f) => {
+            if let FunctionArguments::List(list) = &f.args {
+                for a in &list.args {
+                    if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = a {
+                        column_refs_into(e, out);
+                    }
+                }
+            }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(e) = operand {
+                column_refs_into(e, out);
+            }
+            for e in conditions.iter().chain(results) {
+                column_refs_into(e, out);
+            }
+            if let Some(e) = else_result {
+                column_refs_into(e, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Whether `expr` contains a scalar/`IN`/`EXISTS` subquery (recursively).
@@ -5418,6 +5727,57 @@ mod tests {
                     .unwrap()
             ),
             vec![vec![Value::Int64(1)]]
+        );
+    }
+
+    #[test]
+    fn correlated_subqueries() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE emp (id BIGINT, dept BIGINT, salary BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO emp VALUES (1,10,100),(2,10,200),(3,20,50),(4,20,90)")
+            .unwrap();
+
+        // Correlated scalar subquery: each employee paid the max in their dept.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id FROM emp e \
+                         WHERE e.salary = (SELECT MAX(salary) FROM emp WHERE dept = e.dept) \
+                         ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2)], vec![Value::Int64(4)]]
+        );
+
+        // Correlated EXISTS: employees in a dept that has someone paid over 150.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id FROM emp e WHERE EXISTS \
+                         (SELECT 1 FROM emp x WHERE x.dept = e.dept AND x.salary > 150) ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+
+        // Correlated NOT EXISTS is the complement.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id FROM emp e WHERE NOT EXISTS \
+                         (SELECT 1 FROM emp x WHERE x.dept = e.dept AND x.salary > 150) ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(3)], vec![Value::Int64(4)]]
         );
     }
 }
