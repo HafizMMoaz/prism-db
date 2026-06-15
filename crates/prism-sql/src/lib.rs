@@ -885,13 +885,14 @@ impl SqlEngine {
         self.finish_select(select, query, schema, filtered, distinct)
     }
 
-    /// If the `WHERE` clause pins every column of some index to a literal —
-    /// possibly within a top-level `AND` — seek that index and return the
-    /// matching rows, with the full predicate applied to each candidate (so
-    /// residual conditions still filter). The primary key (single-column, bare
-    /// key) is preferred, then secondary indexes (composite key; UNIQUE seeks a
-    /// point, non-unique range-scans the value's entries). Returns `None` when no
-    /// index applies, so the caller falls back to a scan.
+    /// Seek an index instead of scanning when the `WHERE` clause (within a
+    /// top-level `AND`) constrains an indexed column, returning the matching rows
+    /// with the full predicate re-applied to each candidate (so residual
+    /// conditions still filter). Tried in order: an equality on the primary key
+    /// (point lookup) or on every column of a secondary index (UNIQUE → point,
+    /// non-unique → the value's entries); then a primary-key **range** scan for
+    /// `>`/`>=`/`<`/`<=`/`BETWEEN`. Returns `None` when no index applies, so the
+    /// caller falls back to a scan.
     fn index_seek(
         &self,
         txn: &TxnHandle,
@@ -903,9 +904,6 @@ impl SqlEngine {
             return Ok(None);
         };
         let eqs = collect_equalities(pred);
-        if eqs.is_empty() {
-            return Ok(None);
-        }
         // A literal pinned to column `col`, if its type matches the column.
         let value_for = |col: usize| -> Option<Value> {
             eqs.iter()
@@ -914,23 +912,25 @@ impl SqlEngine {
                 .filter(|v| v.type_matches(table.columns[col].ty))
         };
 
-        // The candidate row ids from whichever index has all its columns pinned.
-        let rids: Vec<RecordId> =
-            if let (Some(pk), Some(tree)) = (table.primary_key, self.pk_index(table)) {
-                if let Some(v) = value_for(pk) {
-                    tree.search(&encode_index_key(&v)?)?.into_iter().collect()
-                } else {
-                    match self.secondary_seek_rids(table, &value_for)? {
-                        Some(rids) => rids,
-                        None => return Ok(None),
-                    }
-                }
+        // The candidate row ids: first an equality seek (primary-key point lookup,
+        // else a secondary index whose every column is pinned); failing that, a
+        // primary-key range scan (`>`, `>=`, `<`, `<=`, `BETWEEN`).
+        let equality = if let (Some(pk), Some(tree)) = (table.primary_key, self.pk_index(table)) {
+            if let Some(v) = value_for(pk) {
+                Some(tree.search(&encode_index_key(&v)?)?.into_iter().collect())
             } else {
-                match self.secondary_seek_rids(table, &value_for)? {
-                    Some(rids) => rids,
-                    None => return Ok(None),
-                }
-            };
+                self.secondary_seek_rids(table, &value_for)?
+            }
+        } else {
+            self.secondary_seek_rids(table, &value_for)?
+        };
+        let rids: Vec<RecordId> = match equality {
+            Some(rids) => rids,
+            None => match self.pk_range_seek_rids(table, pred)? {
+                Some(rids) => rids,
+                None => return Ok(None),
+            },
+        };
 
         let types = table.types();
         let mut out = Vec::new();
@@ -981,6 +981,72 @@ impl SqlEngine {
             return Ok(Some(rids));
         }
         Ok(None)
+    }
+
+    /// Row ids from a range scan of the primary-key index when `pred` bounds the
+    /// PK column with `>`, `>=`, `<`, `<=`, or `BETWEEN` (within a top-level
+    /// `AND`). Only fixed-width key types (numeric / timestamp / bool) are
+    /// scanned — text keys vary in length, so an open-ended text range has no safe
+    /// sentinel and falls back to a full scan. The bounds need only be a correct
+    /// superset: `index_seek` re-applies the full predicate to every candidate.
+    fn pk_range_seek_rids(&self, table: &Table, pred: &Expr) -> Result<Option<Vec<RecordId>>> {
+        let (Some(pk), Some(tree)) = (table.primary_key, self.pk_index(table)) else {
+            return Ok(None);
+        };
+        let ty = table.columns[pk].ty;
+        let key_len = match ty {
+            Type::Int64 | Type::Double | Type::Timestamp => 8,
+            Type::Bool => 1,
+            Type::Text => return Ok(None),
+        };
+
+        // Collect the tightest lower/upper bound on the PK column. Any valid
+        // bound is correct (the predicate is re-checked); we keep the last seen.
+        let pk_name = &table.columns[pk].name;
+        let mut lower: Option<(Value, bool)> = None; // (value, inclusive)
+        let mut upper: Option<(Value, bool)> = None;
+        for (name, op, v) in collect_ranges(pred) {
+            if name != *pk_name || !v.type_matches(ty) {
+                continue;
+            }
+            match op {
+                RangeOp::Gt => lower = Some((v, false)),
+                RangeOp::Ge => lower = Some((v, true)),
+                RangeOp::Lt => upper = Some((v, false)),
+                RangeOp::Le => upper = Some((v, true)),
+            }
+        }
+        if lower.is_none() && upper.is_none() {
+            return Ok(None);
+        }
+
+        // `range(start, end)` is `[start, end)`. Appending a 0x00 byte to a key
+        // makes it sort just after that key (so an exclusive lower / inclusive
+        // upper steps past the bound value itself).
+        let start = match &lower {
+            None => Vec::new(),
+            Some((v, true)) => encode_index_key(v)?,
+            Some((v, false)) => {
+                let mut k = encode_index_key(v)?;
+                k.push(0x00);
+                k
+            }
+        };
+        let end = match &upper {
+            None => vec![0xFFu8; key_len + 1],
+            Some((v, false)) => encode_index_key(v)?,
+            Some((v, true)) => {
+                let mut k = encode_index_key(v)?;
+                k.push(0x00);
+                k
+            }
+        };
+        let rids = tree
+            .range(&start, &end)?
+            .into_iter()
+            .map(|(_, rid)| rid)
+            .collect();
+        Ok(Some(rids))
     }
 
     /// Shared tail of a `SELECT`: dispatch to the aggregate path when the query
@@ -2824,6 +2890,79 @@ fn collect_equalities_into(expr: &Expr, out: &mut Vec<(String, Value)>) {
             }
             _ => {}
         },
+        _ => {}
+    }
+}
+
+/// A range comparison against a column, for primary-key range seeks.
+#[derive(Clone, Copy)]
+enum RangeOp {
+    Gt,
+    Ge,
+    Lt,
+    Le,
+}
+
+/// Collect `col <op> literal` range constraints (`>`, `>=`, `<`, `<=`) and
+/// `col BETWEEN lo AND hi` from a top-level `AND` chain. A `literal <op> col`
+/// form flips the operator. Used to seek the primary-key index over a range.
+fn collect_ranges(expr: &Expr) -> Vec<(String, RangeOp, Value)> {
+    let mut out = Vec::new();
+    collect_ranges_into(expr, &mut out);
+    out
+}
+
+fn collect_ranges_into(expr: &Expr, out: &mut Vec<(String, RangeOp, Value)>) {
+    match expr {
+        Expr::Nested(e) => collect_ranges_into(e, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_ranges_into(left, out);
+            collect_ranges_into(right, out);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            // (operator when `col <op> literal`, operator when `literal <op> col`).
+            let ops = match op {
+                BinaryOperator::Gt => Some((RangeOp::Gt, RangeOp::Lt)),
+                BinaryOperator::GtEq => Some((RangeOp::Ge, RangeOp::Le)),
+                BinaryOperator::Lt => Some((RangeOp::Lt, RangeOp::Gt)),
+                BinaryOperator::LtEq => Some((RangeOp::Le, RangeOp::Ge)),
+                _ => None,
+            };
+            if let Some((forward, flipped)) = ops {
+                match (left.as_ref(), right.as_ref()) {
+                    (Expr::Identifier(id), other) => {
+                        if let Ok(v) = literal(other) {
+                            out.push((id.value.clone(), forward, v));
+                        }
+                    }
+                    (other, Expr::Identifier(id)) => {
+                        if let Ok(v) = literal(other) {
+                            out.push((id.value.clone(), flipped, v));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Expr::Between {
+            expr,
+            negated: false,
+            low,
+            high,
+        } => {
+            if let Expr::Identifier(id) = expr.as_ref() {
+                if let Ok(v) = literal(low) {
+                    out.push((id.value.clone(), RangeOp::Ge, v));
+                }
+                if let Ok(v) = literal(high) {
+                    out.push((id.value.clone(), RangeOp::Le, v));
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -6111,6 +6250,60 @@ mod tests {
             env.engine
                 .execute_autocommit("INSERT INTO dst SELECT id, name FROM src")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn pk_range_seek() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')")
+            .unwrap();
+
+        let ids = |sql: &str| -> Vec<i64> {
+            rows(env.engine.execute_autocommit(sql).unwrap())
+                .into_iter()
+                .map(|r| match r[0] {
+                    Value::Int64(n) => n,
+                    ref other => panic!("expected int id, got {other:?}"),
+                })
+                .collect()
+        };
+
+        // Each comparison form over the primary key.
+        assert_eq!(ids("SELECT id FROM t WHERE id > 3 ORDER BY id"), vec![4, 5]);
+        assert_eq!(
+            ids("SELECT id FROM t WHERE id >= 3 ORDER BY id"),
+            vec![3, 4, 5]
+        );
+        assert_eq!(ids("SELECT id FROM t WHERE id < 3 ORDER BY id"), vec![1, 2]);
+        assert_eq!(
+            ids("SELECT id FROM t WHERE id <= 2 ORDER BY id"),
+            vec![1, 2]
+        );
+        assert_eq!(
+            ids("SELECT id FROM t WHERE id BETWEEN 2 AND 4 ORDER BY id"),
+            vec![2, 3, 4]
+        );
+        // Two bounds intersect to a half-open interval.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE id > 1 AND id < 4 ORDER BY id"),
+            vec![2, 3]
+        );
+        // A literal on the left flips the operator (`3 < id` == `id > 3`).
+        assert_eq!(ids("SELECT id FROM t WHERE 3 < id ORDER BY id"), vec![4, 5]);
+        // A residual predicate is still applied to the seeked candidates.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE id >= 2 AND name = 'd'"),
+            vec![4]
+        );
+        // An empty interval yields nothing.
+        assert_eq!(
+            ids("SELECT id FROM t WHERE id > 4 AND id < 2"),
+            Vec::<i64>::new()
         );
     }
 }
