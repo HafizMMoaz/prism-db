@@ -2,11 +2,68 @@
 
 **Crate:** `prism-sql`
 **Status:** Accepted
-**Last updated:** 2026-05-15
+**Last updated:** 2026-06-15
 
 ## Purpose
 
 The SQL engine translates SQL strings into executor pipelines that operate on the record store. It is the relational access method. Its job is to be a clean, narrow, predictable implementation of a useful subset of SQL — not to compete with Postgres on feature breadth.
+
+> **Design target vs. what ships today.** The pipeline, binder, rewriter,
+> planner, and Volcano operators described below are the *target* architecture.
+> The engine that ships today interprets the parsed `sqlparser-rs` AST directly
+> against the catalog — there is no separate bind/rewrite/plan IR yet, joins are
+> nested-loop, and index use is a rule-based equality seek (no cost model). The
+> **[Implemented surface](#implemented-surface-current)** section below is the
+> authoritative list of what actually works; the `prism-sql` crate-level doc
+> comment tracks it line-for-line.
+
+## Implemented surface (current)
+
+What the shipping engine accepts today. This mirrors the `prism-sql` crate-level
+doc comment, which is kept authoritative.
+
+**DDL & DML**
+- `CREATE TABLE` (with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`), `ALTER TABLE`
+  (add / drop / rename column, rename table), `DROP TABLE`.
+- `CREATE [UNIQUE] INDEX name ON t (c, …)` / `DROP INDEX` — secondary B+tree
+  indexes over one **or more** columns, `UNIQUE` or non-unique. `UNIQUE` is
+  enforced on `INSERT`/`UPDATE`; both can serve equality seeks.
+- `INSERT … VALUES (…), …`, `UPDATE t SET … [WHERE …]`,
+  `DELETE FROM t [WHERE …]`. (Updating a `PRIMARY KEY` column is deferred.)
+
+**Queries** — `SELECT [DISTINCT] <exprs | *> FROM … [WHERE …]
+[GROUP BY … [HAVING …]] [ORDER BY … [ASC|DESC]] [LIMIT n] [OFFSET n]`.
+- **Access path:** sequential scan, with a rule-based **index seek** when the
+  `WHERE` pins the primary key — or every column of a secondary index — to a
+  literal via top-level `AND`-ed equalities. The residual predicate is
+  re-applied to the seeked rows.
+- **Joins** (nested-loop): `INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`,
+  comma-separated cartesian products, and self-joins via aliases — with `ON`,
+  `USING (…)`, and `NATURAL` (the latter two coalesce the join columns).
+  `t.col`-qualified references work throughout the statement.
+- **Aggregates:** `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with optional
+  `GROUP BY … HAVING …`. `ORDER BY` may reference aggregate output by name,
+  1-based ordinal, or expression text.
+- **Subqueries:** scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`,
+  `[NOT] EXISTS (SELECT …)`, and derived tables `FROM (SELECT …) AS a`.
+  Uncorrelated subqueries run once up front; **`WHERE` subqueries may be
+  correlated** (re-evaluated per outer row by decorrelation). Correlated
+  subqueries *outside* `WHERE` (e.g. in the select list) are deferred.
+
+**Expressions** — arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
+`IS [NOT] NULL`, `[NOT] IN (…)`, `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`),
+`CASE`, `CAST(x AS <type>)`, and scalar functions:
+- **date/time:** `NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`,
+  `DATEDIFF`, `DATE_ADD`/`DATE_SUB` with `INTERVAL n DAY|HOUR|…`;
+- **string:** `UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`/`REPLACE`;
+- **numeric:** `ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`;
+- **control flow:** `IF`/`IFNULL`/`NULLIF`/`COALESCE`.
+
+**Deferred** (the design sections below describe the eventual home for these):
+correlated subqueries outside `WHERE`, updating a primary-key column, join
+predicate pushdown / index nested-loop joins, leading-prefix and range index
+seeks, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and the formal
+bind → rewrite → plan IR with cost-based planning.
 
 ## Pipeline
 
@@ -141,32 +198,36 @@ No JIT, no expression compilation. Pure tree-walking interpreter. Adequate for O
 
 ## Type system
 
+The implemented SQL column types and their runtime values (`prism-sql/src/types.rs`):
+
 ```rust
 pub enum Type {
-    Bool,
-    Int32,
-    Int64,
-    Float32,
-    Float64,
-    Text,
-    Blob,
-    Timestamp,
+    Bool,         // BOOL / BOOLEAN
+    Int64,        // BIGINT / INT / INTEGER
+    Double,       // DOUBLE / FLOAT / REAL
+    Timestamp,    // TIMESTAMP — epoch microseconds
+    Text,         // TEXT / VARCHAR / CHAR
 }
 
 pub enum Value {
     Null,
     Bool(bool),
-    Int32(i32),
     Int64(i64),
-    Float32(f32),
-    Float64(f64),
-    Text(Box<str>),
-    Blob(Box<[u8]>),
+    Double(f64),
     Timestamp(i64),    // microseconds since Unix epoch
+    Text(Box<str>),
 }
 ```
 
-Coercion rules: explicit `CAST` only. No implicit numeric coercion across precision (`Int32` to `Int64` is explicit). Discussion in `engineering-standards.md`.
+`Int64` is the one integer width and `Double` the one float width (narrower
+SQL spellings map onto them). The binary **wire/SDK** value space is broader —
+it also carries `Int32`, `Float32`, `Binary`, and `ObjectId` tags for the KV and
+document models (`docs/specs/record-format.md`) — but a relational column is one
+of the five types above.
+
+Coercion: integers widen to doubles in mixed arithmetic; `TIMESTAMP` parses from
+`'YYYY-MM-DD[ HH:MM:SS]'` text (and from epoch integers) on insert; otherwise
+conversion between scalar types is explicit via `CAST(x AS <type>)`.
 
 ## Memory accounting
 

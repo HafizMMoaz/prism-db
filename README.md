@@ -94,10 +94,13 @@ All three models share one transaction: `\begin`, mutate across models, `\commit
   crash-safe (WAL + checkpoints + redo recovery).
 - **Durable B-tree indexes** for every model (SQL primary keys, document `_id`,
   KV keys), all WAL-logged.
-- **SQL surface:** `CREATE/ALTER/DROP TABLE`, `INSERT/UPDATE/DELETE`,
-  `SELECT` with `WHERE`/`ORDER BY`/`LIMIT`, joins-free aggregates
-  (`COUNT/SUM/MIN/MAX`, `GROUP BY … HAVING`), `DISTINCT`, scalar functions, and
-  richer expressions (`IN`/`BETWEEN`/`LIKE`/arithmetic).
+- **SQL surface:** `CREATE/ALTER/DROP TABLE`, `CREATE [UNIQUE] INDEX` (single- or
+  multi-column secondary indexes), `INSERT/UPDATE/DELETE`, and `SELECT` with
+  `WHERE`/`GROUP BY … HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`. All join
+  kinds (`INNER`/`LEFT`/`RIGHT`/`FULL OUTER`/`CROSS`, self-joins, and `ON`/
+  `USING`/`NATURAL`), aggregates (`COUNT/SUM/AVG/MIN/MAX`), subqueries (scalar,
+  `IN`, `EXISTS` — correlated in `WHERE`), `CASE`, `CAST`, and date/string/numeric
+  scalar functions over `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/`TEXT`.
 - **Multi-tenant server.** Many named databases under one instance, scrypt-hashed
   accounts, role-based access with **per-database grants**, TLS, connection limits,
   idempotent commits, structured audit logging.

@@ -30,11 +30,12 @@ That phrasing is deliberate. We are not promising to be a better SQL engine than
 - Explicit `BEGIN` / `COMMIT` / `ABORT`; implicit single-statement transactions
 
 ### Relational access method
-- SQL surface: `CREATE TABLE`, `DROP TABLE`, `INSERT`, `UPDATE`, `DELETE`, `SELECT`
-- Joins: inner, left, right, full outer (executor supports all; optimizer chooses nested-loop or hash)
-- `WHERE` predicates, `GROUP BY`, `ORDER BY`, `LIMIT`, `OFFSET`
+- SQL surface: `CREATE`/`ALTER`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`/`DROP INDEX`, `INSERT`, `UPDATE`, `DELETE`, `SELECT`
+- Joins: inner, left, right, full outer, cross, and self-joins, with `ON`/`USING`/`NATURAL` (executor: nested-loop today; hash join is a target)
+- `WHERE` predicates, `GROUP BY … HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
-- B+tree primary key, B+tree secondary indexes
+- Subqueries (scalar, `IN`, `EXISTS`; correlated in `WHERE`), `CASE`, `CAST`, and date/string/numeric scalar functions
+- B+tree primary key, single- and multi-column B+tree secondary indexes (`UNIQUE` and non-unique)
 - Type system: `INT`, `BIGINT`, `FLOAT`, `DOUBLE`, `TEXT`, `BLOB`, `TIMESTAMP`, `BOOL`
 - Constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` (deferred check option)
 
@@ -88,7 +89,6 @@ These are explicitly excluded. Anyone arguing to pull them in is arguing to slip
 - Full-text search (beyond basic substring `LIKE`)
 
 ### Advanced indexing
-- Multi-column indexes (single-column only in v1)
 - Partial indexes
 - Functional/expression indexes
 - Geospatial indexes
