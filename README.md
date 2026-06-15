@@ -95,12 +95,15 @@ All three models share one transaction: `\begin`, mutate across models, `\commit
 - **Durable B-tree indexes** for every model (SQL primary keys, document `_id`,
   KV keys), all WAL-logged.
 - **SQL surface:** `CREATE/ALTER/DROP TABLE`, `CREATE [UNIQUE] INDEX` (single- or
-  multi-column secondary indexes), `INSERT/UPDATE/DELETE`, and `SELECT` with
-  `WHERE`/`GROUP BY … HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`. All join
-  kinds (`INNER`/`LEFT`/`RIGHT`/`FULL OUTER`/`CROSS`, self-joins, and `ON`/
-  `USING`/`NATURAL`), aggregates (`COUNT/SUM/AVG/MIN/MAX`), subqueries (scalar,
-  `IN`, `EXISTS` — correlated in `WHERE`), `CASE`, `CAST`, and date/string/numeric
-  scalar functions over `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/`TEXT`.
+  multi-column secondary indexes), `INSERT … VALUES`/`INSERT … SELECT`,
+  `UPDATE/DELETE`, and `SELECT` with
+  `WHERE`/`GROUP BY … HAVING`/`ORDER BY`/`LIMIT`/`OFFSET`/`DISTINCT`, combinable
+  with `UNION`/`INTERSECT`/`EXCEPT`. All join kinds (`INNER`/`LEFT`/`RIGHT`/
+  `FULL OUTER`/`CROSS`, self-joins, and `ON`/`USING`/`NATURAL`), aggregates
+  (`COUNT/SUM/AVG/MIN/MAX`), subqueries (scalar, `IN`, `EXISTS` — correlated in
+  `WHERE`), primary-key equality **and range** index seeks, `CASE`, `CAST`, and
+  date/string/numeric scalar functions over `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/
+  `TEXT`.
 - **Multi-tenant server.** Many named databases under one instance, scrypt-hashed
   accounts, role-based access with **per-database grants**, TLS, connection limits,
   idempotent commits, structured audit logging.

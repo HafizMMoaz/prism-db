@@ -28,14 +28,19 @@ doc comment, which is kept authoritative.
 - `CREATE [UNIQUE] INDEX name ON t (c, …)` / `DROP INDEX` — secondary B+tree
   indexes over one **or more** columns, `UNIQUE` or non-unique. `UNIQUE` is
   enforced on `INSERT`/`UPDATE`; both can serve equality seeks.
-- `INSERT … VALUES (…), …`, `UPDATE t SET … [WHERE …]`,
-  `DELETE FROM t [WHERE …]`. (Updating a `PRIMARY KEY` column is deferred.)
+- `INSERT … VALUES (…), …` and `INSERT … SELECT` (the source query materializes
+  before any insert, so inserting from the same table is safe),
+  `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`. (Updating a
+  `PRIMARY KEY` column is deferred.)
 
 **Queries** — `SELECT [DISTINCT] <exprs | *> FROM … [WHERE …]
-[GROUP BY … [HAVING …]] [ORDER BY … [ASC|DESC]] [LIMIT n] [OFFSET n]`.
-- **Access path:** sequential scan, with a rule-based **index seek** when the
-  `WHERE` pins the primary key — or every column of a secondary index — to a
-  literal via top-level `AND`-ed equalities. The residual predicate is
+[GROUP BY … [HAVING …]] [ORDER BY … [ASC|DESC]] [LIMIT n] [OFFSET n]`, combinable
+with `UNION` / `INTERSECT` / `EXCEPT` (each `ALL` or distinct; the outer
+`ORDER BY`/`LIMIT`/`OFFSET` binds to the combined result).
+- **Access path:** sequential scan, with a rule-based **index seek** when (within
+  a top-level `AND`) the `WHERE` pins the primary key — or every column of a
+  secondary index — to a literal, or bounds the primary key with a range
+  (`>`/`>=`/`<`/`<=`/`BETWEEN`, fixed-width key types). The residual predicate is
   re-applied to the seeked rows.
 - **Joins** (nested-loop): `INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`,
   comma-separated cartesian products, and self-joins via aliases — with `ON`,
@@ -53,16 +58,19 @@ doc comment, which is kept authoritative.
 **Expressions** — arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
 `IS [NOT] NULL`, `[NOT] IN (…)`, `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`),
 `CASE`, `CAST(x AS <type>)`, and scalar functions:
-- **date/time:** `NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`,
-  `DATEDIFF`, `DATE_ADD`/`DATE_SUB` with `INTERVAL n DAY|HOUR|…`;
-- **string:** `UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`/`REPLACE`;
-- **numeric:** `ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`;
+- **date/time:** `NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/
+  `QUARTER`/`DAYOFWEEK`/`DAYOFYEAR`, `DATEDIFF`, `DATE_ADD`/`DATE_SUB` with
+  `INTERVAL n DAY|HOUR|…`, `UNIX_TIMESTAMP`/`FROM_UNIXTIME`;
+- **string:** `UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`/`REPLACE`/`LEFT`/
+  `RIGHT`/`REVERSE`/`REPEAT`/`SPACE`/`LPAD`/`RPAD`/`INSTR`/`LOCATE`/`ASCII`;
+- **numeric:** `ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`/`SQRT`/`EXP`/`LN`/`LOG`/
+  `LOG10`/`LOG2`/`SIGN`/`TRUNCATE`/`PI`/`GREATEST`/`LEAST`;
 - **control flow:** `IF`/`IFNULL`/`NULLIF`/`COALESCE`.
 
 **Deferred** (the design sections below describe the eventual home for these):
 correlated subqueries outside `WHERE`, updating a primary-key column, join
-predicate pushdown / index nested-loop joins, leading-prefix and range index
-seeks, set operations (`UNION`/`INTERSECT`/`EXCEPT`), and the formal
+predicate pushdown / index nested-loop joins, leading-prefix index seeks (and
+range seeks on secondary or text-keyed indexes), and the formal
 bind → rewrite → plan IR with cost-based planning.
 
 ## Pipeline

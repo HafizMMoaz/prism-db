@@ -30,9 +30,9 @@ That phrasing is deliberate. We are not promising to be a better SQL engine than
 - Explicit `BEGIN` / `COMMIT` / `ABORT`; implicit single-statement transactions
 
 ### Relational access method
-- SQL surface: `CREATE`/`ALTER`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`/`DROP INDEX`, `INSERT`, `UPDATE`, `DELETE`, `SELECT`
+- SQL surface: `CREATE`/`ALTER`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`/`DROP INDEX`, `INSERT` (`VALUES` or `SELECT`), `UPDATE`, `DELETE`, `SELECT`
 - Joins: inner, left, right, full outer, cross, and self-joins, with `ON`/`USING`/`NATURAL` (executor: nested-loop today; hash join is a target)
-- `WHERE` predicates, `GROUP BY … HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`
+- `WHERE` predicates, `GROUP BY … HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, and `UNION`/`INTERSECT`/`EXCEPT`
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
 - Subqueries (scalar, `IN`, `EXISTS`; correlated in `WHERE`), `CASE`, `CAST`, and date/string/numeric scalar functions
 - B+tree primary key, single- and multi-column B+tree secondary indexes (`UNIQUE` and non-unique)
