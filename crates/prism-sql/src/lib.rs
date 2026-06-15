@@ -9,8 +9,9 @@
 //! on `INSERT`/`UPDATE`), `INSERT … VALUES`,
 //! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
-//! and `DELETE FROM t [WHERE …]` over a sequential scan (with a primary-key
-//! index seek for `SELECT … WHERE pk = …`), and aggregates `COUNT`/`SUM`/`AVG`/
+//! and `DELETE FROM t [WHERE …]` over a sequential scan (with an index seek when
+//! the `WHERE` pins the primary key or a UNIQUE-indexed column to a literal —
+//! `SELECT … WHERE col = …`), and aggregates `COUNT`/`SUM`/`AVG`/
 //! `MIN`/`MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
 //! `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/`TEXT` (integers widen to doubles in
 //! mixed arithmetic; `TIMESTAMP` is epoch microseconds and parses from
@@ -693,10 +694,10 @@ impl SqlEngine {
         self.finish_select(select, &query, &schema, filtered, distinct)
     }
 
-    /// The single-base-table path: an index seek for `WHERE <pk> = <literal>`
-    /// (when there is no ORDER BY / LIMIT / OFFSET), otherwise a full scan with
-    /// the predicate applied per row. Produces the WHERE-filtered rows and hands
-    /// off to [`Self::finish_select`].
+    /// The single-base-table path: an index seek when the `WHERE` pins an
+    /// indexed column to a literal, otherwise a full scan with the predicate
+    /// applied per row. Produces the WHERE-filtered rows and hands off to
+    /// [`Self::finish_select`].
     fn select_single(
         &self,
         txn: &TxnHandle,
@@ -706,36 +707,91 @@ impl SqlEngine {
         schema: &JoinSchema,
         distinct: bool,
     ) -> Result<Outcome> {
-        let types = table.types();
-        let plain = query.order_by.is_none() && query.limit.is_none() && query.offset.is_none();
-
-        let mut filtered: Vec<Vec<Value>> = Vec::new();
-        let mut seeked = false;
-        if plain {
-            if let (Some(tree), Some(key_value)) = (
-                self.pk_index(table),
-                self.pk_equality_literal(&select.selection, table)?,
-            ) {
-                let key = encode_index_key(&key_value)?;
-                if let Some(rid) = tree.search(&key)? {
-                    if let Some(payload) = self.store.read(txn, rid)? {
-                        // The seek key *is* the whole predicate, so no re-filter.
-                        filtered.push(types::decode_row(&types, &payload)?);
-                    }
-                }
-                seeked = true;
-            }
+        // Index seek (primary key or a UNIQUE secondary index) when applicable.
+        if let Some(rows) = self.index_seek(txn, table, schema, &select.selection)? {
+            return self.finish_select(select, query, schema, rows, distinct);
         }
-        if !seeked {
-            for (_, payload) in self.store.scan(txn, table.heap)? {
-                let full = types::decode_row(&types, &payload)?;
-                match &select.selection {
-                    Some(pred) if !self.matches(pred, &full, schema)? => continue,
-                    _ => filtered.push(full),
-                }
+        // Otherwise a full sequential scan applying the predicate per row.
+        let types = table.types();
+        let mut filtered: Vec<Vec<Value>> = Vec::new();
+        for (_, payload) in self.store.scan(txn, table.heap)? {
+            let full = types::decode_row(&types, &payload)?;
+            match &select.selection {
+                Some(pred) if !self.matches(pred, &full, schema)? => continue,
+                _ => filtered.push(full),
             }
         }
         self.finish_select(select, query, schema, filtered, distinct)
+    }
+
+    /// If the `WHERE` clause pins an indexed column (the primary key or a UNIQUE
+    /// secondary index) to a literal — possibly within a top-level `AND` — seek
+    /// that index and return the matching rows, with the full predicate applied
+    /// to the candidate (so residual conditions still filter). Returns `None`
+    /// when no index applies, so the caller falls back to a scan.
+    fn index_seek(
+        &self,
+        txn: &TxnHandle,
+        table: &Table,
+        schema: &JoinSchema,
+        selection: &Option<Expr>,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        let Some(pred) = selection else {
+            return Ok(None);
+        };
+        let eqs = collect_equalities(pred);
+        if eqs.is_empty() {
+            return Ok(None);
+        }
+        // A literal pinned to column `col`, if its type matches the column.
+        let value_for = |col: usize| -> Option<Value> {
+            eqs.iter()
+                .find(|(n, _)| *n == table.columns[col].name)
+                .map(|(_, v)| v.clone())
+                .filter(|v| v.type_matches(table.columns[col].ty))
+        };
+
+        // Prefer the primary-key index, then any UNIQUE secondary index.
+        let chosen: Option<(BTree, Vec<u8>)> =
+            if let (Some(pk), Some(tree)) = (table.primary_key, self.pk_index(table)) {
+                match value_for(pk) {
+                    Some(v) => Some((tree, encode_index_key(&v)?)),
+                    None => self.first_secondary_seek(table, &value_for)?,
+                }
+            } else {
+                self.first_secondary_seek(table, &value_for)?
+            };
+        let Some((tree, key)) = chosen else {
+            return Ok(None);
+        };
+
+        let types = table.types();
+        let mut out = Vec::new();
+        if let Some(rid) = tree.search(&key)? {
+            if let Some(payload) = self.store.read(txn, rid)? {
+                let row = types::decode_row(&types, &payload)?;
+                if self.matches(pred, &row, schema)? {
+                    out.push(row);
+                }
+            }
+        }
+        Ok(Some(out))
+    }
+
+    /// The first UNIQUE secondary index whose column is pinned by `value_for`,
+    /// opened and paired with the seek key.
+    fn first_secondary_seek(
+        &self,
+        table: &Table,
+        value_for: &dyn Fn(usize) -> Option<Value>,
+    ) -> Result<Option<(BTree, Vec<u8>)>> {
+        for def in &table.indexes {
+            if let Some(v) = value_for(def.column) {
+                let tree = BTree::open(self.store.buffer(), self.store.wal(), def.root, usize::MAX);
+                return Ok(Some((tree, encode_index_key(&v)?)));
+            }
+        }
+        Ok(None)
     }
 
     /// Shared tail of a `SELECT`: dispatch to the aggregate path when the query
@@ -1548,35 +1604,6 @@ impl SqlEngine {
         Ok(Outcome::Delete { count })
     }
 
-    /// If `selection` is exactly `<pk> = <literal>` (either operand order) on a
-    /// table with a primary key whose type matches the literal, return that
-    /// literal value for an index seek; otherwise `None` (fall back to a scan).
-    fn pk_equality_literal(
-        &self,
-        selection: &Option<Expr>,
-        table: &Table,
-    ) -> Result<Option<Value>> {
-        let Some(pk_col) = table.primary_key else {
-            return Ok(None);
-        };
-        let Some(Expr::BinaryOp {
-            left,
-            op: BinaryOperator::Eq,
-            right,
-        }) = selection
-        else {
-            return Ok(None);
-        };
-        let pk_name = &table.columns[pk_col].name;
-        let lit = match (left.as_ref(), right.as_ref()) {
-            (Expr::Identifier(id), other) if &id.value == pk_name => literal(other).ok(),
-            (other, Expr::Identifier(id)) if &id.value == pk_name => literal(other).ok(),
-            _ => None,
-        };
-        // Only seek when the literal's type matches the key column.
-        Ok(lit.filter(|v| v.type_matches(table.columns[pk_col].ty)))
-    }
-
     /// Whether `row` satisfies the boolean predicate `expr`.
     fn matches(&self, expr: &Expr, row: &[Value], cols: &dyn ColumnResolver) -> Result<bool> {
         Ok(matches!(self.eval(expr, row, cols)?, Value::Bool(true)))
@@ -2274,6 +2301,43 @@ fn expr_has_subquery(e: &Expr) -> bool {
             expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
         }
         _ => false,
+    }
+}
+
+/// Collect `column = literal` equalities reachable through a top-level `AND`
+/// chain (either operand order), as `(column name, value)` pairs. Used to pick
+/// an index seek; conditions it can't read are simply ignored (the full
+/// predicate is still applied to any seeked row).
+fn collect_equalities(expr: &Expr) -> Vec<(String, Value)> {
+    let mut out = Vec::new();
+    collect_equalities_into(expr, &mut out);
+    out
+}
+
+fn collect_equalities_into(expr: &Expr, out: &mut Vec<(String, Value)>) {
+    match expr {
+        Expr::Nested(e) => collect_equalities_into(e, out),
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_equalities_into(left, out);
+            collect_equalities_into(right, out);
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (Expr::Identifier(id), other) | (other, Expr::Identifier(id)) => {
+                if let Ok(v) = literal(other) {
+                    out.push((id.value.clone(), v));
+                }
+            }
+            _ => {}
+        },
+        _ => {}
     }
 }
 
@@ -5135,6 +5199,57 @@ mod tests {
                     .unwrap()
             ),
             vec![vec![Value::Int64(3), Value::Int64(30)]]
+        );
+    }
+
+    #[test]
+    fn index_seek_returns_correct_rows() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE u (id BIGINT PRIMARY KEY, email TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO u VALUES (1,'a@x'),(2,'b@x'),(3,'c@x')")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE UNIQUE INDEX u_email ON u (email)")
+            .unwrap();
+
+        // Seek via the secondary UNIQUE index.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM u WHERE email = 'b@x'")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2)]]
+        );
+        // A residual predicate is still applied to the seeked row.
+        assert!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM u WHERE email = 'b@x' AND id < 0")
+                    .unwrap()
+            )
+            .is_empty()
+        );
+        // No match yields no rows.
+        assert!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM u WHERE email = 'z@x'")
+                    .unwrap()
+            )
+            .is_empty()
+        );
+        // The primary-key seek still works (with ORDER BY/LIMIT honored).
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT email FROM u WHERE id = 3 LIMIT 1")
+                    .unwrap()
+            ),
+            vec![vec![t("c@x")]]
         );
     }
 }
