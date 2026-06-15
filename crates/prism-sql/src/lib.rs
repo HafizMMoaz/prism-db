@@ -39,10 +39,15 @@
 //! 1-based ordinal, or expression text). Subqueries are supported: scalar
 //! `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and derived
 //! tables `FROM (SELECT …) AS alias`; uncorrelated ones run once up front, and
-//! `WHERE` subqueries may be correlated (run per outer row). Deferred: correlated
-//! subqueries outside `WHERE` (e.g. in the select list), updating a primary-key
-//! column, join predicate pushdown / index nested-loop, the formal
-//! bind/rewrite/plan IR. The current executor interprets the parsed
+//! `WHERE` subqueries may be correlated (run per outer row). Non-recursive CTEs
+//! (`WITH a AS (…) …`) are inlined as derived tables. Window functions
+//! (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD` and `SUM`/`COUNT`/`AVG`/`MIN`/
+//! `MAX` over `OVER (PARTITION BY … ORDER BY …)`) yield one value per row;
+//! aggregate windows cover the whole partition (no running frame). Deferred:
+//! recursive CTEs, correlated subqueries outside `WHERE` (e.g. in the select
+//! list), window frame clauses, updating a primary-key column, join predicate
+//! pushdown / index nested-loop, the formal bind/rewrite/plan IR. The current
+//! executor interprets the parsed
 //! AST directly against the catalog; the full parse→bind→plan→execute pipeline
 //! is a follow-up.
 
@@ -67,7 +72,7 @@ use sqlparser::ast::{
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
     JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr,
     SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Value as SqlValue,
+    UnaryOperator, Value as SqlValue, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -1069,6 +1074,12 @@ impl SqlEngine {
         mut rows: Vec<Vec<Value>>,
         distinct: bool,
     ) -> Result<Outcome> {
+        // Window functions (`f() OVER (…)`) produce one value per input row, so
+        // they take a separate path from collapsing GROUP BY aggregates.
+        if projection_has_window(&select.projection) {
+            return self.exec_window(schema, &select.projection, query, rows, distinct);
+        }
+
         let group_keys = parse_group_by(&select.group_by, schema)?;
         if !group_keys.is_empty() || projection_has_aggregate(&select.projection) {
             return self.exec_aggregate(
@@ -1915,6 +1926,298 @@ impl SqlEngine {
         }
         let columns = outputs.into_iter().map(|(name, _)| name).collect();
         Ok(Outcome::Select { columns, rows })
+    }
+
+    /// Execute a `SELECT` whose projection contains window functions
+    /// (`f() OVER (PARTITION BY … ORDER BY …)`). Unlike a `GROUP BY` aggregate,
+    /// each window function yields one value per input row; non-window projection
+    /// items are evaluated per row as usual. Outer `ORDER BY`/`LIMIT`/`OFFSET`/
+    /// `DISTINCT` then apply to the result.
+    fn exec_window(
+        &self,
+        schema: &JoinSchema,
+        projection: &[SelectItem],
+        query: &Query,
+        rows: Vec<Vec<Value>>,
+        distinct: bool,
+    ) -> Result<Outcome> {
+        // Resolve each projection item into an output column: a window function,
+        // a per-row expression, or (for `*`) a direct row-column index.
+        enum OutKind {
+            Window(WindowFn),
+            Expr(Expr),
+            Col(usize),
+        }
+        let mut outputs: Vec<(String, OutKind)> = Vec::with_capacity(projection.len());
+        for item in projection {
+            match item {
+                SelectItem::Wildcard(_) => {
+                    for (i, (_, name)) in schema.columns().iter().enumerate() {
+                        outputs.push((name.clone(), OutKind::Col(i)));
+                    }
+                }
+                SelectItem::QualifiedWildcard(obj, _) => {
+                    let q = object_name(obj);
+                    for (i, (cq, name)) in schema.columns().iter().enumerate() {
+                        if cq.as_deref() == Some(q.as_str()) {
+                            outputs.push((name.clone(), OutKind::Col(i)));
+                        }
+                    }
+                }
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    let alias = match item {
+                        SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.clone()),
+                        _ => None,
+                    };
+                    match e {
+                        Expr::Function(f) if f.over.is_some() => {
+                            let name = alias.unwrap_or_else(|| e.to_string());
+                            outputs.push((name, OutKind::Window(self.parse_window_fn(f, schema)?)));
+                        }
+                        _ => {
+                            let name = alias.unwrap_or_else(|| name_of_expr(e));
+                            outputs.push((name, OutKind::Expr(e.clone())));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Precompute each window function's per-row column (None for non-window
+        // outputs).
+        let mut window_cols: Vec<Option<Vec<Value>>> = Vec::with_capacity(outputs.len());
+        for (_, kind) in &outputs {
+            window_cols.push(match kind {
+                OutKind::Window(wf) => Some(self.compute_window(wf, &rows, schema)?),
+                _ => None,
+            });
+        }
+
+        // Assemble one output row per input row.
+        let mut result: Vec<Vec<Value>> = Vec::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let mut cells = Vec::with_capacity(outputs.len());
+            for (oi, (_, kind)) in outputs.iter().enumerate() {
+                let v = match kind {
+                    OutKind::Window(_) => window_cols[oi].as_ref().unwrap()[i].clone(),
+                    OutKind::Expr(e) => self.eval(e, row, schema)?,
+                    OutKind::Col(c) => row[*c].clone(),
+                };
+                cells.push(v);
+            }
+            result.push(cells);
+        }
+
+        // ORDER BY / OFFSET / LIMIT / DISTINCT over the produced rows.
+        if let Some(order_by) = &query.order_by {
+            // An ORDER BY key is an output column (by name / 1-based ordinal /
+            // expression text) when it matches one, else an expression over the
+            // input row (e.g. ordering by a column that is not projected).
+            let names: Vec<&str> = outputs.iter().map(|(n, _)| n.as_str()).collect();
+            enum SortSrc {
+                Out(usize),
+                Input(Expr),
+            }
+            let mut spec: Vec<(SortSrc, bool)> = Vec::with_capacity(order_by.exprs.len());
+            for item in &order_by.exprs {
+                let asc = item.asc != Some(false);
+                match resolve_output_col(&item.expr, &names) {
+                    Ok(idx) => spec.push((SortSrc::Out(idx), asc)),
+                    Err(_) => spec.push((SortSrc::Input(item.expr.clone()), asc)),
+                }
+            }
+            // Pair each output row with its sort key, sort, then drop the key.
+            let mut keyed: Vec<(Vec<Value>, Vec<Value>)> = Vec::with_capacity(result.len());
+            for (i, out_row) in result.into_iter().enumerate() {
+                let mut key = Vec::with_capacity(spec.len());
+                for (src, _) in &spec {
+                    key.push(match src {
+                        SortSrc::Out(idx) => out_row[*idx].clone(),
+                        SortSrc::Input(e) => self.eval(e, &rows[i], schema)?,
+                    });
+                }
+                keyed.push((key, out_row));
+            }
+            keyed.sort_by(|a, b| {
+                for (pos, (_, asc)) in spec.iter().enumerate() {
+                    let ord = value_cmp(&a.0[pos], &b.0[pos]);
+                    let ord = if *asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            result = keyed.into_iter().map(|(_, row)| row).collect();
+        }
+        let offset = match &query.offset {
+            Some(o) => count_literal(&o.value)?,
+            None => 0,
+        };
+        let limit = match &query.limit {
+            Some(e) => count_literal(e)?,
+            None => usize::MAX,
+        };
+        let mut out: Vec<Vec<Value>> = result.into_iter().skip(offset).take(limit).collect();
+        if distinct {
+            dedup_rows(&mut out);
+        }
+        let columns = outputs.into_iter().map(|(name, _)| name).collect();
+        Ok(Outcome::Select { columns, rows: out })
+    }
+
+    /// Parse a window function call (`f() OVER (…)`) into a [`WindowFn`].
+    fn parse_window_fn(&self, f: &Function, schema: &JoinSchema) -> Result<WindowFn> {
+        let spec = match &f.over {
+            Some(WindowType::WindowSpec(spec)) => spec,
+            _ => return Err(SqlError::Unsupported("named window (WINDOW clause)".into())),
+        };
+        let name = object_name(&f.name).to_ascii_uppercase();
+        let args = scalar_args(f).unwrap_or_default();
+        let kind = match name.as_str() {
+            "ROW_NUMBER" => WindowKind::RowNumber,
+            "RANK" => WindowKind::Rank,
+            "DENSE_RANK" => WindowKind::DenseRank,
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                WindowKind::Agg(parse_window_aggregate(f, schema)?)
+            }
+            "LAG" | "LEAD" => {
+                let col = match args.first() {
+                    Some(e) => resolve_col_expr(schema, e)?,
+                    None => return Err(SqlError::Type(format!("{name} needs a column argument"))),
+                };
+                let amount = match args.get(1) {
+                    Some(e) => match literal(e)? {
+                        Value::Int64(n) => n,
+                        other => {
+                            return Err(SqlError::Type(format!(
+                                "{name} offset must be an integer, got {other:?}"
+                            )));
+                        }
+                    },
+                    None => 1,
+                };
+                let default = match args.get(2) {
+                    Some(e) => literal(e)?,
+                    None => Value::Null,
+                };
+                WindowKind::Offset {
+                    col,
+                    amount,
+                    default,
+                    lead: name == "LEAD",
+                }
+            }
+            other => return Err(SqlError::Unsupported(format!("window function {other}"))),
+        };
+        Ok(WindowFn {
+            kind,
+            partition_by: spec.partition_by.clone(),
+            order_by: spec.order_by.clone(),
+        })
+    }
+
+    /// Compute a window function's value for every input row (indexed as `rows`).
+    /// Rows are grouped by the `PARTITION BY` key; within each partition the
+    /// `ORDER BY` keys order the rows for ranking and offset functions. Aggregate
+    /// windows produce the whole-partition value broadcast to each member (no
+    /// running frame — an explicit frame clause is ignored).
+    fn compute_window(
+        &self,
+        wf: &WindowFn,
+        rows: &[Vec<Value>],
+        schema: &JoinSchema,
+    ) -> Result<Vec<Value>> {
+        let n = rows.len();
+        let mut out = vec![Value::Null; n];
+
+        // Order-by key tuple per row, plus the shared ascending flags.
+        let asc: Vec<bool> = wf.order_by.iter().map(|o| o.asc != Some(false)).collect();
+        let mut order_vals: Vec<Vec<Value>> = Vec::with_capacity(n);
+        for row in rows {
+            let mut key = Vec::with_capacity(wf.order_by.len());
+            for o in &wf.order_by {
+                key.push(self.eval(&o.expr, row, schema)?);
+            }
+            order_vals.push(key);
+        }
+
+        // Partition row indices by the PARTITION BY key, preserving first-seen
+        // order.
+        let mut partitions: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+        for (i, row) in rows.iter().enumerate() {
+            let mut key = Vec::with_capacity(wf.partition_by.len());
+            for e in &wf.partition_by {
+                key.push(self.eval(e, row, schema)?);
+            }
+            match partitions.iter_mut().find(|(k, _)| *k == key) {
+                Some(entry) => entry.1.push(i),
+                None => partitions.push((key, vec![i])),
+            }
+        }
+
+        let cmp = |a: usize, b: usize| {
+            for (pos, &ascending) in asc.iter().enumerate() {
+                let ord = value_cmp(&order_vals[a][pos], &order_vals[b][pos]);
+                let ord = if ascending { ord } else { ord.reverse() };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        };
+
+        for (_, members) in partitions {
+            let mut idxs = members.clone();
+            if !wf.order_by.is_empty() {
+                idxs.sort_by(|&a, &b| cmp(a, b));
+            }
+            match &wf.kind {
+                WindowKind::RowNumber => {
+                    for (pos, &i) in idxs.iter().enumerate() {
+                        out[i] = Value::Int64(pos as i64 + 1);
+                    }
+                }
+                WindowKind::Rank | WindowKind::DenseRank => {
+                    let dense = matches!(wf.kind, WindowKind::DenseRank);
+                    let mut rank: i64 = 0;
+                    for (pos, &i) in idxs.iter().enumerate() {
+                        let new_group = pos == 0 || order_vals[i] != order_vals[idxs[pos - 1]];
+                        if new_group {
+                            rank = if dense { rank + 1 } else { pos as i64 + 1 };
+                        }
+                        out[i] = Value::Int64(rank);
+                    }
+                }
+                WindowKind::Agg(agg) => {
+                    let value = agg.compute(&members, rows)?;
+                    for &i in &members {
+                        out[i] = value.clone();
+                    }
+                }
+                WindowKind::Offset {
+                    col,
+                    amount,
+                    default,
+                    lead,
+                } => {
+                    let len = idxs.len() as i64;
+                    for pos in 0..idxs.len() {
+                        let src = if *lead {
+                            pos as i64 + *amount
+                        } else {
+                            pos as i64 - *amount
+                        };
+                        out[idxs[pos]] = if src >= 0 && src < len {
+                            rows[idxs[src as usize]][*col].clone()
+                        } else {
+                            default.clone()
+                        };
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Evaluate a HAVING predicate for one group. Aggregate function calls are
@@ -3990,12 +4293,21 @@ fn is_aggregate_name(name: &str) -> bool {
 }
 
 /// Whether any projection item is an *aggregate* function call (scalar
-/// functions like `YEAR`/`UPPER` are evaluated per row, not aggregated).
+/// functions like `YEAR`/`UPPER` are evaluated per row, not aggregated; a
+/// windowed `SUM(…) OVER (…)` is a window function, not a collapsing aggregate).
 fn projection_has_aggregate(items: &[SelectItem]) -> bool {
-    let is_agg =
-        |e: &Expr| matches!(e, Expr::Function(f) if is_aggregate_name(&object_name(&f.name)));
+    let is_agg = |e: &Expr| matches!(e, Expr::Function(f) if f.over.is_none() && is_aggregate_name(&object_name(&f.name)));
     items.iter().any(|item| match item {
         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => is_agg(e),
+        _ => false,
+    })
+}
+
+/// Whether any projection item is a window function call (`f() OVER (…)`).
+fn projection_has_window(items: &[SelectItem]) -> bool {
+    let is_window = |e: &Expr| matches!(e, Expr::Function(f) if f.over.is_some());
+    items.iter().any(|item| match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => is_window(e),
         _ => false,
     })
 }
@@ -4073,6 +4385,87 @@ fn parse_aggregate(f: &Function, cols: &dyn ColumnResolver) -> Result<Aggregate>
         other => {
             return Err(SqlError::Unsupported(format!("aggregate function {other}")));
         }
+    };
+    Ok(Aggregate {
+        func,
+        col: Some(col_of(arg)?),
+    })
+}
+
+/// A parsed window function call and its partition / order specification.
+struct WindowFn {
+    kind: WindowKind,
+    partition_by: Vec<Expr>,
+    order_by: Vec<OrderByExpr>,
+}
+
+/// The kind of window function, with anything it needs already resolved.
+enum WindowKind {
+    RowNumber,
+    Rank,
+    DenseRank,
+    /// A window aggregate over the whole partition (no running frame).
+    Agg(Aggregate),
+    /// `LAG`/`LEAD`: the value of `col` `amount` rows back (`lead = false`) or
+    /// ahead (`lead = true`) in the ordered partition, else `default`.
+    Offset {
+        col: usize,
+        amount: i64,
+        default: Value,
+        lead: bool,
+    },
+}
+
+/// The reported output-column name for a non-aliased projection expression.
+fn name_of_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) if !parts.is_empty() => parts.last().unwrap().value.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// Parse the aggregate part of a window aggregate (`SUM(x) OVER …`). Like
+/// [`parse_aggregate`] but the `OVER` clause is expected rather than rejected.
+fn parse_window_aggregate(f: &Function, cols: &dyn ColumnResolver) -> Result<Aggregate> {
+    let name = object_name(&f.name).to_ascii_uppercase();
+    let FunctionArguments::List(list) = &f.args else {
+        return Err(SqlError::Unsupported(format!(
+            "{name} requires an argument"
+        )));
+    };
+    if list.args.len() != 1 {
+        return Err(SqlError::Unsupported(format!(
+            "{name} takes exactly one argument"
+        )));
+    }
+    let FunctionArg::Unnamed(arg) = &list.args[0] else {
+        return Err(SqlError::Unsupported("named aggregate argument".into()));
+    };
+    let col_of = |arg: &FunctionArgExpr| -> Result<usize> {
+        match arg {
+            FunctionArgExpr::Expr(e) => resolve_col_expr(cols, e),
+            other => Err(SqlError::Unsupported(format!(
+                "aggregate argument: {other:?}"
+            ))),
+        }
+    };
+    let func = match name.as_str() {
+        "COUNT" => {
+            let col = match arg {
+                FunctionArgExpr::Wildcard => None,
+                other => Some(col_of(other)?),
+            };
+            return Ok(Aggregate {
+                func: AggFunc::Count,
+                col,
+            });
+        }
+        "SUM" => AggFunc::Sum,
+        "AVG" => AggFunc::Avg,
+        "MIN" => AggFunc::Min,
+        "MAX" => AggFunc::Max,
+        other => return Err(SqlError::Unsupported(format!("aggregate function {other}"))),
     };
     Ok(Aggregate {
         func,
@@ -6862,6 +7255,109 @@ mod tests {
                     .unwrap()
             ),
             vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+    }
+
+    #[test]
+    fn window_functions() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE emp (id BIGINT, dept BIGINT, salary BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO emp VALUES (1,10,100),(2,10,200),(3,20,50),(4,20,90)")
+            .unwrap();
+
+        // ROW_NUMBER within each dept, highest salary first.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn \
+                         FROM emp ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(1), Value::Int64(2)],
+                vec![Value::Int64(2), Value::Int64(1)],
+                vec![Value::Int64(3), Value::Int64(2)],
+                vec![Value::Int64(4), Value::Int64(1)],
+            ]
+        );
+
+        // Whole-partition SUM broadcast to each member row.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id, SUM(salary) OVER (PARTITION BY dept) AS s FROM emp ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(1), Value::Int64(300)],
+                vec![Value::Int64(2), Value::Int64(300)],
+                vec![Value::Int64(3), Value::Int64(140)],
+                vec![Value::Int64(4), Value::Int64(140)],
+            ]
+        );
+
+        // LAG over ascending (distinct) salary — first row has no predecessor.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id, LAG(salary) OVER (ORDER BY salary) AS prev \
+                         FROM emp ORDER BY salary"
+                    )
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(3), Value::Null],
+                vec![Value::Int64(4), Value::Int64(50)],
+                vec![Value::Int64(1), Value::Int64(90)],
+                vec![Value::Int64(2), Value::Int64(100)],
+            ]
+        );
+
+        // RANK vs DENSE_RANK with a tie at the top.
+        env.engine
+            .execute_autocommit("CREATE TABLE scores (name TEXT, score BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO scores VALUES ('a',90),('b',90),('c',80),('d',70)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT name, RANK() OVER (ORDER BY score DESC) AS r FROM scores ORDER BY name"
+                    )
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Text("a".into()), Value::Int64(1)],
+                vec![Value::Text("b".into()), Value::Int64(1)],
+                vec![Value::Text("c".into()), Value::Int64(3)],
+                vec![Value::Text("d".into()), Value::Int64(4)],
+            ]
+        );
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT name, DENSE_RANK() OVER (ORDER BY score DESC) AS r \
+                         FROM scores ORDER BY name"
+                    )
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Text("a".into()), Value::Int64(1)],
+                vec![Value::Text("b".into()), Value::Int64(1)],
+                vec![Value::Text("c".into()), Value::Int64(2)],
+                vec![Value::Text("d".into()), Value::Int64(3)],
+            ]
         );
     }
 }
