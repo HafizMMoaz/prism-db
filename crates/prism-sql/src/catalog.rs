@@ -11,7 +11,7 @@ use prism_core::store::HeapId;
 use prism_storage::PageId;
 
 use crate::error::{Result, SqlError};
-use crate::types::Type;
+use crate::types::{Type, Value};
 
 /// A column definition.
 #[derive(Clone, Debug)]
@@ -22,6 +22,9 @@ pub struct Column {
     pub ty: Type,
     /// Whether NULLs are allowed.
     pub nullable: bool,
+    /// The literal value to use when an `INSERT` omits this column (`DEFAULT`).
+    /// `None` means the implicit default of NULL.
+    pub default: Option<Value>,
 }
 
 /// A secondary index: a named, durable B+tree over one or more columns. A

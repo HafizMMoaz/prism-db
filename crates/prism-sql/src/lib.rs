@@ -68,11 +68,11 @@ use prism_core::txn::{TxnHandle, TxnMode};
 use prism_index::BTree;
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, CeilFloorKind, ColumnDef,
-    ColumnOption, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment, Expr, FromTable,
-    Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
-    JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
-    UnaryOperator, Value as SqlValue, WindowType,
+    ColumnOption, ColumnOptionDef, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem,
+    SetExpr, SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableObject,
+    TableWithJoins, UnaryOperator, Value as SqlValue, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -399,6 +399,7 @@ impl SqlEngine {
             name: col_name.clone(),
             ty,
             nullable: !not_null,
+            default: column_default(&def.options)?,
         });
         let new_types: Vec<Type> = new_columns.iter().map(|c| c.ty).collect();
 
@@ -536,6 +537,7 @@ impl SqlEngine {
                 name: col.name.value.clone(),
                 ty,
                 nullable,
+                default: column_default(&col.options)?,
             });
         }
 
@@ -646,8 +648,19 @@ impl SqlEngine {
         let types = table.types();
         let index = self.pk_index(&table);
         let sec = self.secondary_indexes(&table);
+        // Columns supplied by the statement; the rest fall back to their DEFAULT.
+        let targeted: std::collections::HashSet<usize> = target.iter().copied().collect();
         let mut count = 0;
-        for row in input_rows {
+        for mut row in input_rows {
+            // Fill a column DEFAULT for any column the statement omitted (an
+            // explicitly supplied value, including NULL, is left untouched).
+            for (i, col) in table.columns.iter().enumerate() {
+                if !targeted.contains(&i) {
+                    if let Some(default) = &col.default {
+                        row[i] = default.clone();
+                    }
+                }
+            }
             // Enforce NOT NULL.
             for (col, value) in table.columns.iter().zip(&row) {
                 if !col.nullable && matches!(value, Value::Null) {
@@ -4610,6 +4623,21 @@ fn map_data_type(dt: &DataType) -> Result<Type> {
     }
 }
 
+/// The literal `DEFAULT` value declared on a column, if any. Only literal
+/// defaults are supported; a non-literal default (e.g. `NOW()`) is rejected.
+fn column_default(options: &[ColumnOptionDef]) -> Result<Option<Value>> {
+    for o in options {
+        if let ColumnOption::Default(expr) = &o.option {
+            return Ok(Some(literal(expr).map_err(|_| {
+                SqlError::Unsupported(format!(
+                    "only literal DEFAULT values are supported, got {expr}"
+                ))
+            })?));
+        }
+    }
+    Ok(None)
+}
+
 /// The simple name of an object (last identifier), unquoted.
 fn object_name(name: &sqlparser::ast::ObjectName) -> String {
     name.to_string().trim_matches('"').to_string()
@@ -7358,6 +7386,67 @@ mod tests {
                 vec![Value::Text("c".into()), Value::Int64(2)],
                 vec![Value::Text("d".into()), Value::Int64(3)],
             ]
+        );
+    }
+
+    #[test]
+    fn column_defaults() {
+        let env = env();
+        env.engine
+            .execute_autocommit(
+                "CREATE TABLE t (id BIGINT PRIMARY KEY, status TEXT DEFAULT 'new', \
+                 qty BIGINT DEFAULT 0, flag BOOL DEFAULT TRUE)",
+            )
+            .unwrap();
+
+        // Omitted columns fall back to their declared defaults.
+        env.engine
+            .execute_autocommit("INSERT INTO t (id) VALUES (1)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT status, qty, flag FROM t WHERE id = 1")
+                    .unwrap()
+            ),
+            vec![vec![
+                Value::Text("new".into()),
+                Value::Int64(0),
+                Value::Bool(true)
+            ]]
+        );
+
+        // An explicitly supplied value wins over the default.
+        env.engine
+            .execute_autocommit("INSERT INTO t (id, status, qty) VALUES (2, 'custom', 5)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT status, qty FROM t WHERE id = 2")
+                    .unwrap()
+            ),
+            vec![vec![Value::Text("custom".into()), Value::Int64(5)]]
+        );
+
+        // An explicit NULL is kept (it is not replaced by the default).
+        env.engine
+            .execute_autocommit("INSERT INTO t (id, status) VALUES (3, NULL)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT status FROM t WHERE id = 3")
+                    .unwrap()
+            ),
+            vec![vec![Value::Null]]
+        );
+
+        // A non-literal default is rejected at CREATE TABLE.
+        assert!(
+            env.engine
+                .execute_autocommit("CREATE TABLE bad (id BIGINT, ts TIMESTAMP DEFAULT NOW())")
+                .is_err()
         );
     }
 }

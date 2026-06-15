@@ -142,6 +142,38 @@ fn all_three_models_survive_restart() {
 }
 
 #[test]
+fn column_defaults_survive_restart() {
+    let tmp = TempDir::new("durability_defaults").unwrap();
+
+    // ---- Session 1: declare a table with column DEFAULTs, then close. ----
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql(
+            "CREATE TABLE t (id BIGINT PRIMARY KEY, status TEXT DEFAULT 'new', qty BIGINT DEFAULT 7)",
+        ));
+        drop(s);
+        drop(db);
+    }
+
+    // ---- Session 2: reopen; an INSERT omitting columns must still pick up the
+    // persisted DEFAULTs (they were recovered from the catalog). ----
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    s.handle(sql("INSERT INTO t (id) VALUES (1)"));
+    match s.handle(sql("SELECT status, qty FROM t WHERE id = 1")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0][0], Some(WireValue::Str("new".into())));
+            assert_eq!(rows[0][1], Some(WireValue::Int64(7)));
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn checkpoint_then_more_writes_all_survive_durable_restart() {
     // A durable database: write, checkpoint (flush to disk), write more, then
     // reopen. Both the checkpointed and the post-checkpoint data must be there.

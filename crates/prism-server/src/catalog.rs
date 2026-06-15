@@ -12,7 +12,7 @@
 //! (DDL is not yet transactional with surrounding data).
 
 use prism_protocol::codec::{Reader, Writer};
-use prism_sql::{Column, Type};
+use prism_sql::{Column, Type, Value};
 
 use crate::error::{Result, ServerError};
 
@@ -155,6 +155,24 @@ impl CatalogEntry {
             w.put_u8(u8::from(ix.unique));
             w.put_u64(ix.root);
         }
+        // Column DEFAULT values follow the indexes (column index -> literal).
+        // Only columns that have a default are written; a record without this
+        // trailing section (older, or no defaults) decodes as all-None.
+        let defaults: Vec<(usize, &Value)> = self
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| c.default.as_ref().map(|v| (i, v)))
+            .collect();
+        let ndef: u16 = defaults
+            .len()
+            .try_into()
+            .map_err(|_| ServerError::Corrupt("too many defaults".into()))?;
+        w.put_u16(ndef);
+        for (i, v) in defaults {
+            w.put_u16(i as u16);
+            encode_value(&mut w, v)?;
+        }
         Ok(w.into_vec())
     }
 
@@ -177,6 +195,7 @@ impl CatalogEntry {
                 name: col_name,
                 ty,
                 nullable,
+                default: None,
             });
         }
         // Records from before `DROP` support end here and decode as `Upsert`.
@@ -209,6 +228,17 @@ impl CatalogEntry {
             }
             v
         };
+        // Column DEFAULT values follow the indexes; absent in older records.
+        if !r.is_empty() {
+            let ndef = r.get_u16("catalog.ndefaults")?;
+            for _ in 0..ndef {
+                let idx = r.get_u16("catalog.default_col")? as usize;
+                let value = decode_value(&mut r)?;
+                if let Some(col) = columns.get_mut(idx) {
+                    col.default = Some(value);
+                }
+            }
+        }
         Ok(Self {
             op,
             kind,
@@ -220,6 +250,51 @@ impl CatalogEntry {
             indexes,
         })
     }
+}
+
+/// Encode a literal default [`Value`] (a one-byte tag then its payload).
+fn encode_value(w: &mut Writer, v: &Value) -> Result<()> {
+    match v {
+        Value::Null => w.put_u8(0),
+        Value::Bool(b) => {
+            w.put_u8(1);
+            w.put_u8(u8::from(*b));
+        }
+        Value::Int64(n) => {
+            w.put_u8(2);
+            w.put_u64(*n as u64);
+        }
+        Value::Double(d) => {
+            w.put_u8(3);
+            w.put_u64(d.to_bits());
+        }
+        Value::Timestamp(t) => {
+            w.put_u8(4);
+            w.put_u64(*t as u64);
+        }
+        Value::Text(s) => {
+            w.put_u8(5);
+            w.put_str_u16("catalog.default_text", s)?;
+        }
+    }
+    Ok(())
+}
+
+/// Decode a literal default [`Value`] written by [`encode_value`].
+fn decode_value(r: &mut Reader) -> Result<Value> {
+    Ok(match r.get_u8("catalog.default_tag")? {
+        0 => Value::Null,
+        1 => Value::Bool(r.get_u8("catalog.default_bool")? != 0),
+        2 => Value::Int64(r.get_u64("catalog.default_i64")? as i64),
+        3 => Value::Double(f64::from_bits(r.get_u64("catalog.default_f64")?)),
+        4 => Value::Timestamp(r.get_u64("catalog.default_ts")? as i64),
+        5 => Value::Text(r.get_str_u16("catalog.default_text")?),
+        other => {
+            return Err(ServerError::Corrupt(format!(
+                "bad default value tag {other}"
+            )));
+        }
+    })
 }
 
 /// Whether a persisted user record creates/updates an account or removes it.
@@ -363,11 +438,13 @@ mod tests {
                     name: "id".into(),
                     ty: Type::Int64,
                     nullable: false,
+                    default: None,
                 },
                 Column {
                     name: "owner".into(),
                     ty: Type::Text,
                     nullable: true,
+                    default: Some(Value::Text("anon".into())),
                 },
             ],
             indexes: vec![IndexMeta {
@@ -392,6 +469,8 @@ mod tests {
         assert_eq!(decoded.indexes[0].columns, vec![1]);
         assert!(decoded.indexes[0].unique);
         assert_eq!(decoded.indexes[0].root, 99);
+        assert_eq!(decoded.columns[0].default, None);
+        assert_eq!(decoded.columns[1].default, Some(Value::Text("anon".into())));
 
         let ns = CatalogEntry {
             op: CatalogOp::Delete,
@@ -427,9 +506,10 @@ mod tests {
         }
         .encode()
         .unwrap();
-        // The original create-only format ended after the columns; drop the op
-        // byte and the (empty) index-count u16 that follow it.
-        bytes.truncate(bytes.len() - 3);
+        // The original create-only format ended after the columns; drop the
+        // trailing op byte, the (empty) index-count u16, and the (empty)
+        // default-count u16 that now follow it.
+        bytes.truncate(bytes.len() - 5);
         let decoded = CatalogEntry::decode(&bytes).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
         assert_eq!(decoded.name, "t");
