@@ -5,8 +5,9 @@
 //! documents. See `docs/components/sql-engine.md`.
 //!
 //! **Scope (this slice):** `CREATE TABLE` (with `PRIMARY KEY`, `NOT NULL`,
-//! `UNIQUE`, literal `DEFAULT`, and column- or table-level `CHECK (…)`
-//! constraints), `CREATE [UNIQUE] INDEX … ON t (c, …)`
+//! `UNIQUE`, literal `DEFAULT`, column- or table-level `CHECK (…)`, and
+//! `FOREIGN KEY`/`REFERENCES` constraints — child-checked on `INSERT`/`UPDATE`,
+//! `RESTRICT` on parent `DELETE`), `CREATE [UNIQUE] INDEX … ON t (c, …)`
 //! / `DROP INDEX` (single- or multi-column secondary indexes, UNIQUE or
 //! non-unique; UNIQUE enforces on `INSERT`/`UPDATE`, and an equality `WHERE` over
 //! all of an index's columns seeks it), `INSERT … VALUES` and `INSERT … SELECT`,
@@ -57,7 +58,7 @@ pub mod catalog;
 pub mod error;
 pub mod types;
 
-pub use catalog::{Catalog, Column, IndexDef, Table};
+pub use catalog::{Catalog, Column, ForeignKey, IndexDef, Table};
 pub use error::{Result, SqlError};
 pub use types::{Type, Value};
 
@@ -508,6 +509,9 @@ impl SqlEngine {
         let mut columns = Vec::with_capacity(ct.columns.len());
         let mut primary_key = None;
         let mut checks: Vec<String> = Vec::new();
+        // Raw FK specs as (child column positions, parent table, parent column
+        // names) — resolved to positions once all columns are known.
+        let mut fk_specs: Vec<(Vec<usize>, String, Vec<String>)> = Vec::new();
         for (idx, col) in ct.columns.iter().enumerate() {
             let ty = map_data_type(&col.data_type)?;
             let nullable = !col.options.iter().any(|o| {
@@ -544,16 +548,82 @@ impl SqlEngine {
             });
             // Column-level CHECK (…) is stored as a table check predicate.
             for o in &col.options {
-                if let ColumnOption::Check(expr) = &o.option {
-                    checks.push(expr.to_string());
+                match &o.option {
+                    ColumnOption::Check(expr) => checks.push(expr.to_string()),
+                    // Column-level `REFERENCES parent (cols)`.
+                    ColumnOption::ForeignKey {
+                        foreign_table,
+                        referred_columns,
+                        ..
+                    } => fk_specs.push((
+                        vec![idx],
+                        object_name(foreign_table),
+                        referred_columns.iter().map(|c| c.value.clone()).collect(),
+                    )),
+                    _ => {}
                 }
             }
         }
-        // Table-level CHECK (…) constraints.
         for c in &ct.constraints {
-            if let TableConstraint::Check { expr, .. } = c {
-                checks.push(expr.to_string());
+            match c {
+                // Table-level CHECK (…).
+                TableConstraint::Check { expr, .. } => checks.push(expr.to_string()),
+                // Table-level FOREIGN KEY (cols) REFERENCES parent (cols).
+                TableConstraint::ForeignKey {
+                    columns: child,
+                    foreign_table,
+                    referred_columns,
+                    ..
+                } => {
+                    let child_cols = child
+                        .iter()
+                        .map(|c| {
+                            columns
+                                .iter()
+                                .position(|col| col.name == c.value)
+                                .ok_or_else(|| SqlError::NoSuchColumn(c.value.clone()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    fk_specs.push((
+                        child_cols,
+                        object_name(foreign_table),
+                        referred_columns.iter().map(|c| c.value.clone()).collect(),
+                    ));
+                }
+                _ => {}
             }
+        }
+
+        // Resolve each FK against its (already existing) parent table.
+        let mut foreign_keys = Vec::with_capacity(fk_specs.len());
+        for (child_cols, ref_table, ref_names) in fk_specs {
+            let parent = self.catalog.table(&ref_table)?;
+            let ref_columns: Vec<usize> = if ref_names.is_empty() {
+                vec![parent.primary_key.ok_or_else(|| {
+                    SqlError::Unsupported(format!(
+                        "REFERENCES {ref_table} without a column list requires {ref_table} to have a PRIMARY KEY"
+                    ))
+                })?]
+            } else {
+                ref_names
+                    .iter()
+                    .map(|n| {
+                        parent
+                            .column_index(n)
+                            .ok_or_else(|| SqlError::NoSuchColumn(format!("{ref_table}.{n}")))
+                    })
+                    .collect::<Result<_>>()?
+            };
+            if child_cols.len() != ref_columns.len() {
+                return Err(SqlError::Unsupported(format!(
+                    "FOREIGN KEY column count does not match referenced columns in {ref_table}"
+                )));
+            }
+            foreign_keys.push(ForeignKey {
+                columns: child_cols,
+                ref_table,
+                ref_columns,
+            });
         }
 
         // A PRIMARY KEY column gets a durable B+tree index (key -> row RID).
@@ -564,8 +634,14 @@ impl SqlEngine {
             None
         };
 
-        self.catalog
-            .create_table(&name, columns, primary_key, index_root, checks)?;
+        self.catalog.create_table(
+            &name,
+            columns,
+            primary_key,
+            index_root,
+            checks,
+            foreign_keys,
+        )?;
         Ok(Outcome::CreateTable)
     }
 
@@ -685,6 +761,7 @@ impl SqlEngine {
                 }
             }
             self.enforce_checks(&check_exprs, &row, &check_schema, &table.name)?;
+            self.enforce_foreign_keys(txn, &table, &row)?;
 
             // Maintain the primary-key index, rejecting a duplicate that is
             // visible to this transaction (committed, or our own).
@@ -2390,6 +2467,7 @@ impl SqlEngine {
                 }
             }
             self.enforce_checks(&check_exprs, &row, &table, &table.name)?;
+            self.enforce_foreign_keys(txn, &table, &row)?;
 
             // Secondary UNIQUE indexes: when the composite value changes, reject
             // a visible duplicate in another row before writing.
@@ -2458,13 +2536,23 @@ impl SqlEngine {
         };
         let table = self.catalog.table(&object_name(name))?;
         let types = table.types();
+        // Only pay the parent-side FK scan when some table references this one.
+        let referenced = self
+            .catalog
+            .tables_snapshot()
+            .iter()
+            .any(|t| t.foreign_keys.iter().any(|fk| fk.ref_table == table.name));
         let mut count = 0;
         for (rid, payload) in self.store.scan(txn, table.heap)? {
+            let row = types::decode_row(&types, &payload)?;
             if let Some(pred) = &del.selection {
-                let row = types::decode_row(&types, &payload)?;
                 if !self.matches(pred, &row, &table)? {
                     continue;
                 }
+            }
+            // RESTRICT: refuse to delete a row that a foreign key still references.
+            if referenced {
+                self.assert_unreferenced(txn, &table.name, &row)?;
             }
             self.store.delete(txn, rid)?;
             count += 1;
@@ -2493,6 +2581,72 @@ impl SqlEngine {
                 return Err(SqlError::Constraint(format!(
                     "CHECK constraint violated on {table}: {expr}"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce a child row's `FOREIGN KEY`s: every FK whose columns are all
+    /// non-NULL must match an existing (visible) row in the parent table on the
+    /// referenced columns. A NULL in any FK column skips that FK (MATCH SIMPLE).
+    fn enforce_foreign_keys(&self, txn: &TxnHandle, table: &Table, row: &[Value]) -> Result<()> {
+        for fk in &table.foreign_keys {
+            let key: Vec<Value> = fk.columns.iter().map(|&c| row[c].clone()).collect();
+            if key.iter().any(|v| matches!(v, Value::Null)) {
+                continue;
+            }
+            let parent = self.catalog.table(&fk.ref_table)?;
+            let types = parent.types();
+            let mut found = false;
+            for (_, payload) in self.store.scan(txn, parent.heap)? {
+                let prow = types::decode_row(&types, &payload)?;
+                if fk.ref_columns.iter().zip(&key).all(|(&c, v)| &prow[c] == v) {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Err(SqlError::Constraint(format!(
+                    "FOREIGN KEY violated: no matching row in {}",
+                    fk.ref_table
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce `RESTRICT` before removing (or changing the key of) a parent row:
+    /// reject if any table's `FOREIGN KEY` references `parent_row` on the keyed
+    /// columns. Scans every table that references `parent`.
+    fn assert_unreferenced(
+        &self,
+        txn: &TxnHandle,
+        parent: &str,
+        parent_row: &[Value],
+    ) -> Result<()> {
+        for child in self.catalog.tables_snapshot() {
+            for fk in &child.foreign_keys {
+                if fk.ref_table != parent {
+                    continue;
+                }
+                let key: Vec<Value> = fk
+                    .ref_columns
+                    .iter()
+                    .map(|&c| parent_row[c].clone())
+                    .collect();
+                if key.iter().any(|v| matches!(v, Value::Null)) {
+                    continue;
+                }
+                let types = child.types();
+                for (_, payload) in self.store.scan(txn, child.heap)? {
+                    let crow = types::decode_row(&types, &payload)?;
+                    if fk.columns.iter().zip(&key).all(|(&c, v)| &crow[c] == v) {
+                        return Err(SqlError::Constraint(format!(
+                            "FOREIGN KEY violated: a {parent} row is still referenced by {}",
+                            child.name
+                        )));
+                    }
+                }
             }
         }
         Ok(())
@@ -7564,6 +7718,75 @@ mod tests {
                     .unwrap()
             ),
             vec![vec![Value::Int64(1)]]
+        );
+    }
+
+    #[test]
+    fn foreign_keys() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE dept (id BIGINT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "CREATE TABLE emp (id BIGINT PRIMARY KEY, dept_id BIGINT REFERENCES dept(id), \
+                 name TEXT)",
+            )
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO dept VALUES (1, 'eng'), (2, 'sales')")
+            .unwrap();
+
+        // A child row referencing an existing parent is accepted.
+        env.engine
+            .execute_autocommit("INSERT INTO emp VALUES (10, 1, 'alice')")
+            .unwrap();
+        // Referencing a missing parent is rejected.
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO emp VALUES (11, 99, 'bob')")
+                .is_err()
+        );
+        // A NULL foreign key is allowed (the constraint is skipped).
+        env.engine
+            .execute_autocommit("INSERT INTO emp VALUES (12, NULL, 'carol')")
+            .unwrap();
+        // Updating a child to a bad reference is rejected.
+        assert!(
+            env.engine
+                .execute_autocommit("UPDATE emp SET dept_id = 42 WHERE id = 12")
+                .is_err()
+        );
+
+        // RESTRICT: a referenced parent row cannot be deleted…
+        assert!(
+            env.engine
+                .execute_autocommit("DELETE FROM dept WHERE id = 1")
+                .is_err()
+        );
+        // …but an unreferenced one can.
+        assert_eq!(
+            env.engine
+                .execute_autocommit("DELETE FROM dept WHERE id = 2")
+                .unwrap(),
+            Outcome::Delete { count: 1 }
+        );
+        // Once the child is gone, the parent deletes cleanly.
+        env.engine
+            .execute_autocommit("DELETE FROM emp WHERE id = 10")
+            .unwrap();
+        assert_eq!(
+            env.engine
+                .execute_autocommit("DELETE FROM dept WHERE id = 1")
+                .unwrap(),
+            Outcome::Delete { count: 1 }
+        );
+
+        // Referencing a table that does not exist is rejected at CREATE TABLE.
+        assert!(
+            env.engine
+                .execute_autocommit("CREATE TABLE bad (id BIGINT, r BIGINT REFERENCES nope(id))")
+                .is_err()
         );
     }
 }

@@ -209,6 +209,42 @@ fn check_constraints_survive_restart() {
 }
 
 #[test]
+fn foreign_keys_survive_restart() {
+    let tmp = TempDir::new("durability_fk").unwrap();
+
+    // ---- Session 1: parent + child with a FOREIGN KEY, one parent row. ----
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE dept (id BIGINT PRIMARY KEY, name TEXT)"));
+        s.handle(sql(
+            "CREATE TABLE emp (id BIGINT PRIMARY KEY, dept_id BIGINT REFERENCES dept(id))",
+        ));
+        s.handle(sql("INSERT INTO dept VALUES (1, 'eng')"));
+        drop(s);
+        drop(db);
+    }
+
+    // ---- Session 2: reopen; the FK is still enforced both ways. ----
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    // A child referencing a missing parent is rejected.
+    match s.handle(sql("INSERT INTO emp VALUES (10, 99)")) {
+        Message::SqlResult { status, .. } => assert_ne!(status, 0, "FK rejects missing parent"),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+    // A valid child is accepted, and the parent can then not be deleted.
+    match s.handle(sql("INSERT INTO emp VALUES (10, 1)")) {
+        Message::SqlResult { status: 0, .. } => {}
+        other => panic!("expected ok SqlResult, got {other:?}"),
+    }
+    match s.handle(sql("DELETE FROM dept WHERE id = 1")) {
+        Message::SqlResult { status, .. } => assert_ne!(status, 0, "RESTRICT blocks parent delete"),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn checkpoint_then_more_writes_all_survive_durable_restart() {
     // A durable database: write, checkpoint (flush to disk), write more, then
     // reopen. Both the checkpointed and the post-checkpoint data must be there.

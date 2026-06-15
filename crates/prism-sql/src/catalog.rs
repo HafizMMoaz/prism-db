@@ -43,6 +43,18 @@ pub struct IndexDef {
     pub root: PageId,
 }
 
+/// A `FOREIGN KEY` constraint: this table's `columns` must match an existing row
+/// in `ref_table` on its `ref_columns` (positions resolved at definition time).
+#[derive(Clone, Debug)]
+pub struct ForeignKey {
+    /// The referencing (child) column positions in this table's row.
+    pub columns: Vec<usize>,
+    /// The referenced (parent) table name.
+    pub ref_table: String,
+    /// The referenced column positions in the parent table's row.
+    pub ref_columns: Vec<usize>,
+}
+
 /// A table's schema and physical heap.
 #[derive(Clone, Debug)]
 pub struct Table {
@@ -60,6 +72,8 @@ pub struct Table {
     pub indexes: Vec<IndexDef>,
     /// `CHECK` constraint predicates (SQL text), evaluated on `INSERT`/`UPDATE`.
     pub checks: Vec<String>,
+    /// `FOREIGN KEY` constraints referencing other tables.
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl Table {
@@ -98,6 +112,7 @@ impl Catalog {
         primary_key: Option<usize>,
         index_root: Option<PageId>,
         checks: Vec<String>,
+        foreign_keys: Vec<ForeignKey>,
     ) -> Result<Table> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
@@ -117,6 +132,7 @@ impl Catalog {
             index_root,
             indexes: Vec::new(),
             checks,
+            foreign_keys,
         };
         tables.insert(name.to_string(), table.clone());
         Ok(table)
@@ -200,6 +216,7 @@ impl Catalog {
         index_root: Option<PageId>,
         indexes: Vec<IndexDef>,
         checks: Vec<String>,
+        foreign_keys: Vec<ForeignKey>,
     ) -> Result<()> {
         let mut tables = self.tables.lock().expect("catalog poisoned");
         if tables.contains_key(name) {
@@ -215,6 +232,7 @@ impl Catalog {
                 index_root,
                 indexes,
                 checks,
+                foreign_keys,
             },
         );
         let mut n = self.next_heap.lock().expect("catalog poisoned");

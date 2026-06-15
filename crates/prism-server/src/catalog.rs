@@ -12,7 +12,7 @@
 //! (DDL is not yet transactional with surrounding data).
 
 use prism_protocol::codec::{Reader, Writer};
-use prism_sql::{Column, Type, Value};
+use prism_sql::{Column, ForeignKey, Type, Value};
 
 use crate::error::{Result, ServerError};
 
@@ -110,6 +110,8 @@ pub struct CatalogEntry {
     pub indexes: Vec<IndexMeta>,
     /// `CHECK` constraint predicates, as SQL text (tables only; empty otherwise).
     pub checks: Vec<String>,
+    /// `FOREIGN KEY` constraints (tables only; empty otherwise).
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl CatalogEntry {
@@ -185,6 +187,25 @@ impl CatalogEntry {
         w.put_u16(nchk);
         for c in &self.checks {
             w.put_str_u16("catalog.check", c)?;
+        }
+        // FOREIGN KEYs follow the checks (records without this section decode as
+        // none). Column positions fit u16.
+        let nfk: u16 = self
+            .foreign_keys
+            .len()
+            .try_into()
+            .map_err(|_| ServerError::Corrupt("too many foreign keys".into()))?;
+        w.put_u16(nfk);
+        for fk in &self.foreign_keys {
+            w.put_u16(fk.columns.len() as u16);
+            for &c in &fk.columns {
+                w.put_u16(c as u16);
+            }
+            w.put_str_u16("catalog.fk_table", &fk.ref_table)?;
+            w.put_u16(fk.ref_columns.len() as u16);
+            for &c in &fk.ref_columns {
+                w.put_u16(c as u16);
+            }
         }
         Ok(w.into_vec())
     }
@@ -263,6 +284,32 @@ impl CatalogEntry {
             }
             v
         };
+        // FOREIGN KEYs follow the checks; absent in older records.
+        let foreign_keys = if r.is_empty() {
+            Vec::new()
+        } else {
+            let nfk = r.get_u16("catalog.nfk")?;
+            let mut v = Vec::with_capacity(nfk as usize);
+            for _ in 0..nfk {
+                let nchild = r.get_u16("catalog.fk_nchild")?;
+                let mut columns = Vec::with_capacity(nchild as usize);
+                for _ in 0..nchild {
+                    columns.push(r.get_u16("catalog.fk_child")? as usize);
+                }
+                let ref_table = r.get_str_u16("catalog.fk_table")?;
+                let nref = r.get_u16("catalog.fk_nref")?;
+                let mut ref_columns = Vec::with_capacity(nref as usize);
+                for _ in 0..nref {
+                    ref_columns.push(r.get_u16("catalog.fk_ref")? as usize);
+                }
+                v.push(ForeignKey {
+                    columns,
+                    ref_table,
+                    ref_columns,
+                });
+            }
+            v
+        };
         Ok(Self {
             op,
             kind,
@@ -273,6 +320,7 @@ impl CatalogEntry {
             columns,
             indexes,
             checks,
+            foreign_keys,
         })
     }
 }
@@ -479,6 +527,11 @@ mod tests {
                 root: 99,
             }],
             checks: vec!["id > 0".into()],
+            foreign_keys: vec![ForeignKey {
+                columns: vec![1],
+                ref_table: "owners".into(),
+                ref_columns: vec![0],
+            }],
         };
         let decoded = CatalogEntry::decode(&table.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
@@ -498,6 +551,10 @@ mod tests {
         assert_eq!(decoded.columns[0].default, None);
         assert_eq!(decoded.columns[1].default, Some(Value::Text("anon".into())));
         assert_eq!(decoded.checks, vec!["id > 0".to_string()]);
+        assert_eq!(decoded.foreign_keys.len(), 1);
+        assert_eq!(decoded.foreign_keys[0].columns, vec![1]);
+        assert_eq!(decoded.foreign_keys[0].ref_table, "owners");
+        assert_eq!(decoded.foreign_keys[0].ref_columns, vec![0]);
 
         let ns = CatalogEntry {
             op: CatalogOp::Delete,
@@ -509,6 +566,7 @@ mod tests {
             columns: vec![],
             indexes: vec![],
             checks: vec![],
+            foreign_keys: vec![],
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Delete);
@@ -532,13 +590,14 @@ mod tests {
             columns: vec![],
             indexes: vec![],
             checks: vec![],
+            foreign_keys: vec![],
         }
         .encode()
         .unwrap();
         // The original create-only format ended after the columns; drop the
-        // trailing op byte and the (empty) index / default / check count u16s
-        // that now follow it.
-        bytes.truncate(bytes.len() - 7);
+        // trailing op byte and the (empty) index / default / check / foreign-key
+        // count u16s that now follow it.
+        bytes.truncate(bytes.len() - 9);
         let decoded = CatalogEntry::decode(&bytes).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
         assert_eq!(decoded.name, "t");
