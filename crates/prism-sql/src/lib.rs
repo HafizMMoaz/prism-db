@@ -66,8 +66,8 @@ use sqlparser::ast::{
     ColumnOption, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment, Expr, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
     JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr,
-    SetOperator, SetQuantifier, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator,
-    Value as SqlValue,
+    SetOperator, SetQuantifier, Statement, TableAlias, TableFactor, TableObject, TableWithJoins,
+    UnaryOperator, Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -709,8 +709,12 @@ impl SqlEngine {
     }
 
     /// Execute a top-level query: a simple `SELECT`, a parenthesized query, or a
-    /// set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two queries.
-    fn exec_select(&self, txn: &TxnHandle, query: Query) -> Result<Outcome> {
+    /// set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two queries. A
+    /// leading `WITH` (non-recursive CTEs) is expanded first by inlining.
+    fn exec_select(&self, txn: &TxnHandle, mut query: Query) -> Result<Outcome> {
+        if query.with.is_some() {
+            expand_ctes(&mut query);
+        }
         match query.body.as_ref() {
             SetExpr::Select(_) => self.exec_simple_select(txn, &query),
             SetExpr::Query(inner) => self.exec_select(txn, (**inner).clone()),
@@ -1293,17 +1297,66 @@ impl SqlEngine {
     }
 
     fn collect_factor_columns(&self, factor: &TableFactor, out: &mut Vec<(String, String)>) {
-        if let TableFactor::Table { name, alias, .. } = factor {
-            if let Ok(t) = self.catalog.table(&object_name(name)) {
-                let qualifier = match alias {
-                    Some(a) => a.name.value.clone(),
-                    None => t.name.clone(),
-                };
-                for c in &t.columns {
-                    out.push((qualifier.clone(), c.name.clone()));
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                if let Ok(t) = self.catalog.table(&object_name(name)) {
+                    let qualifier = match alias {
+                        Some(a) => a.name.value.clone(),
+                        None => t.name.clone(),
+                    };
+                    for c in &t.columns {
+                        out.push((qualifier.clone(), c.name.clone()));
+                    }
+                }
+            }
+            // A derived table (incl. an inlined CTE) provides its projected output
+            // columns under its alias; tracking them keeps a reference into a
+            // derived table from being misread as a correlated outer reference.
+            TableFactor::Derived {
+                subquery,
+                alias: Some(a),
+                ..
+            } => {
+                let qualifier = a.name.value.clone();
+                for name in self.derived_output_names(subquery) {
+                    out.push((qualifier.clone(), name));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Best-effort output column names of a subquery used as a derived table —
+    /// for correlation analysis only. Explicit projection items resolve to their
+    /// name/alias; a `*` falls back to the inner `FROM`'s column names.
+    fn derived_output_names(&self, q: &Query) -> Vec<String> {
+        let body = match q.body.as_ref() {
+            SetExpr::Select(s) => s,
+            SetExpr::Query(inner) => return self.derived_output_names(inner),
+            _ => return Vec::new(),
+        };
+        let mut names = Vec::new();
+        for item in &body.projection {
+            match item {
+                SelectItem::UnnamedExpr(Expr::Identifier(id)) => names.push(id.value.clone()),
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) if !parts.is_empty() => {
+                    names.push(parts.last().unwrap().value.clone());
+                }
+                SelectItem::ExprWithAlias { alias, .. } => names.push(alias.value.clone()),
+                SelectItem::UnnamedExpr(e) => names.push(e.to_string()),
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                    let mut inner = Vec::new();
+                    for twj in &body.from {
+                        self.collect_factor_columns(&twj.relation, &mut inner);
+                        for join in &twj.joins {
+                            self.collect_factor_columns(&join.relation, &mut inner);
+                        }
+                    }
+                    names.extend(inner.into_iter().map(|(_, n)| n));
                 }
             }
         }
+        names
     }
 
     /// Rewrite a correlated subquery into an uncorrelated one for `(schema, row)`
@@ -3171,6 +3224,94 @@ fn collect_ranges_into(expr: &Expr, out: &mut Vec<(String, RangeOp, Value)>) {
                     out.push((id.value.clone(), RangeOp::Le, v));
                 }
             }
+        }
+        _ => {}
+    }
+}
+
+/// Expand a query's `WITH` clause by inlining each CTE as a derived table
+/// wherever its name is referenced (non-recursive). CTEs may reference earlier
+/// ones; a self- or forward-reference is left unresolved, so a recursive CTE
+/// fails at table lookup rather than looping. A CTE column-rename list
+/// (`WITH c(a, b) AS …`) is not applied — references use the body's output names.
+fn expand_ctes(query: &mut Query) {
+    let Some(with) = query.with.take() else {
+        return;
+    };
+    let mut ctes: Vec<(String, Query, TableAlias)> = Vec::new();
+    for cte in with.cte_tables {
+        let name = cte.alias.name.value.clone();
+        let mut body = (*cte.query).clone();
+        inline_ctes_into_query(&mut body, &ctes);
+        ctes.push((name, body, cte.alias));
+    }
+    inline_ctes_into_query(query, &ctes);
+}
+
+fn inline_ctes_into_query(q: &mut Query, ctes: &[(String, Query, TableAlias)]) {
+    inline_ctes_into_setexpr(&mut q.body, ctes);
+}
+
+fn inline_ctes_into_setexpr(body: &mut SetExpr, ctes: &[(String, Query, TableAlias)]) {
+    match body {
+        SetExpr::Select(s) => inline_ctes_into_select(s, ctes),
+        SetExpr::Query(q) => inline_ctes_into_query(q, ctes),
+        SetExpr::SetOperation { left, right, .. } => {
+            inline_ctes_into_setexpr(left, ctes);
+            inline_ctes_into_setexpr(right, ctes);
+        }
+        _ => {}
+    }
+}
+
+fn inline_ctes_into_select(s: &mut Select, ctes: &[(String, Query, TableAlias)]) {
+    for twj in &mut s.from {
+        inline_ctes_into_factor(&mut twj.relation, ctes);
+        for join in &mut twj.joins {
+            inline_ctes_into_factor(&mut join.relation, ctes);
+        }
+    }
+    if let Some(e) = &mut s.selection {
+        inline_ctes_into_expr(e, ctes);
+    }
+    if let Some(e) = &mut s.having {
+        inline_ctes_into_expr(e, ctes);
+    }
+    for item in &mut s.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+            inline_ctes_into_expr(e, ctes);
+        }
+    }
+}
+
+fn inline_ctes_into_factor(factor: &mut TableFactor, ctes: &[(String, Query, TableAlias)]) {
+    match factor {
+        TableFactor::Table { name, alias, .. } => {
+            let key = object_name(name);
+            if let Some((_, body, cte_alias)) = ctes.iter().find(|(n, _, _)| *n == key) {
+                let use_alias = alias.clone().unwrap_or_else(|| cte_alias.clone());
+                *factor = TableFactor::Derived {
+                    lateral: false,
+                    subquery: Box::new(body.clone()),
+                    alias: Some(use_alias),
+                };
+            }
+        }
+        TableFactor::Derived { subquery, .. } => inline_ctes_into_query(subquery, ctes),
+        _ => {}
+    }
+}
+
+fn inline_ctes_into_expr(e: &mut Expr, ctes: &[(String, Query, TableAlias)]) {
+    match e {
+        Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => inline_ctes_into_query(q, ctes),
+        Expr::InSubquery { subquery, .. } => inline_ctes_into_query(subquery, ctes),
+        Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+            inline_ctes_into_expr(inner, ctes)
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            inline_ctes_into_expr(left, ctes);
+            inline_ctes_into_expr(right, ctes);
         }
         _ => {}
     }
@@ -6657,6 +6798,70 @@ mod tests {
         assert_eq!(
             scalar("SELECT YEAR(FROM_UNIXTIME(0)) FROM t"),
             Value::Int64(1970)
+        );
+    }
+
+    #[test]
+    fn common_table_expressions() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE emp (id BIGINT, dept BIGINT, salary BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO emp VALUES (1,10,100),(2,10,200),(3,20,50),(4,20,90)")
+            .unwrap();
+
+        // A single CTE used as the FROM source.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "WITH hi AS (SELECT id FROM emp WHERE salary >= 100) \
+                         SELECT id FROM hi ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+
+        // A CTE that references an earlier CTE.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "WITH a AS (SELECT id, salary FROM emp WHERE dept = 10), \
+                              b AS (SELECT id FROM a WHERE salary > 150) \
+                         SELECT id FROM b"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2)]]
+        );
+
+        // An aggregate CTE joined back to a base table.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "WITH d AS (SELECT dept, COUNT(*) AS n FROM emp GROUP BY dept) \
+                         SELECT e.id, d.n FROM emp e JOIN d ON e.dept = d.dept WHERE e.id = 1"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1), Value::Int64(2)]]
+        );
+
+        // A CTE referenced from a WHERE subquery.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "WITH big AS (SELECT id FROM emp WHERE salary >= 100) \
+                         SELECT id FROM emp WHERE id IN (SELECT id FROM big) ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
         );
     }
 }
