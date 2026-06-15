@@ -580,27 +580,64 @@ impl SqlEngine {
             .source
             .as_ref()
             .ok_or_else(|| SqlError::Unsupported("INSERT without VALUES".into()))?;
-        let SetExpr::Values(values) = source.body.as_ref() else {
-            return Err(SqlError::Unsupported("INSERT source must be VALUES".into()));
+
+        // Build the full-width rows to insert (every column NULL-defaulted, the
+        // targeted positions filled) from either a `VALUES` list or a query. An
+        // `INSERT … SELECT` reads its source fully (the query materializes) before
+        // any insert, so inserting from the same table is safe.
+        let input_rows: Vec<Vec<Value>> = match source.body.as_ref() {
+            SetExpr::Values(values) => {
+                let mut rows = Vec::with_capacity(values.rows.len());
+                for row_exprs in &values.rows {
+                    if row_exprs.len() != target.len() {
+                        return Err(SqlError::Type(format!(
+                            "INSERT has {} values for {} columns",
+                            row_exprs.len(),
+                            target.len()
+                        )));
+                    }
+                    let mut row = vec![Value::Null; table.columns.len()];
+                    for (expr, &pos) in row_exprs.iter().zip(&target) {
+                        row[pos] = literal(expr)?;
+                    }
+                    rows.push(row);
+                }
+                rows
+            }
+            _ => {
+                let (columns, result) = match self.exec_select(txn, (**source).clone())? {
+                    Outcome::Select { columns, rows } => (columns, rows),
+                    other => {
+                        return Err(SqlError::Unsupported(format!(
+                            "INSERT source must be VALUES or a query, got {other:?}"
+                        )));
+                    }
+                };
+                if columns.len() != target.len() {
+                    return Err(SqlError::Type(format!(
+                        "INSERT source produces {} columns for {} target columns",
+                        columns.len(),
+                        target.len()
+                    )));
+                }
+                result
+                    .into_iter()
+                    .map(|src| {
+                        let mut row = vec![Value::Null; table.columns.len()];
+                        for (value, &pos) in src.into_iter().zip(&target) {
+                            row[pos] = value;
+                        }
+                        row
+                    })
+                    .collect()
+            }
         };
 
         let types = table.types();
         let index = self.pk_index(&table);
         let sec = self.secondary_indexes(&table);
         let mut count = 0;
-        for row_exprs in &values.rows {
-            if row_exprs.len() != target.len() {
-                return Err(SqlError::Type(format!(
-                    "INSERT has {} values for {} columns",
-                    row_exprs.len(),
-                    target.len()
-                )));
-            }
-            // Default every column to NULL, then fill the targeted positions.
-            let mut row = vec![Value::Null; table.columns.len()];
-            for (expr, &pos) in row_exprs.iter().zip(&target) {
-                row[pos] = literal(expr)?;
-            }
+        for row in input_rows {
             // Enforce NOT NULL.
             for (col, value) in table.columns.iter().zip(&row) {
                 if !col.nullable && matches!(value, Value::Null) {
@@ -6013,6 +6050,66 @@ mod tests {
         assert!(
             env.engine
                 .execute_autocommit("SELECT x, x FROM a UNION SELECT x FROM b")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn insert_select() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE src (id BIGINT, name TEXT, qty BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE TABLE dst (id BIGINT PRIMARY KEY, name TEXT, qty BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO src VALUES (1,'a',10),(2,'b',20),(3,'c',30)")
+            .unwrap();
+
+        // INSERT … SELECT with a WHERE filter; the PK index is maintained.
+        assert_eq!(
+            env.engine
+                .execute_autocommit("INSERT INTO dst SELECT id, name, qty FROM src WHERE qty >= 20")
+                .unwrap(),
+            Outcome::Insert { count: 2 }
+        );
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id, name FROM dst ORDER BY id")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(2), Value::Text("b".into())],
+                vec![Value::Int64(3), Value::Text("c".into())],
+            ]
+        );
+
+        // A column subset fills the named columns; the rest default to NULL.
+        env.engine
+            .execute_autocommit("INSERT INTO dst (id, name) SELECT id, name FROM src WHERE id = 1")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT qty FROM dst WHERE id = 1")
+                    .unwrap()
+            ),
+            vec![vec![Value::Null]]
+        );
+
+        // A duplicate primary key from the source is rejected.
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO dst SELECT id, name, qty FROM src WHERE id = 2")
+                .is_err()
+        );
+
+        // Arity mismatch between source and target is rejected.
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO dst SELECT id, name FROM src")
                 .is_err()
         );
     }
