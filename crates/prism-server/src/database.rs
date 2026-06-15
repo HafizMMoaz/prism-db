@@ -692,8 +692,8 @@ impl Database {
                         .iter()
                         .map(|ix| prism_sql::IndexDef {
                             name: ix.name.clone(),
-                            column: ix.column as usize,
-                            unique: true,
+                            columns: ix.columns.iter().map(|&c| c as usize).collect(),
+                            unique: ix.unique,
                             root: PageId(ix.root),
                         })
                         .collect();
@@ -736,7 +736,8 @@ fn index_metas(table: &prism_sql::Table) -> Vec<IndexMeta> {
         .iter()
         .map(|ix| IndexMeta {
             name: ix.name.clone(),
-            column: ix.column as u32,
+            columns: ix.columns.iter().map(|&c| c as u32).collect(),
+            unique: ix.unique,
             root: ix.root.as_u64(),
         })
         .collect()

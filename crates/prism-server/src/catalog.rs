@@ -72,14 +72,16 @@ impl CatalogOp {
     }
 }
 
-/// A persisted secondary (UNIQUE) index: its name, the indexed column position,
-/// and its B+tree root page.
+/// A persisted secondary index: its name, the indexed column positions, whether
+/// it is UNIQUE, and its B+tree root page.
 #[derive(Clone, Debug)]
 pub struct IndexMeta {
     /// Index name.
     pub name: String,
-    /// Indexed column position in the row.
-    pub column: u32,
+    /// Indexed column positions in the row, in index order.
+    pub columns: Vec<u32>,
+    /// Whether the index enforces uniqueness.
+    pub unique: bool,
     /// The index B+tree's root page.
     pub root: u64,
 }
@@ -141,7 +143,16 @@ impl CatalogEntry {
         w.put_u16(nidx);
         for ix in &self.indexes {
             w.put_str_u16("catalog.index", &ix.name)?;
-            w.put_u64(u64::from(ix.column));
+            let ncols: u16 = ix
+                .columns
+                .len()
+                .try_into()
+                .map_err(|_| ServerError::Corrupt("too many index columns".into()))?;
+            w.put_u16(ncols);
+            for c in &ix.columns {
+                w.put_u64(u64::from(*c));
+            }
+            w.put_u8(u8::from(ix.unique));
             w.put_u64(ix.root);
         }
         Ok(w.into_vec())
@@ -182,9 +193,19 @@ impl CatalogEntry {
             let mut v = Vec::with_capacity(nidx as usize);
             for _ in 0..nidx {
                 let name = r.get_str_u16("catalog.index")?;
-                let column = r.get_u64("catalog.index_col")? as u32;
+                let ncols = r.get_u16("catalog.index_ncols")?;
+                let mut columns = Vec::with_capacity(ncols as usize);
+                for _ in 0..ncols {
+                    columns.push(r.get_u64("catalog.index_col")? as u32);
+                }
+                let unique = r.get_u8("catalog.index_unique")? != 0;
                 let root = r.get_u64("catalog.index_root")?;
-                v.push(IndexMeta { name, column, root });
+                v.push(IndexMeta {
+                    name,
+                    columns,
+                    unique,
+                    root,
+                });
             }
             v
         };
@@ -351,7 +372,8 @@ mod tests {
             ],
             indexes: vec![IndexMeta {
                 name: "accounts_owner_idx".into(),
-                column: 1,
+                columns: vec![1],
+                unique: true,
                 root: 99,
             }],
         };
@@ -367,7 +389,8 @@ mod tests {
         assert_eq!(decoded.columns[1].ty, Type::Text);
         assert_eq!(decoded.indexes.len(), 1);
         assert_eq!(decoded.indexes[0].name, "accounts_owner_idx");
-        assert_eq!(decoded.indexes[0].column, 1);
+        assert_eq!(decoded.indexes[0].columns, vec![1]);
+        assert!(decoded.indexes[0].unique);
         assert_eq!(decoded.indexes[0].root, 99);
 
         let ns = CatalogEntry {

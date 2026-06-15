@@ -4,9 +4,10 @@
 //! shares MVCC, locking, recovery, and cross-model transactions with KV and
 //! documents. See `docs/components/sql-engine.md`.
 //!
-//! **Scope (this slice):** `CREATE TABLE`, `CREATE UNIQUE INDEX … ON t (col)` /
-//! `DROP INDEX` (single-column UNIQUE secondary indexes that enforce uniqueness
-//! on `INSERT`/`UPDATE`), `INSERT … VALUES`,
+//! **Scope (this slice):** `CREATE TABLE`, `CREATE [UNIQUE] INDEX … ON t (c, …)`
+//! / `DROP INDEX` (single- or multi-column secondary indexes, UNIQUE or
+//! non-unique; UNIQUE enforces on `INSERT`/`UPDATE`, and an equality `WHERE` over
+//! all of an index's columns seeks it), `INSERT … VALUES`,
 //! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with an index seek when
@@ -48,6 +49,7 @@ pub use types::{Type, Value};
 
 use std::sync::Arc;
 
+use prism_core::RecordId;
 use prism_core::TxnManager;
 use prism_core::store::RecordStore;
 use prism_core::txn::{TxnHandle, TxnMode};
@@ -234,48 +236,60 @@ impl SqlEngine {
         txn: &TxnHandle,
         ci: sqlparser::ast::CreateIndex,
     ) -> Result<Outcome> {
-        if !ci.unique {
+        if ci.columns.is_empty() {
             return Err(SqlError::Unsupported(
-                "only CREATE UNIQUE INDEX is supported".into(),
-            ));
-        }
-        if ci.columns.len() != 1 {
-            return Err(SqlError::Unsupported(
-                "only single-column indexes are supported".into(),
+                "an index needs at least one column".into(),
             ));
         }
         let table_name = object_name(&ci.table_name);
         let table = self.catalog.table(&table_name)?;
-        let col_idx = resolve_col_expr(&table, &ci.columns[0].expr)?;
+        let columns: Vec<usize> = ci
+            .columns
+            .iter()
+            .map(|c| resolve_col_expr(&table, &c.expr))
+            .collect::<Result<_>>()?;
+        let unique = ci.unique;
         let name = match &ci.name {
             Some(n) => object_name(n),
-            None => format!("{table_name}_{}_idx", table.columns[col_idx].name),
+            None => {
+                let cols = columns
+                    .iter()
+                    .map(|&c| table.columns[c].name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("_");
+                format!("{table_name}_{cols}_idx")
+            }
         };
 
-        // Build the tree from the live rows, enforcing uniqueness as we go.
+        // Build the tree from the live rows. A UNIQUE index keys on the composite
+        // value (rejecting duplicates as it goes); a non-unique index appends the
+        // row id so duplicates coexist. Rows with a NULL in any indexed column are
+        // not indexed.
         let tree = BTree::create(self.store.buffer(), self.store.wal())?;
         let types = table.types();
         for (rid, payload) in self.store.scan(txn, table.heap)? {
             let row = types::decode_row(&types, &payload)?;
-            if matches!(row[col_idx], Value::Null) {
-                continue; // NULLs are not indexed (and don't collide for UNIQUE)
+            let Some(key) = index_row_key(&row, &columns)? else {
+                continue;
+            };
+            if unique {
+                if tree.search(&key)?.is_some() {
+                    return Err(SqlError::Constraint(format!(
+                        "index {name} would have duplicate values; cannot create as UNIQUE"
+                    )));
+                }
+                tree.insert(&key, rid)?;
+            } else {
+                tree.insert(&nonunique_key(&key, rid), rid)?;
             }
-            let key = encode_index_key(&row[col_idx])?;
-            if tree.search(&key)?.is_some() {
-                return Err(SqlError::Constraint(format!(
-                    "column {} has duplicate values; cannot create a UNIQUE index",
-                    table.columns[col_idx].name
-                )));
-            }
-            tree.insert(&key, rid)?;
         }
 
         self.catalog.add_index(
             &table_name,
             IndexDef {
                 name,
-                column: col_idx,
-                unique: true,
+                columns,
+                unique,
                 root: tree.root_page(),
             },
         )?;
@@ -609,20 +623,22 @@ impl SqlEngine {
                 _ => None,
             };
 
-            // Secondary UNIQUE indexes: reject a visible duplicate, then collect
-            // the keys to insert once the row has a RID. NULLs are not indexed.
+            // Secondary indexes: reject a visible duplicate for UNIQUE ones, then
+            // collect the composite keys to insert once the row has a RID. A row
+            // with a NULL in any indexed column is not indexed.
             let mut sec_keys: Vec<(usize, Vec<u8>)> = Vec::new();
             for (si, (def, tree)) in sec.iter().enumerate() {
-                if matches!(row[def.column], Value::Null) {
+                let Some(key) = index_row_key(&row, &def.columns)? else {
                     continue;
-                }
-                let key = encode_index_key(&row[def.column])?;
-                if let Some(existing) = tree.search(&key)? {
-                    if self.store.read(txn, existing)?.is_some() {
-                        return Err(SqlError::Constraint(format!(
-                            "duplicate value for UNIQUE index {}",
-                            def.name
-                        )));
+                };
+                if def.unique {
+                    if let Some(existing) = tree.search(&key)? {
+                        if self.store.read(txn, existing)?.is_some() {
+                            return Err(SqlError::Constraint(format!(
+                                "duplicate value for UNIQUE index {}",
+                                def.name
+                            )));
+                        }
                     }
                 }
                 sec_keys.push((si, key));
@@ -634,7 +650,13 @@ impl SqlEngine {
                 tree.insert(&key, rid)?;
             }
             for (si, key) in sec_keys {
-                sec[si].1.insert(&key, rid)?;
+                let (def, tree) = &sec[si];
+                let stored = if def.unique {
+                    key
+                } else {
+                    nonunique_key(&key, rid)
+                };
+                tree.insert(&stored, rid)?;
             }
             count += 1;
         }
@@ -724,11 +746,13 @@ impl SqlEngine {
         self.finish_select(select, query, schema, filtered, distinct)
     }
 
-    /// If the `WHERE` clause pins an indexed column (the primary key or a UNIQUE
-    /// secondary index) to a literal — possibly within a top-level `AND` — seek
-    /// that index and return the matching rows, with the full predicate applied
-    /// to the candidate (so residual conditions still filter). Returns `None`
-    /// when no index applies, so the caller falls back to a scan.
+    /// If the `WHERE` clause pins every column of some index to a literal —
+    /// possibly within a top-level `AND` — seek that index and return the
+    /// matching rows, with the full predicate applied to each candidate (so
+    /// residual conditions still filter). The primary key (single-column, bare
+    /// key) is preferred, then secondary indexes (composite key; UNIQUE seeks a
+    /// point, non-unique range-scans the value's entries). Returns `None` when no
+    /// index applies, so the caller falls back to a scan.
     fn index_seek(
         &self,
         txn: &TxnHandle,
@@ -751,23 +775,27 @@ impl SqlEngine {
                 .filter(|v| v.type_matches(table.columns[col].ty))
         };
 
-        // Prefer the primary-key index, then any UNIQUE secondary index.
-        let chosen: Option<(BTree, Vec<u8>)> =
+        // The candidate row ids from whichever index has all its columns pinned.
+        let rids: Vec<RecordId> =
             if let (Some(pk), Some(tree)) = (table.primary_key, self.pk_index(table)) {
-                match value_for(pk) {
-                    Some(v) => Some((tree, encode_index_key(&v)?)),
-                    None => self.first_secondary_seek(table, &value_for)?,
+                if let Some(v) = value_for(pk) {
+                    tree.search(&encode_index_key(&v)?)?.into_iter().collect()
+                } else {
+                    match self.secondary_seek_rids(table, &value_for)? {
+                        Some(rids) => rids,
+                        None => return Ok(None),
+                    }
                 }
             } else {
-                self.first_secondary_seek(table, &value_for)?
+                match self.secondary_seek_rids(table, &value_for)? {
+                    Some(rids) => rids,
+                    None => return Ok(None),
+                }
             };
-        let Some((tree, key)) = chosen else {
-            return Ok(None);
-        };
 
         let types = table.types();
         let mut out = Vec::new();
-        if let Some(rid) = tree.search(&key)? {
+        for rid in rids {
             if let Some(payload) = self.store.read(txn, rid)? {
                 let row = types::decode_row(&types, &payload)?;
                 if self.matches(pred, &row, schema)? {
@@ -778,18 +806,40 @@ impl SqlEngine {
         Ok(Some(out))
     }
 
-    /// The first UNIQUE secondary index whose column is pinned by `value_for`,
-    /// opened and paired with the seek key.
-    fn first_secondary_seek(
+    /// Row ids from the first secondary index whose every column is pinned by
+    /// `value_for`. UNIQUE → a point lookup; non-unique → a range scan of the
+    /// value's `key ++ rid` entries. `None` means no secondary index applied.
+    fn secondary_seek_rids(
         &self,
         table: &Table,
         value_for: &dyn Fn(usize) -> Option<Value>,
-    ) -> Result<Option<(BTree, Vec<u8>)>> {
-        for def in &table.indexes {
-            if let Some(v) = value_for(def.column) {
-                let tree = BTree::open(self.store.buffer(), self.store.wal(), def.root, usize::MAX);
-                return Ok(Some((tree, encode_index_key(&v)?)));
+    ) -> Result<Option<Vec<RecordId>>> {
+        'indexes: for def in &table.indexes {
+            let mut values: Vec<Value> = Vec::with_capacity(def.columns.len());
+            for &col in &def.columns {
+                match value_for(col) {
+                    Some(v) => values.push(v),
+                    None => continue 'indexes,
+                }
             }
+            let key = frame_index_key(&values.iter().collect::<Vec<_>>())?;
+            let tree = BTree::open(self.store.buffer(), self.store.wal(), def.root, usize::MAX);
+            let rids = if def.unique {
+                tree.search(&key)?.into_iter().collect()
+            } else {
+                let mut start = key.clone();
+                start.extend_from_slice(&[0u8; RID_SUFFIX_LEN]);
+                let mut end = key.clone();
+                end.extend_from_slice(&[0xFFu8; RID_SUFFIX_LEN]);
+                tree.range(&start, &end)?
+                    .into_iter()
+                    .filter(|(k, _)| {
+                        k.len() == key.len() + RID_SUFFIX_LEN && k[..key.len()] == key[..]
+                    })
+                    .map(|(_, rid)| rid)
+                    .collect()
+            };
+            return Ok(Some(rids));
         }
         Ok(None)
     }
@@ -1529,21 +1579,23 @@ impl SqlEngine {
                 }
             }
 
-            // Secondary UNIQUE indexes: when an indexed value changes, reject a
-            // visible duplicate in another row before writing.
+            // Secondary UNIQUE indexes: when the composite value changes, reject
+            // a visible duplicate in another row before writing.
             for (def, tree) in &sec {
-                let new_val = &row[def.column];
-                if matches!(new_val, Value::Null) {
+                if !def.unique {
                     continue;
                 }
-                if original[def.column] != *new_val {
-                    let key = encode_index_key(new_val)?;
-                    if let Some(existing) = tree.search(&key)? {
-                        if existing != rid && self.store.read(txn, existing)?.is_some() {
-                            return Err(SqlError::Constraint(format!(
-                                "duplicate value for UNIQUE index {}",
-                                def.name
-                            )));
+                let new_key = index_row_key(&row, &def.columns)?;
+                let old_key = index_row_key(&original, &def.columns)?;
+                if let Some(key) = &new_key {
+                    if new_key != old_key {
+                        if let Some(existing) = tree.search(key)? {
+                            if existing != rid && self.store.read(txn, existing)?.is_some() {
+                                return Err(SqlError::Constraint(format!(
+                                    "duplicate value for UNIQUE index {}",
+                                    def.name
+                                )));
+                            }
                         }
                     }
                 }
@@ -1557,12 +1609,16 @@ impl SqlEngine {
                 let key = encode_index_key(&row[pk_col])?;
                 tree.insert(&key, new_rid)?;
             }
-            // Repoint each secondary index at the new version (a changed value
-            // adds a new key; the stale old key is hidden by MVCC on read).
+            // Point each secondary index at the new version (a changed value
+            // writes a new key; the stale old key is hidden by MVCC on read).
             for (def, tree) in &sec {
-                if !matches!(row[def.column], Value::Null) {
-                    let key = encode_index_key(&row[def.column])?;
-                    tree.insert(&key, new_rid)?;
+                if let Some(key) = index_row_key(&row, &def.columns)? {
+                    let stored = if def.unique {
+                        key
+                    } else {
+                        nonunique_key(&key, new_rid)
+                    };
+                    tree.insert(&stored, new_rid)?;
                 }
             }
             count += 1;
@@ -3014,6 +3070,48 @@ fn key_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
         }
     }
     Ordering::Equal
+}
+
+/// Bytes appended to a non-unique secondary-index key to make each row's entry
+/// unique: the record id's page (u64 BE) then slot (u16 BE).
+const RID_SUFFIX_LEN: usize = 10;
+
+fn rid_suffix(rid: RecordId) -> [u8; RID_SUFFIX_LEN] {
+    let mut s = [0u8; RID_SUFFIX_LEN];
+    s[..8].copy_from_slice(&rid.page.as_u64().to_be_bytes());
+    s[8..].copy_from_slice(&rid.slot.to_be_bytes());
+    s
+}
+
+/// A non-unique index key: the composite value key followed by the row id.
+fn nonunique_key(framed: &[u8], rid: RecordId) -> Vec<u8> {
+    let mut k = Vec::with_capacity(framed.len() + RID_SUFFIX_LEN);
+    k.extend_from_slice(framed);
+    k.extend_from_slice(&rid_suffix(rid));
+    k
+}
+
+/// Frame (non-NULL) values into a self-delimiting composite key — each part is a
+/// `u32` length followed by its order-preserving bytes — so a multi-column key is
+/// unambiguous and all entries for one value share a prefix.
+fn frame_index_key(values: &[&Value]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for v in values {
+        let part = encode_index_key(v)?;
+        out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+        out.extend_from_slice(&part);
+    }
+    Ok(out)
+}
+
+/// The composite key for `row`'s `columns`, or `None` if any indexed column is
+/// NULL (rows with a NULL in an indexed column are not indexed).
+fn index_row_key(row: &[Value], columns: &[usize]) -> Result<Option<Vec<u8>>> {
+    if columns.iter().any(|&c| matches!(row[c], Value::Null)) {
+        return Ok(None);
+    }
+    let vals: Vec<&Value> = columns.iter().map(|&c| &row[c]).collect();
+    Ok(Some(frame_index_key(&vals)?))
 }
 
 /// Encode a value as an order-preserving B+tree index key. Integers use a
@@ -5250,6 +5348,76 @@ mod tests {
                     .unwrap()
             ),
             vec![vec![t("c@x")]]
+        );
+    }
+
+    #[test]
+    fn nonunique_and_multicolumn_indexes() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE p (id BIGINT, city TEXT, age BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "INSERT INTO p VALUES (1,'NYC',30),(2,'LA',30),(3,'NYC',41),(4,'NYC',30)",
+            )
+            .unwrap();
+
+        // Non-unique single-column index: duplicates allowed; a seek returns all.
+        env.engine
+            .execute_autocommit("CREATE INDEX p_city ON p (city)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM p WHERE city = 'NYC' ORDER BY id")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(3)],
+                vec![Value::Int64(4)]
+            ]
+        );
+
+        // A multi-column UNIQUE index over duplicate pairs ((NYC,30) twice) fails.
+        assert!(
+            env.engine
+                .execute_autocommit("CREATE UNIQUE INDEX p_city_age ON p (city, age)")
+                .is_err()
+        );
+
+        // Multi-column UNIQUE on distinct pairs: enforced, and seekable when both
+        // columns are pinned.
+        env.engine
+            .execute_autocommit("CREATE TABLE q (a BIGINT, b BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO q VALUES (1,1),(1,2),(2,1)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE UNIQUE INDEX q_ab ON q (a, b)")
+            .unwrap();
+        assert!(
+            env.engine
+                .execute_autocommit("INSERT INTO q VALUES (1,2)")
+                .is_err()
+        );
+        assert_eq!(
+            affected(
+                env.engine
+                    .execute_autocommit("INSERT INTO q VALUES (2,2)")
+                    .unwrap()
+            ),
+            1
+        );
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT a FROM q WHERE a = 1 AND b = 2")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)]]
         );
     }
 }

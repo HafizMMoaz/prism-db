@@ -24,16 +24,17 @@ pub struct Column {
     pub nullable: bool,
 }
 
-/// A secondary index: a named, durable B+tree mapping one column's value to the
-/// row's id. Only `UNIQUE` indexes are supported (the tree is a unique key map),
-/// so the index both enforces uniqueness and accelerates equality lookups.
+/// A secondary index: a named, durable B+tree over one or more columns. A
+/// `UNIQUE` index keys directly on the (composite) column value and enforces
+/// uniqueness; a non-unique index appends the row id to the key (so duplicates
+/// coexist) and is range-scanned for lookups. Both accelerate equality seeks.
 #[derive(Clone, Debug)]
 pub struct IndexDef {
     /// Index name (unique within a database).
     pub name: String,
-    /// The indexed column's position in the row.
-    pub column: usize,
-    /// Always true for now (non-unique indexes are not yet supported).
+    /// The indexed columns' positions in the row, in index order.
+    pub columns: Vec<usize>,
+    /// Whether the index enforces uniqueness on the composite key.
     pub unique: bool,
     /// The index B+tree's root page.
     pub root: PageId,
