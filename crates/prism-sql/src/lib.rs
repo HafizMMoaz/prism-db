@@ -61,7 +61,8 @@ use sqlparser::ast::{
     ColumnOption, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment, Expr, FromTable,
     Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
     JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem, SetExpr,
-    Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator, Value as SqlValue,
+    SetOperator, SetQuantifier, Statement, TableFactor, TableObject, TableWithJoins, UnaryOperator,
+    Value as SqlValue,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -665,14 +666,98 @@ impl SqlEngine {
         Ok(Outcome::Insert { count })
     }
 
+    /// Execute a top-level query: a simple `SELECT`, a parenthesized query, or a
+    /// set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two queries.
     fn exec_select(&self, txn: &TxnHandle, query: Query) -> Result<Outcome> {
-        let select: &Select = match query.body.as_ref() {
-            SetExpr::Select(s) => s.as_ref(),
-            _ => {
-                return Err(SqlError::Unsupported(
-                    "only simple SELECT is supported".into(),
+        match query.body.as_ref() {
+            SetExpr::Select(_) => self.exec_simple_select(txn, &query),
+            SetExpr::Query(inner) => self.exec_select(txn, (**inner).clone()),
+            SetExpr::SetOperation { .. } => self.exec_set_operation(txn, &query),
+            other => Err(SqlError::Unsupported(format!("query body: {other:?}"))),
+        }
+    }
+
+    /// Combine two queries with a set operator. Each side is evaluated without the
+    /// outer `ORDER BY`/`LIMIT`/`OFFSET`; the two row sets are combined under
+    /// multiset (`ALL`) or distinct semantics; the outer ordering and limit then
+    /// apply to the result. Output column names come from the left side.
+    fn exec_set_operation(&self, txn: &TxnHandle, query: &Query) -> Result<Outcome> {
+        let SetExpr::SetOperation {
+            op,
+            set_quantifier,
+            left,
+            right,
+        } = query.body.as_ref()
+        else {
+            unreachable!("exec_set_operation called on a non-set-operation body");
+        };
+
+        // Each side runs as its own query, stripped of the outer tail clauses.
+        let side = |body: &SetExpr| -> Query {
+            let mut q = query.clone();
+            q.body = Box::new(body.clone());
+            q.order_by = None;
+            q.limit = None;
+            q.offset = None;
+            q
+        };
+        let (columns, lrows) = match self.exec_select(txn, side(left))? {
+            Outcome::Select { columns, rows } => (columns, rows),
+            _ => unreachable!("a SELECT side must produce rows"),
+        };
+        let (rcols, rrows) = match self.exec_select(txn, side(right))? {
+            Outcome::Select { columns, rows } => (columns, rows),
+            _ => unreachable!("a SELECT side must produce rows"),
+        };
+        if columns.len() != rcols.len() {
+            return Err(SqlError::Type(format!(
+                "set operation sides have {} and {} columns",
+                columns.len(),
+                rcols.len()
+            )));
+        }
+
+        let all = matches!(
+            set_quantifier,
+            SetQuantifier::All | SetQuantifier::AllByName
+        );
+        let mut rows = match op {
+            SetOperator::Union => set_union(lrows, rrows, all),
+            SetOperator::Intersect => set_intersect(lrows, rrows, all),
+            SetOperator::Except => set_except(lrows, rrows, all),
+            other => return Err(SqlError::Unsupported(format!("set operator: {other:?}"))),
+        };
+
+        // ORDER BY over the combined output (output column by name, 1-based
+        // ordinal, or expression text), then OFFSET / LIMIT.
+        if let Some(order_by) = &query.order_by {
+            let names: Vec<&str> = columns.iter().map(|s| s.as_str()).collect();
+            let mut keys: Vec<(usize, bool)> = Vec::with_capacity(order_by.exprs.len());
+            for item in &order_by.exprs {
+                keys.push((
+                    resolve_output_col(&item.expr, &names)?,
+                    item.asc != Some(false),
                 ));
             }
+            rows.sort_by(|a, b| order_cmp(&keys, a, b));
+        }
+        let offset = match &query.offset {
+            Some(o) => count_literal(&o.value)?,
+            None => 0,
+        };
+        let limit = match &query.limit {
+            Some(e) => count_literal(e)?,
+            None => usize::MAX,
+        };
+        let rows = rows.into_iter().skip(offset).take(limit).collect();
+        Ok(Outcome::Select { columns, rows })
+    }
+
+    /// Execute a non-set-operation `SELECT` (`query.body` is `SetExpr::Select`).
+    fn exec_simple_select(&self, txn: &TxnHandle, query: &Query) -> Result<Outcome> {
+        let select: &Select = match query.body.as_ref() {
+            SetExpr::Select(s) => s.as_ref(),
+            _ => unreachable!("exec_simple_select called on a non-SELECT body"),
         };
 
         // Resolve uncorrelated subqueries (scalar `(SELECT …)`, `IN (SELECT …)`,
@@ -711,7 +796,7 @@ impl SqlEngine {
             return self.select_single(
                 txn,
                 select,
-                &query,
+                query,
                 &table,
                 &schema,
                 distinct,
@@ -726,7 +811,7 @@ impl SqlEngine {
                 filtered.push(row);
             }
         }
-        self.finish_select(select, &query, &schema, filtered, distinct)
+        self.finish_select(select, query, &schema, filtered, distinct)
     }
 
     /// The single-base-table path: an index seek when the `WHERE` pins an
@@ -2825,6 +2910,67 @@ fn coalesce_join(
 fn dedup_rows(rows: &mut Vec<Vec<Value>>) {
     let mut seen = std::collections::HashSet::new();
     rows.retain(|row| seen.insert(row.clone()));
+}
+
+/// Multiplicity of each distinct row (for multiset `ALL` set operations).
+fn row_counts(rows: Vec<Vec<Value>>) -> std::collections::HashMap<Vec<Value>, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for row in rows {
+        *counts.entry(row).or_insert(0usize) += 1;
+    }
+    counts
+}
+
+/// `UNION` (distinct) / `UNION ALL`: the rows of both sides, deduplicated unless
+/// `all`. Left rows precede right rows.
+fn set_union(mut left: Vec<Vec<Value>>, right: Vec<Vec<Value>>, all: bool) -> Vec<Vec<Value>> {
+    left.extend(right);
+    if !all {
+        dedup_rows(&mut left);
+    }
+    left
+}
+
+/// `INTERSECT` (distinct) / `INTERSECT ALL`: rows on both sides. `ALL` keeps
+/// `min(countL, countR)` copies; otherwise the distinct intersection. Order
+/// follows the left side.
+fn set_intersect(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>, all: bool) -> Vec<Vec<Value>> {
+    let mut right_counts = row_counts(right);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in left {
+        if all {
+            if let Some(c) = right_counts.get_mut(&row) {
+                if *c > 0 {
+                    *c -= 1;
+                    out.push(row);
+                }
+            }
+        } else if right_counts.contains_key(&row) && seen.insert(row.clone()) {
+            out.push(row);
+        }
+    }
+    out
+}
+
+/// `EXCEPT` (distinct) / `EXCEPT ALL`: left rows not matched on the right. `ALL`
+/// removes one left copy per matching right copy; otherwise the distinct
+/// difference. Order follows the left side.
+fn set_except(left: Vec<Vec<Value>>, right: Vec<Vec<Value>>, all: bool) -> Vec<Vec<Value>> {
+    let mut right_counts = row_counts(right);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in left {
+        if all {
+            match right_counts.get_mut(&row) {
+                Some(c) if *c > 0 => *c -= 1,
+                _ => out.push(row),
+            }
+        } else if !right_counts.contains_key(&row) && seen.insert(row.clone()) {
+            out.push(row);
+        }
+    }
+    out
 }
 
 /// Extract a scalar function's positional argument expressions.
@@ -5778,6 +5924,96 @@ mod tests {
                     .unwrap()
             ),
             vec![vec![Value::Int64(3)], vec![Value::Int64(4)]]
+        );
+    }
+
+    #[test]
+    fn set_operations() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE a (x BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE TABLE b (x BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO a VALUES (1),(2),(2),(3)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO b VALUES (2),(3),(3),(4)")
+            .unwrap();
+
+        // UNION dedupes across both sides; ORDER BY binds to the combined output.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT x FROM a UNION SELECT x FROM b ORDER BY x")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(1)],
+                vec![Value::Int64(2)],
+                vec![Value::Int64(3)],
+                vec![Value::Int64(4)],
+            ]
+        );
+
+        // UNION ALL keeps every copy (4 + 4 rows).
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT x FROM a UNION ALL SELECT x FROM b")
+                    .unwrap()
+            )
+            .len(),
+            8
+        );
+
+        // INTERSECT: distinct rows on both sides.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT x FROM a INTERSECT SELECT x FROM b ORDER BY x")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+        );
+
+        // INTERSECT ALL: min multiplicity per row — one 2 (a:2,b:1) and one 3 (a:1,b:2).
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT x FROM a INTERSECT ALL SELECT x FROM b ORDER BY x")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+        );
+
+        // EXCEPT: distinct left rows absent from the right (only 1).
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT x FROM a EXCEPT SELECT x FROM b ORDER BY x")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)]]
+        );
+
+        // EXCEPT ALL: left multiplicities minus right — 1 once, and one extra 2.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT x FROM a EXCEPT ALL SELECT x FROM b ORDER BY x")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)], vec![Value::Int64(2)]]
+        );
+
+        // Mismatched arity is rejected.
+        assert!(
+            env.engine
+                .execute_autocommit("SELECT x, x FROM a UNION SELECT x FROM b")
+                .is_err()
         );
     }
 }
