@@ -29,10 +29,13 @@
 //! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
 //! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
 //! the select list, and `HAVING` (and `ORDER BY` over aggregate output, by name,
-//! 1-based ordinal, or expression text). Deferred: updating a primary-key
-//! column, join predicate pushdown / index nested-loop, the formal
-//! bind/rewrite/plan IR. The current executor interprets the parsed AST directly
-//! against the catalog; the full parse→bind→plan→execute pipeline is a follow-up.
+//! 1-based ordinal, or expression text). Uncorrelated subqueries are supported:
+//! scalar `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and
+//! derived tables `FROM (SELECT …) AS alias`. Deferred: correlated subqueries,
+//! updating a primary-key column, join predicate pushdown / index nested-loop,
+//! the formal bind/rewrite/plan IR. The current executor interprets the parsed
+//! AST directly against the catalog; the full parse→bind→plan→execute pipeline
+//! is a follow-up.
 
 pub mod catalog;
 pub mod error;
@@ -647,6 +650,19 @@ impl SqlEngine {
             }
         };
 
+        // Resolve uncorrelated subqueries (scalar `(SELECT …)`, `IN (SELECT …)`,
+        // `EXISTS (SELECT …)`) in WHERE/projection/HAVING by running them once and
+        // substituting their results. Only clone the AST when one is present.
+        let owned;
+        let select = if select_has_subquery(select) {
+            let mut s = select.clone();
+            self.resolve_select_subqueries(txn, &mut s)?;
+            owned = s;
+            &owned
+        } else {
+            select
+        };
+
         // SELECT DISTINCT dedupes the result rows (DISTINCT ON is not supported).
         let distinct = match &select.distinct {
             None => false,
@@ -655,9 +671,12 @@ impl SqlEngine {
         };
 
         // A single base table (no joins) keeps the primary-key index-seek fast
-        // path; anything with joins or several FROM items goes through the
-        // nested-loop join materializer.
-        if select.from.len() == 1 && select.from[0].joins.is_empty() {
+        // path; joins, several FROM items, or a derived table (subquery in FROM)
+        // go through the nested-loop join materializer.
+        if select.from.len() == 1
+            && select.from[0].joins.is_empty()
+            && matches!(select.from[0].relation, TableFactor::Table { .. })
+        {
             let (qualifier, table) = self.relation_of(&select.from[0].relation)?;
             let schema = JoinSchema::single(&qualifier, &table);
             return self.select_single(txn, select, &query, &table, &schema, distinct);
@@ -798,6 +817,48 @@ impl SqlEngine {
         Ok(rows)
     }
 
+    /// Materialize one `FROM`/`JOIN` source — a base table or a derived table
+    /// (`(SELECT …) AS alias`) — into a schema and its rows.
+    fn source_of(
+        &self,
+        txn: &TxnHandle,
+        factor: &TableFactor,
+    ) -> Result<(JoinSchema, Vec<Vec<Value>>)> {
+        match factor {
+            TableFactor::Table { .. } => {
+                let (q, table) = self.relation_of(factor)?;
+                let schema = JoinSchema::single(&q, &table);
+                let rows = self.scan_rows(txn, &table)?;
+                Ok((schema, rows))
+            }
+            TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let alias = alias.as_ref().ok_or_else(|| {
+                    SqlError::Unsupported("a derived table (subquery) needs an alias".into())
+                })?;
+                let q = alias.name.value.clone();
+                let (columns, rows) = match self.exec_select(txn, (**subquery).clone())? {
+                    Outcome::Select { columns, rows } => (columns, rows),
+                    _ => {
+                        return Err(SqlError::Unsupported(
+                            "derived table must be a SELECT".into(),
+                        ));
+                    }
+                };
+                let cols = columns
+                    .into_iter()
+                    .map(|name| JoinCol {
+                        qualifier: q.clone(),
+                        name,
+                    })
+                    .collect();
+                Ok((JoinSchema { cols }, rows))
+            }
+            other => Err(SqlError::Unsupported(format!("FROM item: {other:?}"))),
+        }
+    }
+
     /// Materialize the `FROM` clause (comma-separated tables cross-joined, each
     /// with its chain of `JOIN`s) into a combined schema and row set via
     /// nested-loop joins.
@@ -811,17 +872,13 @@ impl SqlEngine {
         let mut rows: Vec<Vec<Value>> = vec![Vec::new()];
 
         for twj in from {
-            let (q, table) = self.relation_of(&twj.relation)?;
-            let base_schema = JoinSchema::single(&q, &table);
-            let base_rows = self.scan_rows(txn, &table)?;
+            let (base_schema, base_rows) = self.source_of(txn, &twj.relation)?;
             let (s, r) = cross_join(schema, rows, base_schema, base_rows);
             schema = s;
             rows = r;
 
             for join in &twj.joins {
-                let (rq, rtable) = self.relation_of(&join.relation)?;
-                let right_schema = JoinSchema::single(&rq, &rtable);
-                let right_rows = self.scan_rows(txn, &rtable)?;
+                let (right_schema, right_rows) = self.source_of(txn, &join.relation)?;
                 let (s, r) =
                     self.apply_join(schema, rows, right_schema, right_rows, &join.join_operator)?;
                 schema = s;
@@ -829,6 +886,123 @@ impl SqlEngine {
             }
         }
         Ok((schema, rows))
+    }
+
+    /// Rewrite the WHERE / projection / HAVING of `sel` with uncorrelated
+    /// subqueries replaced by their computed values (run once each).
+    fn resolve_select_subqueries(&self, txn: &TxnHandle, sel: &mut Select) -> Result<()> {
+        if let Some(e) = sel.selection.take() {
+            sel.selection = Some(self.resolve_subqueries(txn, e)?);
+        }
+        for item in &mut sel.projection {
+            if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item {
+                *e = self.resolve_subqueries(txn, e.clone())?;
+            }
+        }
+        if let Some(e) = sel.having.take() {
+            sel.having = Some(self.resolve_subqueries(txn, e)?);
+        }
+        Ok(())
+    }
+
+    /// Replace `(SELECT …)` / `x IN (SELECT …)` / `EXISTS (SELECT …)` in `expr`
+    /// with their results (uncorrelated only — the subquery runs standalone).
+    fn resolve_subqueries(&self, txn: &TxnHandle, expr: Expr) -> Result<Expr> {
+        let rec = |this: &Self, e: Expr| this.resolve_subqueries(txn, e);
+        Ok(match expr {
+            Expr::Subquery(q) => value_to_expr(self.run_scalar_subquery(txn, *q)?),
+            Expr::Exists { subquery, negated } => {
+                let (_, rows) = self.run_subquery(txn, *subquery)?;
+                Expr::Value(SqlValue::Boolean(!rows.is_empty() ^ negated))
+            }
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(rec(self, *expr)?),
+                list: self
+                    .run_column_subquery(txn, *subquery)?
+                    .into_iter()
+                    .map(value_to_expr)
+                    .collect(),
+                negated,
+            },
+            Expr::Nested(e) => Expr::Nested(Box::new(rec(self, *e)?)),
+            Expr::IsNull(e) => Expr::IsNull(Box::new(rec(self, *e)?)),
+            Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(rec(self, *e)?)),
+            Expr::UnaryOp { op, expr: e } => Expr::UnaryOp {
+                op,
+                expr: Box::new(rec(self, *e)?),
+            },
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(rec(self, *left)?),
+                op,
+                right: Box::new(rec(self, *right)?),
+            },
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(rec(self, *expr)?),
+                negated,
+                low: Box::new(rec(self, *low)?),
+                high: Box::new(rec(self, *high)?),
+            },
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(rec(self, *expr)?),
+                list: list
+                    .into_iter()
+                    .map(|e| rec(self, e))
+                    .collect::<Result<_>>()?,
+                negated,
+            },
+            other => other,
+        })
+    }
+
+    /// Run a subquery, returning its output columns and rows.
+    fn run_subquery(&self, txn: &TxnHandle, q: Query) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+        match self.exec_select(txn, q)? {
+            Outcome::Select { columns, rows } => Ok((columns, rows)),
+            _ => Err(SqlError::Unsupported("subquery must be a SELECT".into())),
+        }
+    }
+
+    /// Run a scalar subquery: exactly one column, at most one row (no row = NULL).
+    fn run_scalar_subquery(&self, txn: &TxnHandle, q: Query) -> Result<Value> {
+        let (columns, rows) = self.run_subquery(txn, q)?;
+        if columns.len() != 1 {
+            return Err(SqlError::Type(
+                "a scalar subquery must return exactly one column".into(),
+            ));
+        }
+        if rows.len() > 1 {
+            return Err(SqlError::Type(
+                "a scalar subquery returned more than one row".into(),
+            ));
+        }
+        Ok(rows
+            .into_iter()
+            .next()
+            .map_or(Value::Null, |mut r| r.remove(0)))
+    }
+
+    /// Run a single-column subquery, returning its column of values (for `IN`).
+    fn run_column_subquery(&self, txn: &TxnHandle, q: Query) -> Result<Vec<Value>> {
+        let (columns, rows) = self.run_subquery(txn, q)?;
+        if columns.len() != 1 {
+            return Err(SqlError::Type(
+                "an IN subquery must return exactly one column".into(),
+            ));
+        }
+        Ok(rows.into_iter().map(|mut r| r.remove(0)).collect())
     }
 
     /// Evaluate a join `ON` predicate against the concatenation of a left and a
@@ -2054,6 +2228,52 @@ impl ColumnResolver for JoinSchema {
             .iter()
             .map(|c| (Some(c.qualifier.clone()), c.name.clone()))
             .collect()
+    }
+}
+
+/// Convert a computed value back into a literal expression, for substituting a
+/// resolved subquery result into the surrounding query. (A `Timestamp` reduces
+/// to its integer microseconds, losing the timestamp type — a known limit.)
+fn value_to_expr(v: Value) -> Expr {
+    Expr::Value(match v {
+        Value::Null => SqlValue::Null,
+        Value::Bool(b) => SqlValue::Boolean(b),
+        Value::Int64(n) => SqlValue::Number(n.to_string(), false),
+        // `{:?}` keeps a decimal point so it re-parses as a double.
+        Value::Double(d) => SqlValue::Number(format!("{d:?}"), false),
+        Value::Timestamp(t) => SqlValue::Number(t.to_string(), false),
+        Value::Text(s) => SqlValue::SingleQuotedString(s),
+    })
+}
+
+/// Whether a `SELECT`'s WHERE / projection / HAVING contains a subquery worth a
+/// resolve pass (so the common subquery-free query skips the AST clone).
+fn select_has_subquery(s: &Select) -> bool {
+    s.selection.as_ref().is_some_and(expr_has_subquery)
+        || s.having.as_ref().is_some_and(expr_has_subquery)
+        || s.projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                expr_has_subquery(e)
+            }
+            _ => false,
+        })
+}
+
+/// Whether `expr` contains a scalar/`IN`/`EXISTS` subquery (recursively).
+fn expr_has_subquery(e: &Expr) -> bool {
+    match e {
+        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => true,
+        Expr::Nested(x) | Expr::IsNull(x) | Expr::IsNotNull(x) | Expr::UnaryOp { expr: x, .. } => {
+            expr_has_subquery(x)
+        }
+        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        Expr::Between {
+            expr, low, high, ..
+        } => expr_has_subquery(expr) || expr_has_subquery(low) || expr_has_subquery(high),
+        Expr::InList { expr, list, .. } => {
+            expr_has_subquery(expr) || list.iter().any(expr_has_subquery)
+        }
+        _ => false,
     }
 }
 
@@ -4809,6 +5029,112 @@ mod tests {
                     .unwrap()
             ),
             1
+        );
+    }
+
+    #[test]
+    fn subqueries_scalar_in_exists_and_derived() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT, v BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE TABLE big (id BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO big VALUES (2),(3)")
+            .unwrap();
+
+        // Scalar subquery in WHERE.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE v = (SELECT MAX(v) FROM t)")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(3)]]
+        );
+
+        // Scalar subquery in the projection.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id, (SELECT COUNT(*) FROM big) FROM t WHERE id = 1")
+                    .unwrap()
+            )[0],
+            vec![Value::Int64(1), Value::Int64(2)]
+        );
+
+        // IN / NOT IN (subquery).
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id FROM t WHERE id IN (SELECT id FROM big) ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
+        );
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT id FROM t WHERE id NOT IN (SELECT id FROM big) ORDER BY id"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(1)]]
+        );
+
+        // EXISTS / NOT EXISTS.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE EXISTS (SELECT 1 FROM big)")
+                    .unwrap()
+            )
+            .len(),
+            3
+        );
+        env.engine
+            .execute_autocommit("CREATE TABLE empty (id BIGINT)")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM empty)")
+                    .unwrap()
+            )
+            .len(),
+            3
+        );
+
+        // Derived table in FROM.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT d.v FROM (SELECT v FROM t WHERE v >= 20) d ORDER BY d.v"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(20)], vec![Value::Int64(30)]]
+        );
+
+        // Derived table joined to a base table.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT t.id, m.mx FROM t JOIN (SELECT MAX(v) mx FROM t) m ON t.v = m.mx"
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(3), Value::Int64(30)]]
         );
     }
 }
