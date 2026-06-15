@@ -7,12 +7,14 @@
 //! **Scope (this slice):** `CREATE TABLE`, `CREATE [UNIQUE] INDEX … ON t (c, …)`
 //! / `DROP INDEX` (single- or multi-column secondary indexes, UNIQUE or
 //! non-unique; UNIQUE enforces on `INSERT`/`UPDATE`, and an equality `WHERE` over
-//! all of an index's columns seeks it), `INSERT … VALUES`,
+//! all of an index's columns seeks it), `INSERT … VALUES` and `INSERT … SELECT`,
 //! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with an index seek when
 //! the `WHERE` pins the primary key or a UNIQUE-indexed column to a literal —
-//! `SELECT … WHERE col = …`), and aggregates `COUNT`/`SUM`/`AVG`/
+//! `SELECT … WHERE col = …` — or bounds the primary key with a range,
+//! `> >= < <= BETWEEN`). Queries combine with `UNION`/`INTERSECT`/`EXCEPT`
+//! (`ALL` or distinct). Aggregates are `COUNT`/`SUM`/`AVG`/
 //! `MIN`/`MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
 //! `BOOL`/`BIGINT`/`DOUBLE`/`TIMESTAMP`/`TEXT` (integers widen to doubles in
 //! mixed arithmetic; `TIMESTAMP` is epoch microseconds and parses from
@@ -26,10 +28,13 @@
 //! comparisons, `AND`/`OR`/`NOT`, `IS [NOT] NULL`, `[NOT] IN (…)`,
 //! `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`), `CASE`, and scalar
 //! functions: date/time (`NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/
-//! `SECOND`, `DATEDIFF`, `DATE_ADD`/`DATE_SUB` with `INTERVAL n DAY|HOUR|…`, over
-//! Unix epoch seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/
-//! `CONCAT`/`REPLACE`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`), and
-//! control flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
+//! `SECOND`/`QUARTER`/`DAYOFWEEK`/`DAYOFYEAR`, `DATEDIFF`, `DATE_ADD`/`DATE_SUB`
+//! with `INTERVAL n DAY|HOUR|…`, `UNIX_TIMESTAMP`/`FROM_UNIXTIME`, over Unix epoch
+//! seconds), string (`UPPER`/`LOWER`/`LENGTH`/`SUBSTR`/`TRIM`/`CONCAT`/`REPLACE`/
+//! `LEFT`/`RIGHT`/`REVERSE`/`REPEAT`/`SPACE`/`LPAD`/`RPAD`/`INSTR`/`LOCATE`/
+//! `ASCII`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`/`SQRT`/`EXP`/`LN`/
+//! `LOG`/`LOG10`/`LOG2`/`SIGN`/`TRUNCATE`/`PI`/`GREATEST`/`LEAST`), and control
+//! flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
 //! the select list, and `HAVING` (and `ORDER BY` over aggregate output, by name,
 //! 1-based ordinal, or expression text). Subqueries are supported: scalar
 //! `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and derived
@@ -2539,6 +2544,210 @@ impl SqlEngine {
                 let a = arg(0)?;
                 if a == arg(1)? { Ok(Value::Null) } else { Ok(a) }
             }
+            // ── more string ──
+            "LEFT" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(s), Value::Int64(n)) => {
+                    Ok(Value::Text(s.chars().take(n.max(0) as usize).collect()))
+                }
+                (a, b) => Err(SqlError::Type(format!(
+                    "LEFT expects (text, int), got {a:?}, {b:?}"
+                ))),
+            },
+            "RIGHT" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(s), Value::Int64(n)) => {
+                    let chars: Vec<char> = s.chars().collect();
+                    let take = (n.max(0) as usize).min(chars.len());
+                    Ok(Value::Text(chars[chars.len() - take..].iter().collect()))
+                }
+                (a, b) => Err(SqlError::Type(format!(
+                    "RIGHT expects (text, int), got {a:?}, {b:?}"
+                ))),
+            },
+            "REVERSE" => str_map(arg(0)?, |s| s.chars().rev().collect()),
+            "REPEAT" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(s), Value::Int64(n)) => Ok(Value::Text(s.repeat(n.max(0) as usize))),
+                (a, b) => Err(SqlError::Type(format!(
+                    "REPEAT expects (text, int), got {a:?}, {b:?}"
+                ))),
+            },
+            "SPACE" => match arg(0)? {
+                Value::Null => Ok(Value::Null),
+                Value::Int64(n) => Ok(Value::Text(" ".repeat(n.max(0) as usize))),
+                other => Err(SqlError::Type(format!(
+                    "SPACE expects an int, got {other:?}"
+                ))),
+            },
+            "LPAD" | "RPAD" => match (arg(0)?, arg(1)?, arg(2)?) {
+                (Value::Null, _, _) | (_, Value::Null, _) | (_, _, Value::Null) => Ok(Value::Null),
+                (Value::Text(s), Value::Int64(len), Value::Text(pad)) => {
+                    let target = len.max(0) as usize;
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= target {
+                        return Ok(Value::Text(chars[..target].iter().collect()));
+                    }
+                    let pad_chars: Vec<char> = pad.chars().collect();
+                    if pad_chars.is_empty() {
+                        return Ok(Value::Text(s));
+                    }
+                    let fill: String = pad_chars
+                        .iter()
+                        .cycle()
+                        .take(target - chars.len())
+                        .collect();
+                    Ok(Value::Text(if name == "LPAD" {
+                        format!("{fill}{s}")
+                    } else {
+                        format!("{s}{fill}")
+                    }))
+                }
+                (a, b, c) => Err(SqlError::Type(format!(
+                    "{name} expects (text, int, text), got {a:?}, {b:?}, {c:?}"
+                ))),
+            },
+            "INSTR" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Text(s), Value::Text(sub)) => Ok(Value::Int64(str_index(&s, &sub))),
+                (a, b) => Err(SqlError::Type(format!(
+                    "INSTR expects text, got {a:?}, {b:?}"
+                ))),
+            },
+            "LOCATE" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                // LOCATE takes (substring, string) — the reverse of INSTR.
+                (Value::Text(sub), Value::Text(s)) => Ok(Value::Int64(str_index(&s, &sub))),
+                (a, b) => Err(SqlError::Type(format!(
+                    "LOCATE expects text, got {a:?}, {b:?}"
+                ))),
+            },
+            "ASCII" => match arg(0)? {
+                Value::Null => Ok(Value::Null),
+                Value::Text(s) => Ok(Value::Int64(s.chars().next().map_or(0, |c| c as i64))),
+                other => Err(SqlError::Type(format!("ASCII expects text, got {other:?}"))),
+            },
+            // ── more numeric (all but SIGN return DOUBLE) ──
+            "SQRT" => num_unary("SQRT", arg(0)?, f64::sqrt),
+            "EXP" => num_unary("EXP", arg(0)?, f64::exp),
+            "LN" => num_unary("LN", arg(0)?, f64::ln),
+            "LOG10" => num_unary("LOG10", arg(0)?, f64::log10),
+            "LOG2" => num_unary("LOG2", arg(0)?, f64::log2),
+            // LOG(x) is the natural log; LOG(base, x) is the log to that base.
+            "LOG" => {
+                if nargs >= 2 {
+                    match (arg(0)?, arg(1)?) {
+                        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                        (a, b) => match (as_f64(&a), as_f64(&b)) {
+                            (Some(base), Some(x)) => Ok(Value::Double(x.log(base))),
+                            _ => Err(SqlError::Type(format!(
+                                "LOG expects numbers, got {a:?}, {b:?}"
+                            ))),
+                        },
+                    }
+                } else {
+                    num_unary("LOG", arg(0)?, f64::ln)
+                }
+            }
+            "SIGN" => match arg(0)? {
+                Value::Null => Ok(Value::Null),
+                other => match as_f64(&other) {
+                    Some(x) => Ok(Value::Int64(if x > 0.0 {
+                        1
+                    } else if x < 0.0 {
+                        -1
+                    } else {
+                        0
+                    })),
+                    None => Err(SqlError::Type(format!(
+                        "SIGN expects a number, got {other:?}"
+                    ))),
+                },
+            },
+            "TRUNCATE" => match (arg(0)?, arg(1)?) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (a, Value::Int64(d)) => match as_f64(&a) {
+                    Some(x) => {
+                        let factor = 10f64.powi(d as i32);
+                        Ok(Value::Double((x * factor).trunc() / factor))
+                    }
+                    None => Err(SqlError::Type(format!(
+                        "TRUNCATE expects a number, got {a:?}"
+                    ))),
+                },
+                (a, b) => Err(SqlError::Type(format!(
+                    "TRUNCATE expects (number, int), got {a:?}, {b:?}"
+                ))),
+            },
+            "PI" => Ok(Value::Double(std::f64::consts::PI)),
+            "GREATEST" | "LEAST" => {
+                use std::cmp::Ordering;
+                if nargs == 0 {
+                    return Err(SqlError::Type(format!(
+                        "{name} needs at least one argument"
+                    )));
+                }
+                let mut best: Option<Value> = None;
+                let want_greatest = name == "GREATEST";
+                for i in 0..nargs {
+                    let v = arg(i)?;
+                    if matches!(v, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    best = Some(match best {
+                        None => v,
+                        Some(cur) => {
+                            let ord = value_cmp(&v, &cur);
+                            let take = if want_greatest {
+                                ord == Ordering::Greater
+                            } else {
+                                ord == Ordering::Less
+                            };
+                            if take { v } else { cur }
+                        }
+                    });
+                }
+                Ok(best.expect("at least one argument"))
+            }
+            // ── more date / time (epoch seconds; see NOW/YEAR above) ──
+            "QUARTER" => match date_part(arg(0)?, DatePart::Month)? {
+                Value::Int64(m) => Ok(Value::Int64((m - 1) / 3 + 1)),
+                other => Ok(other),
+            },
+            "DAYOFWEEK" => match epoch_seconds_of(arg(0)?)? {
+                // 1 = Sunday … 7 = Saturday (1970-01-01 was a Thursday).
+                Some(secs) => Ok(Value::Int64(
+                    (secs.div_euclid(86_400) + 4).rem_euclid(7) + 1,
+                )),
+                None => Ok(Value::Null),
+            },
+            "DAYOFYEAR" => match epoch_seconds_of(arg(0)?)? {
+                Some(secs) => {
+                    let (y, mo, d, ..) = civil_from_epoch_secs(secs);
+                    let doy =
+                        types::days_from_civil(y, mo, d) - types::days_from_civil(y, 1, 1) + 1;
+                    Ok(Value::Int64(doy))
+                }
+                None => Ok(Value::Null),
+            },
+            "UNIX_TIMESTAMP" => {
+                let v = if nargs == 0 {
+                    Value::Int64(now_epoch_secs())
+                } else {
+                    arg(0)?
+                };
+                match epoch_seconds_of(v)? {
+                    Some(secs) => Ok(Value::Int64(secs)),
+                    None => Ok(Value::Null),
+                }
+            }
+            "FROM_UNIXTIME" => match arg(0)? {
+                Value::Null => Ok(Value::Null),
+                Value::Int64(secs) => Ok(Value::Timestamp(secs * 1_000_000)),
+                other => Err(SqlError::Type(format!(
+                    "FROM_UNIXTIME expects epoch seconds, got {other:?}"
+                ))),
+            },
             other => Err(SqlError::Unsupported(format!("function {other}"))),
         }
     }
@@ -3182,6 +3391,32 @@ fn str_map(v: Value, f: impl FnOnce(&str) -> String) -> Result<Value> {
     }
 }
 
+/// Apply a floating-point unary function, propagating NULL and rejecting
+/// non-numeric operands. The result is always a `DOUBLE`.
+fn num_unary(name: &str, v: Value, f: impl FnOnce(f64) -> f64) -> Result<Value> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        other => match as_f64(&other) {
+            Some(x) => Ok(Value::Double(f(x))),
+            None => Err(SqlError::Type(format!(
+                "{name} expects a number, got {other:?}"
+            ))),
+        },
+    }
+}
+
+/// The 1-based character position of `needle` in `haystack`, or 0 if absent. An
+/// empty needle is found at position 1 (MySQL's `INSTR`/`LOCATE` convention).
+fn str_index(haystack: &str, needle: &str) -> i64 {
+    if needle.is_empty() {
+        return 1;
+    }
+    match haystack.find(needle) {
+        Some(byte) => haystack[..byte].chars().count() as i64 + 1,
+        None => 0,
+    }
+}
+
 /// Current Unix time in whole seconds.
 fn now_epoch_secs() -> i64 {
     std::time::SystemTime::now()
@@ -3223,6 +3458,19 @@ fn date_part(v: Value, part: DatePart) -> Result<Value> {
         DatePart::Minute => mi,
         DatePart::Second => s,
     }))
+}
+
+/// Reduce a date/time value to whole Unix epoch seconds (UTC). A `TIMESTAMP`
+/// (epoch microseconds) is divided down to seconds; NULL maps to `None`.
+fn epoch_seconds_of(v: Value) -> Result<Option<i64>> {
+    match v {
+        Value::Int64(n) => Ok(Some(n)),
+        Value::Timestamp(micros) => Ok(Some(micros.div_euclid(1_000_000))),
+        Value::Null => Ok(None),
+        other => Err(SqlError::Type(format!(
+            "date function expects a timestamp or epoch-seconds integer, got {other:?}"
+        ))),
+    }
 }
 
 /// Convert Unix epoch seconds (UTC) to `(year, month, day, hour, minute,
@@ -6304,6 +6552,111 @@ mod tests {
         assert_eq!(
             ids("SELECT id FROM t WHERE id > 4 AND id < 2"),
             Vec::<i64>::new()
+        );
+    }
+
+    #[test]
+    fn scalar_function_topup() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (x BIGINT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit("INSERT INTO t VALUES (1)")
+            .unwrap();
+        let scalar = |sql: &str| -> Value {
+            rows(env.engine.execute_autocommit(sql).unwrap())
+                .remove(0)
+                .remove(0)
+        };
+        let dbl = |v: Value| -> f64 {
+            match v {
+                Value::Double(d) => d,
+                Value::Int64(n) => n as f64,
+                other => panic!("expected number, got {other:?}"),
+            }
+        };
+        let approx = |sql: &str, want: f64| {
+            let got = dbl(scalar(sql));
+            assert!((got - want).abs() < 1e-9, "{sql}: got {got}, want {want}");
+        };
+
+        // String functions.
+        assert_eq!(
+            scalar("SELECT LEFT('hello', 3) FROM t"),
+            Value::Text("hel".into())
+        );
+        assert_eq!(
+            scalar("SELECT RIGHT('hello', 2) FROM t"),
+            Value::Text("lo".into())
+        );
+        assert_eq!(
+            scalar("SELECT REVERSE('abc') FROM t"),
+            Value::Text("cba".into())
+        );
+        assert_eq!(
+            scalar("SELECT REPEAT('ab', 3) FROM t"),
+            Value::Text("ababab".into())
+        );
+        assert_eq!(scalar("SELECT SPACE(3) FROM t"), Value::Text("   ".into()));
+        assert_eq!(
+            scalar("SELECT LPAD('7', 3, '0') FROM t"),
+            Value::Text("007".into())
+        );
+        assert_eq!(
+            scalar("SELECT RPAD('7', 3, '*') FROM t"),
+            Value::Text("7**".into())
+        );
+        assert_eq!(
+            scalar("SELECT INSTR('hello', 'll') FROM t"),
+            Value::Int64(3)
+        );
+        assert_eq!(
+            scalar("SELECT LOCATE('ll', 'hello') FROM t"),
+            Value::Int64(3)
+        );
+        assert_eq!(scalar("SELECT ASCII('A') FROM t"), Value::Int64(65));
+
+        // Numeric functions.
+        approx("SELECT SQRT(9) FROM t", 3.0);
+        approx("SELECT EXP(0) FROM t", 1.0);
+        approx("SELECT LN(1) FROM t", 0.0);
+        approx("SELECT LOG10(1000) FROM t", 3.0);
+        approx("SELECT LOG2(8) FROM t", 3.0);
+        approx("SELECT LOG(2, 8) FROM t", 3.0);
+        approx("SELECT TRUNCATE(3.456, 2) FROM t", 3.45);
+        approx("SELECT PI() FROM t", std::f64::consts::PI);
+        assert_eq!(scalar("SELECT SIGN(-5) FROM t"), Value::Int64(-1));
+        assert_eq!(scalar("SELECT SIGN(0) FROM t"), Value::Int64(0));
+        assert_eq!(scalar("SELECT GREATEST(3, 7, 2) FROM t"), Value::Int64(7));
+        assert_eq!(scalar("SELECT LEAST(3, 7, 2) FROM t"), Value::Int64(2));
+        assert_eq!(
+            scalar("SELECT GREATEST('a', 'c', 'b') FROM t"),
+            Value::Text("c".into())
+        );
+        assert_eq!(scalar("SELECT GREATEST(1, NULL) FROM t"), Value::Null);
+
+        // Date functions over a known UTC date (2021-07-15 was a Thursday).
+        assert_eq!(
+            scalar("SELECT QUARTER(CAST('2021-07-15' AS TIMESTAMP)) FROM t"),
+            Value::Int64(3)
+        );
+        assert_eq!(
+            scalar("SELECT DAYOFWEEK(CAST('2021-07-15' AS TIMESTAMP)) FROM t"),
+            Value::Int64(5)
+        );
+        assert_eq!(
+            scalar("SELECT DAYOFYEAR(CAST('2021-07-15' AS TIMESTAMP)) FROM t"),
+            Value::Int64(196)
+        );
+        assert_eq!(
+            scalar("SELECT UNIX_TIMESTAMP(CAST('1970-01-02' AS TIMESTAMP)) FROM t"),
+            Value::Int64(86_400)
+        );
+        // FROM_UNIXTIME round-trips back through the calendar.
+        assert_eq!(
+            scalar("SELECT YEAR(FROM_UNIXTIME(0)) FROM t"),
+            Value::Int64(1970)
         );
     }
 }
