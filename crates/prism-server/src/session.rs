@@ -661,8 +661,8 @@ impl Session {
             };
         }
 
-        // Introspection (SHOW TABLES/COLLECTIONS/NAMESPACES, DESCRIBE) over the
-        // current database.
+        // Introspection (SHOW TABLES/COLLECTIONS/NAMESPACES/VIEWS, DESCRIBE) over
+        // the current database.
         if is_introspect_sql(&sql) {
             return match self.run_introspect_sql(&sql) {
                 Ok(msg) => msg,
@@ -727,6 +727,8 @@ impl Session {
                     Outcome::DropIndex { table } if !table.is_empty() => {
                         db.persist_table_schema(table)
                     }
+                    Outcome::CreateView { name } => db.persist_view(name),
+                    Outcome::DropView { name } => db.drop_view_meta(name),
                     _ => Ok(()),
                 };
                 if let Err(e) = persisted {
@@ -813,8 +815,8 @@ impl Session {
     }
 
     /// Handle introspection over the current database: `SHOW TABLES`,
-    /// `SHOW COLLECTIONS`, `SHOW NAMESPACES`, and `DESCRIBE <table>` /
-    /// `SHOW COLUMNS FROM <table>`.
+    /// `SHOW COLLECTIONS`, `SHOW NAMESPACES`, `SHOW VIEWS`, and
+    /// `DESCRIBE <table>` / `SHOW COLUMNS FROM <table>`.
     fn run_introspect_sql(&mut self, sql: &str) -> Result<Message> {
         self.authorize(Need::Read)?;
         let db = self.data_db()?;
@@ -829,6 +831,9 @@ impl Session {
         }
         if upper.starts_with("SHOW NAMESPACES") {
             return Ok(one_column("Namespaces", db.kv_namespace_names()));
+        }
+        if upper.starts_with("SHOW VIEWS") {
+            return Ok(one_column("Views", db.sql().catalog().view_names()));
         }
 
         // DESCRIBE <table> | DESC <table> | SHOW COLUMNS FROM <table>
@@ -1172,6 +1177,7 @@ fn is_introspect_sql(sql: &str) -> bool {
     u.starts_with("SHOW TABLES")
         || u.starts_with("SHOW COLLECTIONS")
         || u.starts_with("SHOW NAMESPACES")
+        || u.starts_with("SHOW VIEWS")
         || u.starts_with("SHOW COLUMNS")
         || u.starts_with("DESCRIBE ")
         || u.starts_with("DESC ")
@@ -1400,7 +1406,9 @@ fn outcome_to_sql_result(outcome: Outcome) -> Message {
         | Outcome::DropTable { .. }
         | Outcome::AlterTable { .. }
         | Outcome::CreateIndex { .. }
-        | Outcome::DropIndex { .. } => (0, vec![], vec![]),
+        | Outcome::DropIndex { .. }
+        | Outcome::CreateView { .. }
+        | Outcome::DropView { .. } => (0, vec![], vec![]),
         Outcome::Insert { count } => (count as u64, vec![], vec![]),
         Outcome::Select { columns, rows } => {
             let wire_rows: Vec<Row> = rows

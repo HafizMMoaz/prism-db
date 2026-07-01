@@ -30,14 +30,15 @@ That phrasing is deliberate. We are not promising to be a better SQL engine than
 - Explicit `BEGIN` / `COMMIT` / `ABORT`; implicit single-statement transactions
 
 ### Relational access method
-- SQL surface: `CREATE`/`ALTER`/`DROP TABLE`, `CREATE [UNIQUE] INDEX`/`DROP INDEX`, `INSERT` (`VALUES` or `SELECT`), `UPDATE`, `DELETE`, `SELECT`
+- SQL surface: `CREATE`/`ALTER`/`DROP TABLE`, `CREATE [OR REPLACE] VIEW`/`DROP VIEW` (logical), `CREATE [UNIQUE] INDEX`/`DROP INDEX`, `INSERT` (`VALUES` or `SELECT`), `UPDATE`, `DELETE`, `SELECT`
 - Joins: inner, left, right, full outer, cross, and self-joins, with `ON`/`USING`/`NATURAL` (executor: nested-loop today; hash join is a target)
 - `WHERE` predicates, `GROUP BY … HAVING`, `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, and `UNION`/`INTERSECT`/`EXCEPT`
 - Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`
+- Non-recursive CTEs (`WITH … AS (…)`) and window functions (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD` and aggregate windows over `OVER (PARTITION BY … ORDER BY …)`)
 - Subqueries (scalar, `IN`, `EXISTS`; correlated in `WHERE`), `CASE`, `CAST`, and date/string/numeric scalar functions
 - B+tree primary key, single- and multi-column B+tree secondary indexes (`UNIQUE` and non-unique)
 - Type system: `INT`, `BIGINT`, `FLOAT`, `DOUBLE`, `TEXT`, `BLOB`, `TIMESTAMP`, `BOOL`
-- Constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, `FOREIGN KEY` (deferred check option)
+- Constraints: `NOT NULL`, `UNIQUE`, `PRIMARY KEY`, literal `DEFAULT`, `CHECK`, and `FOREIGN KEY` (child checked on write, parent `RESTRICT` on delete)
 
 ### Document access method
 - Collection-based, schemaless
@@ -82,10 +83,9 @@ These are explicitly excluded. Anyone arguing to pull them in is arguing to slip
 - Cost-based query optimizer (statistics-driven join reordering)
 - Vectorized execution
 - Columnar storage
-- Materialized views
+- Materialized views (logical/non-materialized views **are** in scope — see above)
 - Stored procedures or user-defined functions
-- Window functions
-- Common table expressions (CTEs)
+- Recursive CTEs and window frame clauses (`ROWS`/`RANGE`) — non-recursive CTEs and unframed window functions **are** in scope
 - Full-text search (beyond basic substring `LIKE`)
 
 ### Advanced indexing

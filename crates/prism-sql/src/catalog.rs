@@ -91,6 +91,9 @@ impl Table {
 /// The in-memory catalog of relational tables.
 pub struct Catalog {
     tables: Mutex<HashMap<String, Table>>,
+    /// Logical views: name → the view's `SELECT` text. A view is expanded into a
+    /// derived subquery at query time (it owns no heap of its own).
+    views: Mutex<HashMap<String, String>>,
     next_heap: Mutex<u64>,
 }
 
@@ -99,6 +102,7 @@ impl Catalog {
     pub fn new(first_heap: u64) -> Self {
         Self {
             tables: Mutex::new(HashMap::new()),
+            views: Mutex::new(HashMap::new()),
             next_heap: Mutex::new(first_heap),
         }
     }
@@ -278,5 +282,69 @@ impl Catalog {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// Define a view from its `SELECT` text. Errors if a table already uses the
+    /// name, or if a view of that name exists and `or_replace` is false.
+    pub fn create_view(&self, name: &str, query_sql: String, or_replace: bool) -> Result<()> {
+        if self
+            .tables
+            .lock()
+            .expect("catalog poisoned")
+            .contains_key(name)
+        {
+            return Err(SqlError::TableExists(name.to_string()));
+        }
+        let mut views = self.views.lock().expect("catalog poisoned");
+        if views.contains_key(name) && !or_replace {
+            return Err(SqlError::TableExists(format!("view {name}")));
+        }
+        views.insert(name.to_string(), query_sql);
+        Ok(())
+    }
+
+    /// Install a view at load time (no name-collision or replace checks — the
+    /// persisted catalog is trusted). Used when reloading after restart.
+    pub fn register_view(&self, name: &str, query_sql: String) {
+        self.views
+            .lock()
+            .expect("catalog poisoned")
+            .insert(name.to_string(), query_sql);
+    }
+
+    /// Remove a view. Errors if no such view exists.
+    pub fn drop_view(&self, name: &str) -> Result<()> {
+        if self
+            .views
+            .lock()
+            .expect("catalog poisoned")
+            .remove(name)
+            .is_none()
+        {
+            return Err(SqlError::NoSuchTable(format!("view {name}")));
+        }
+        Ok(())
+    }
+
+    /// The `SELECT` text of a view, if `name` names one.
+    pub fn view(&self, name: &str) -> Option<String> {
+        self.views
+            .lock()
+            .expect("catalog poisoned")
+            .get(name)
+            .cloned()
+    }
+
+    /// All view names, sorted (for deterministic enumeration).
+    pub fn view_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .views
+            .lock()
+            .expect("catalog poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        names.sort();
+        names
     }
 }

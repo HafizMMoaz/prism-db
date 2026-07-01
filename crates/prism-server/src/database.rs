@@ -447,6 +447,7 @@ impl Database {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         })?;
         map.insert(name.to_string(), (heap, root));
         Ok(coll)
@@ -478,6 +479,7 @@ impl Database {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         })?;
         map.insert(name.to_string(), ns.clone());
         Ok(ns)
@@ -505,6 +507,7 @@ impl Database {
                 indexes: index_metas(&table),
                 checks: table.checks.clone(),
                 foreign_keys: table.foreign_keys.clone(),
+                view_sql: String::new(),
             };
             self.persist_entry(&entry)?;
             persisted.insert(table.name);
@@ -527,6 +530,7 @@ impl Database {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         })?;
         self.persisted_tables
             .lock()
@@ -552,6 +556,7 @@ impl Database {
             indexes,
             checks: table.checks,
             foreign_keys: table.foreign_keys,
+            view_sql: String::new(),
         })?;
         self.persisted_tables
             .lock()
@@ -574,6 +579,7 @@ impl Database {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         })?;
         self.persist_table_schema(new)?;
         self.persisted_tables
@@ -581,6 +587,57 @@ impl Database {
             .expect("persisted set poisoned")
             .remove(old);
         Ok(())
+    }
+
+    /// Persist a view's definition (after a `CREATE [OR REPLACE] VIEW`). The
+    /// relational catalog already holds it; this records the `SELECT` text so the
+    /// view survives restart. The latest record per name wins, so `OR REPLACE`
+    /// overwrites the prior definition.
+    pub fn persist_view(&self, name: &str) -> Result<()> {
+        let view_sql = self
+            .sql
+            .catalog()
+            .view(name)
+            .ok_or_else(|| prism_sql::SqlError::NoSuchTable(format!("view {name}")))?;
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Upsert,
+            kind: ObjectKind::View,
+            name: name.to_string(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+            indexes: vec![],
+            checks: vec![],
+            foreign_keys: vec![],
+            view_sql,
+        })
+    }
+
+    /// Persist every view currently in the catalog (used after a bulk restore).
+    /// Persisting is idempotent — the latest `Upsert` per name wins on reload.
+    pub fn persist_views(&self) -> Result<()> {
+        for name in self.sql.catalog().view_names() {
+            self.persist_view(&name)?;
+        }
+        Ok(())
+    }
+
+    /// Persist a tombstone for a dropped view (after a `DROP VIEW`).
+    pub fn drop_view_meta(&self, name: &str) -> Result<()> {
+        self.persist_entry(&CatalogEntry {
+            op: CatalogOp::Delete,
+            kind: ObjectKind::View,
+            name: name.to_string(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+            indexes: vec![],
+            checks: vec![],
+            foreign_keys: vec![],
+            view_sql: String::new(),
+        })
     }
 
     /// Drop a document collection: persist a tombstone and forget its mapping,
@@ -606,6 +663,7 @@ impl Database {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         })?;
         self.doc_heaps
             .lock()
@@ -636,6 +694,7 @@ impl Database {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         })?;
         self.kv_namespaces
             .lock()
@@ -735,6 +794,13 @@ impl Database {
                     let ns = KvNamespace::open(self.store.clone(), heap, PageId(entry.root_page));
                     kv_namespaces.insert(entry.name, Arc::new(ns));
                     next_kv = next_kv.max(entry.heap + 1);
+                }
+                ObjectKind::View => {
+                    // A view owns no heap; restore its definition into the SQL
+                    // catalog so references expand after restart.
+                    self.sql
+                        .catalog()
+                        .register_view(&entry.name, entry.view_sql);
                 }
             }
         }

@@ -23,8 +23,16 @@ What the shipping engine accepts today. This mirrors the `prism-sql` crate-level
 doc comment, which is kept authoritative.
 
 **DDL & DML**
-- `CREATE TABLE` (with `PRIMARY KEY`, `NOT NULL`, `UNIQUE`), `ALTER TABLE`
-  (add / drop / rename column, rename table), `DROP TABLE`.
+- `CREATE TABLE` with constraints: `PRIMARY KEY`, `NOT NULL`, `UNIQUE`, literal
+  `DEFAULT`, column- or table-level `CHECK (…)` (enforced on `INSERT`/`UPDATE`),
+  and `FOREIGN KEY`/`REFERENCES` (child checked on `INSERT`/`UPDATE`, parent
+  `RESTRICT` on `DELETE`). `ALTER TABLE` (add / drop / rename column, rename
+  table), `DROP TABLE`.
+- `CREATE [OR REPLACE] VIEW v AS <query>` / `DROP VIEW [IF EXISTS] v` — logical
+  views. The view's `SELECT` text is stored in the catalog and expanded into a
+  derived subquery wherever the view is referenced (so views may build on other
+  views; a cyclic definition is caught by a depth limit). Materialized views and
+  an explicit view column list (`CREATE VIEW v (a, b) AS …`) are deferred.
 - `CREATE [UNIQUE] INDEX name ON t (c, …)` / `DROP INDEX` — secondary B+tree
   indexes over one **or more** columns, `UNIQUE` or non-unique. `UNIQUE` is
   enforced on `INSERT`/`UPDATE`; both can serve equality seeks.
@@ -54,6 +62,12 @@ with `UNION` / `INTERSECT` / `EXCEPT` (each `ALL` or distinct; the outer
   Uncorrelated subqueries run once up front; **`WHERE` subqueries may be
   correlated** (re-evaluated per outer row by decorrelation). Correlated
   subqueries *outside* `WHERE` (e.g. in the select list) are deferred.
+- **CTEs:** non-recursive `WITH a AS (…) [, b AS (…)] …`, inlined as derived
+  tables (recursive CTEs are deferred).
+- **Window functions:** `ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD` and the
+  aggregates `SUM`/`COUNT`/`AVG`/`MIN`/`MAX` over
+  `OVER (PARTITION BY … ORDER BY …)`, one value per row. Aggregate windows cover
+  the whole partition; explicit frame clauses (`ROWS`/`RANGE …`) are deferred.
 
 **Expressions** — arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
 `IS [NOT] NULL`, `[NOT] IN (…)`, `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`),

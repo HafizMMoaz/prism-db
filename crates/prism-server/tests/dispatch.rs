@@ -468,6 +468,30 @@ fn show_tables_works_on_an_embedded_session() {
 }
 
 #[test]
+fn show_views_lists_defined_views() {
+    let (db, _tmp) = database();
+    let mut s = Session::new(db);
+    s.handle(sql("CREATE TABLE a (id BIGINT PRIMARY KEY)"));
+    s.handle(sql("CREATE VIEW v1 AS SELECT id FROM a"));
+    s.handle(sql("CREATE VIEW v2 AS SELECT id FROM a WHERE id > 0"));
+    match s.handle(sql("SHOW VIEWS")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => {
+            let names: Vec<_> = rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Some(WireValue::Str(s)) => s.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(names, vec!["v1", "v2"]);
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn doc_count_over_the_wire() {
     let (db, _tmp) = database();
     let mut s = Session::new(db);

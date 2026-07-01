@@ -104,6 +104,18 @@ Every object has a 64-bit OID, allocated from a single global sequence. OIDs are
 | index_kind | INT8 | 1=btree, 2=hash |
 | heap_root_page | INT64 | physical location |
 
+### `_prism_views`
+A logical view owns no heap: only its defining query is stored, and it is
+expanded into a derived subquery wherever referenced.
+
+| Column | Type | Description |
+|---|---|---|
+| oid | INT64 | primary key |
+| name | TEXT | |
+| owner | INT64 | user OID |
+| created_at | TIMESTAMP | |
+| definition | TEXT | the view's `SELECT` text |
+
 ### `_prism_users`
 | Column | Type | Description |
 |---|---|---|

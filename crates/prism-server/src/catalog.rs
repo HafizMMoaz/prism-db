@@ -25,6 +25,8 @@ pub enum ObjectKind {
     Collection,
     /// A KV namespace.
     Namespace,
+    /// A logical view (carries its `SELECT` text in `view_sql`).
+    View,
 }
 
 impl ObjectKind {
@@ -33,6 +35,7 @@ impl ObjectKind {
             ObjectKind::Table => 1,
             ObjectKind::Collection => 2,
             ObjectKind::Namespace => 3,
+            ObjectKind::View => 4,
         }
     }
     fn from_code(v: u8) -> Result<Self> {
@@ -40,6 +43,7 @@ impl ObjectKind {
             1 => Ok(ObjectKind::Table),
             2 => Ok(ObjectKind::Collection),
             3 => Ok(ObjectKind::Namespace),
+            4 => Ok(ObjectKind::View),
             other => Err(ServerError::Corrupt(format!("bad object kind {other}"))),
         }
     }
@@ -112,6 +116,8 @@ pub struct CatalogEntry {
     pub checks: Vec<String>,
     /// `FOREIGN KEY` constraints (tables only; empty otherwise).
     pub foreign_keys: Vec<ForeignKey>,
+    /// A view's `SELECT` text (views only; empty otherwise).
+    pub view_sql: String,
 }
 
 impl CatalogEntry {
@@ -207,6 +213,9 @@ impl CatalogEntry {
                 w.put_u16(c as u16);
             }
         }
+        // A view's SELECT text follows the foreign keys (empty for non-views, and
+        // absent entirely in records written before views existed).
+        w.put_str_u16("catalog.view_sql", &self.view_sql)?;
         Ok(w.into_vec())
     }
 
@@ -310,6 +319,12 @@ impl CatalogEntry {
             }
             v
         };
+        // A view's SELECT text follows the foreign keys; absent in older records.
+        let view_sql = if r.is_empty() {
+            String::new()
+        } else {
+            r.get_str_u16("catalog.view_sql")?
+        };
         Ok(Self {
             op,
             kind,
@@ -321,6 +336,7 @@ impl CatalogEntry {
             indexes,
             checks,
             foreign_keys,
+            view_sql,
         })
     }
 }
@@ -532,6 +548,7 @@ mod tests {
                 ref_table: "owners".into(),
                 ref_columns: vec![0],
             }],
+            view_sql: String::new(),
         };
         let decoded = CatalogEntry::decode(&table.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
@@ -567,6 +584,7 @@ mod tests {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         };
         let decoded = CatalogEntry::decode(&ns.encode().unwrap()).unwrap();
         assert_eq!(decoded.op, CatalogOp::Delete);
@@ -575,6 +593,25 @@ mod tests {
         assert_eq!(decoded.root_page, 77);
         assert_eq!(decoded.primary_key, None);
         assert!(decoded.columns.is_empty());
+
+        let view = CatalogEntry {
+            op: CatalogOp::Upsert,
+            kind: ObjectKind::View,
+            name: "active_accounts".into(),
+            heap: 0,
+            root_page: 0,
+            primary_key: None,
+            columns: vec![],
+            indexes: vec![],
+            checks: vec![],
+            foreign_keys: vec![],
+            view_sql: "SELECT * FROM accounts WHERE id > 0".into(),
+        };
+        let decoded = CatalogEntry::decode(&view.encode().unwrap()).unwrap();
+        assert_eq!(decoded.op, CatalogOp::Upsert);
+        assert_eq!(decoded.kind, ObjectKind::View);
+        assert_eq!(decoded.name, "active_accounts");
+        assert_eq!(decoded.view_sql, "SELECT * FROM accounts WHERE id > 0");
     }
 
     #[test]
@@ -591,13 +628,14 @@ mod tests {
             indexes: vec![],
             checks: vec![],
             foreign_keys: vec![],
+            view_sql: String::new(),
         }
         .encode()
         .unwrap();
         // The original create-only format ended after the columns; drop the
         // trailing op byte and the (empty) index / default / check / foreign-key
-        // count u16s that now follow it.
-        bytes.truncate(bytes.len() - 9);
+        // count u16s and the (empty) view-text length u16 that now follow it.
+        bytes.truncate(bytes.len() - 11);
         let decoded = CatalogEntry::decode(&bytes).unwrap();
         assert_eq!(decoded.op, CatalogOp::Upsert);
         assert_eq!(decoded.name, "t");

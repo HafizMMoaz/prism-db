@@ -43,7 +43,11 @@
 //! `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and derived
 //! tables `FROM (SELECT …) AS alias`; uncorrelated ones run once up front, and
 //! `WHERE` subqueries may be correlated (run per outer row). Non-recursive CTEs
-//! (`WITH a AS (…) …`) are inlined as derived tables. Window functions
+//! (`WITH a AS (…) …`) are inlined as derived tables. Logical views
+//! (`CREATE [OR REPLACE] VIEW v AS <query>` / `DROP VIEW [IF EXISTS] v`) store
+//! their `SELECT` text and expand into a derived subquery wherever referenced
+//! (materialized views and an explicit view column list are not supported).
+//! Window functions
 //! (`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`LAG`/`LEAD` and `SUM`/`COUNT`/`AVG`/`MIN`/
 //! `MAX` over `OVER (PARTITION BY … ORDER BY …)`) yield one value per row;
 //! aggregate windows cover the whole partition (no running frame). Deferred:
@@ -72,7 +76,7 @@ use prism_index::BTree;
 use sqlparser::ast::{
     AlterTableOperation, Assignment, AssignmentTarget, BinaryOperator, CeilFloorKind, ColumnDef,
     ColumnOption, ColumnOptionDef, DataType, DateTimeField, Delete, Distinct, DuplicateTreatment,
-    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
+    Expr, FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, ObjectName, ObjectType, OrderByExpr, Query, Select, SelectItem,
     SetExpr, SetOperator, SetQuantifier, Statement, TableAlias, TableConstraint, TableFactor,
     TableObject, TableWithJoins, UnaryOperator, Value as SqlValue, WindowType,
@@ -82,6 +86,10 @@ use sqlparser::parser::Parser;
 
 /// The base heap id for relational tables (kept disjoint from other models).
 const FIRST_TABLE_HEAP: u64 = 1000;
+
+/// The maximum view-reference nesting depth expanded before giving up. Guards
+/// against a cyclic view definition (e.g. two views referencing each other).
+const MAX_VIEW_DEPTH: usize = 64;
 
 /// The result of executing one statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -132,6 +140,16 @@ pub enum Outcome {
     DropIndex {
         /// The table the index belonged to.
         table: String,
+    },
+    /// A `CREATE VIEW` defined (or replaced) a view.
+    CreateView {
+        /// The view's name (for persisting its definition).
+        name: String,
+    },
+    /// A `DROP VIEW` removed a view.
+    DropView {
+        /// The dropped view's name (for catalog tombstoning).
+        name: String,
     },
 }
 
@@ -184,6 +202,14 @@ impl SqlEngine {
         }
         match stmts.pop().unwrap() {
             Statement::CreateTable(ct) => self.exec_create_table(ct),
+            Statement::CreateView {
+                or_replace,
+                materialized,
+                name,
+                columns,
+                query,
+                ..
+            } => self.exec_create_view(or_replace, materialized, name, columns, *query),
             Statement::CreateIndex(ci) => self.exec_create_index(txn, ci),
             Statement::Insert(ins) => self.exec_insert(txn, ins),
             Statement::Query(q) => self.exec_select(txn, *q),
@@ -238,6 +264,13 @@ impl SqlEngine {
                 Err(_) if if_exists => Ok(Outcome::DropIndex {
                     table: String::new(),
                 }),
+                Err(e) => Err(e),
+            },
+            ObjectType::View => match self.catalog.drop_view(&name) {
+                Ok(()) => Ok(Outcome::DropView { name }),
+                // `IF EXISTS` makes a missing view a no-op (still reported so the
+                // server can persist an idempotent tombstone).
+                Err(SqlError::NoSuchTable(_)) if if_exists => Ok(Outcome::DropView { name }),
                 Err(e) => Err(e),
             },
             other => Err(SqlError::Unsupported(format!("DROP {other}"))),
@@ -645,6 +678,127 @@ impl SqlEngine {
         Ok(Outcome::CreateTable)
     }
 
+    /// `CREATE [OR REPLACE] VIEW <name> AS <query>`. A view is logical: its
+    /// `SELECT` text is stored in the catalog and expanded into a derived subquery
+    /// wherever the view is referenced. Materialized views and an explicit column
+    /// list (`CREATE VIEW v (a, b) AS …`) are not supported yet.
+    fn exec_create_view(
+        &self,
+        or_replace: bool,
+        materialized: bool,
+        name: ObjectName,
+        columns: Vec<sqlparser::ast::ViewColumnDef>,
+        query: Query,
+    ) -> Result<Outcome> {
+        if materialized {
+            return Err(SqlError::Unsupported("materialized views".into()));
+        }
+        if !columns.is_empty() {
+            return Err(SqlError::Unsupported(
+                "CREATE VIEW with an explicit column list".into(),
+            ));
+        }
+        let name = object_name(&name);
+        // Store the query as normalized text; it is re-parsed and expanded on use.
+        let sql = query.to_string();
+        self.catalog.create_view(&name, sql, or_replace)?;
+        Ok(Outcome::CreateView { name })
+    }
+
+    /// Replace every view reference in `body` with the view's definition as a
+    /// derived subquery, recursively (so a view may build on other views). A
+    /// view is fully expanded in place — its own CTEs and nested views are
+    /// resolved here — so the result contains no view references and re-running
+    /// the executor over a derived subquery does not re-trigger expansion.
+    fn expand_views(&self, body: &mut SetExpr, depth: usize) -> Result<()> {
+        match body {
+            SetExpr::Select(s) => {
+                for twj in &mut s.from {
+                    self.expand_view_factor(&mut twj.relation, depth)?;
+                    for join in &mut twj.joins {
+                        self.expand_view_factor(&mut join.relation, depth)?;
+                    }
+                }
+                if let Some(e) = &mut s.selection {
+                    self.expand_view_expr(e, depth)?;
+                }
+                if let Some(e) = &mut s.having {
+                    self.expand_view_expr(e, depth)?;
+                }
+                for item in &mut s.projection {
+                    if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } =
+                        item
+                    {
+                        self.expand_view_expr(e, depth)?;
+                    }
+                }
+            }
+            SetExpr::Query(q) => self.expand_views(&mut q.body, depth)?,
+            SetExpr::SetOperation { left, right, .. } => {
+                self.expand_views(left, depth)?;
+                self.expand_views(right, depth)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Expand a single `FROM`/`JOIN` factor: if it names a view, swap it for the
+    /// view's definition as a derived table (keeping any caller-supplied alias,
+    /// else using the view name as the qualifier). Recurses into derived tables.
+    fn expand_view_factor(&self, factor: &mut TableFactor, depth: usize) -> Result<()> {
+        match factor {
+            TableFactor::Table { name, alias, .. } => {
+                let key = object_name(name);
+                if let Some(sql) = self.catalog.view(&key) {
+                    if depth >= MAX_VIEW_DEPTH {
+                        return Err(SqlError::Unsupported(format!(
+                            "view {key} is nested too deeply (cyclic view definition?)"
+                        )));
+                    }
+                    let mut q = parse_query(&sql)?;
+                    if q.with.is_some() {
+                        expand_ctes(&mut q);
+                    }
+                    self.expand_views(&mut q.body, depth + 1)?;
+                    let use_alias = alias.clone().unwrap_or_else(|| TableAlias {
+                        name: Ident::new(key),
+                        columns: Vec::new(),
+                    });
+                    *factor = TableFactor::Derived {
+                        lateral: false,
+                        subquery: Box::new(q),
+                        alias: Some(use_alias),
+                    };
+                }
+            }
+            TableFactor::Derived { subquery, .. } => {
+                self.expand_views(&mut subquery.body, depth)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Expand views inside an expression's subqueries (scalar `(SELECT …)`,
+    /// `[NOT] IN (SELECT …)`, `[NOT] EXISTS (…)`).
+    fn expand_view_expr(&self, e: &mut Expr, depth: usize) -> Result<()> {
+        match e {
+            Expr::Subquery(q) | Expr::Exists { subquery: q, .. } => {
+                self.expand_views(&mut q.body, depth)
+            }
+            Expr::InSubquery { subquery, .. } => self.expand_views(&mut subquery.body, depth),
+            Expr::Nested(inner) | Expr::UnaryOp { expr: inner, .. } => {
+                self.expand_view_expr(inner, depth)
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                self.expand_view_expr(left, depth)?;
+                self.expand_view_expr(right, depth)
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Open the primary-key index tree for `table`, if it has one.
     fn pk_index(&self, table: &Table) -> Option<BTree> {
         match (table.primary_key, table.index_root) {
@@ -828,6 +982,9 @@ impl SqlEngine {
         if query.with.is_some() {
             expand_ctes(&mut query);
         }
+        // Replace any view reference in the (CTE-expanded) tree with the view's
+        // definition as a derived subquery.
+        self.expand_views(&mut query.body, 0)?;
         match query.body.as_ref() {
             SetExpr::Select(_) => self.exec_simple_select(txn, &query),
             SetExpr::Query(inner) => self.exec_select(txn, (**inner).clone()),
@@ -4824,6 +4981,18 @@ fn parse_checks(table: &Table) -> Result<Vec<Expr>> {
     table.checks.iter().map(|t| parse_predicate(t)).collect()
 }
 
+/// Parse a stored view definition (a `SELECT`/`WITH` query) into a `Query`.
+fn parse_query(sql: &str) -> Result<Query> {
+    let stmts =
+        Parser::parse_sql(&GenericDialect {}, sql).map_err(|e| SqlError::Parse(e.to_string()))?;
+    match stmts.into_iter().next() {
+        Some(Statement::Query(q)) => Ok(*q),
+        _ => Err(SqlError::Parse(format!(
+            "view definition is not a query: {sql}"
+        ))),
+    }
+}
+
 /// Parse a standalone predicate (e.g. a stored `CHECK` text) into an `Expr` by
 /// parsing it as the projection of a trivial `SELECT`.
 fn parse_predicate(text: &str) -> Result<Expr> {
@@ -7788,5 +7957,156 @@ mod tests {
                 .execute_autocommit("CREATE TABLE bad (id BIGINT, r BIGINT REFERENCES nope(id))")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn views() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT, label TEXT)")
+            .unwrap();
+        env.engine
+            .execute_autocommit(
+                "INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'a'), (4, 40, 'b')",
+            )
+            .unwrap();
+
+        // A view filtering and projecting the base table.
+        assert_eq!(
+            env.engine
+                .execute_autocommit("CREATE VIEW big AS SELECT id, n FROM t WHERE n >= 30")
+                .unwrap(),
+            Outcome::CreateView { name: "big".into() }
+        );
+        // Selecting from the view returns the filtered rows.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id, n FROM big ORDER BY id")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Int64(3), Value::Int64(30)],
+                vec![Value::Int64(4), Value::Int64(40)],
+            ]
+        );
+        // A WHERE on top of the view, and a qualified column reference, both work.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT big.n FROM big WHERE big.id = 4")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(40)]]
+        );
+
+        // A view can build on another view.
+        env.engine
+            .execute_autocommit("CREATE VIEW biggest AS SELECT id FROM big WHERE n = 40")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT id FROM biggest")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(4)]]
+        );
+
+        // A view over an aggregate query.
+        env.engine
+            .execute_autocommit(
+                "CREATE VIEW by_label AS SELECT label, COUNT(*) AS c FROM t GROUP BY label",
+            )
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT label, c FROM by_label ORDER BY label")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::Text("a".into()), Value::Int64(2)],
+                vec![Value::Text("b".into()), Value::Int64(2)],
+            ]
+        );
+
+        // A view participates in a JOIN, with an alias.
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit(
+                        "SELECT v.label, v.c FROM by_label v JOIN t ON t.label = v.label \
+                         WHERE t.id = 1",
+                    )
+                    .unwrap()
+            ),
+            vec![vec![Value::Text("a".into()), Value::Int64(2)]]
+        );
+
+        // CREATE VIEW without OR REPLACE rejects a duplicate name.
+        assert!(
+            env.engine
+                .execute_autocommit("CREATE VIEW big AS SELECT id FROM t")
+                .is_err()
+        );
+        // OR REPLACE redefines it.
+        env.engine
+            .execute_autocommit("CREATE OR REPLACE VIEW big AS SELECT id, n FROM t WHERE n >= 20")
+            .unwrap();
+        assert_eq!(
+            rows(
+                env.engine
+                    .execute_autocommit("SELECT COUNT(*) FROM big")
+                    .unwrap()
+            ),
+            vec![vec![Value::Int64(3)]]
+        );
+
+        // A view name may not collide with a table.
+        assert!(
+            env.engine
+                .execute_autocommit("CREATE VIEW t AS SELECT id FROM t")
+                .is_err()
+        );
+
+        // DROP VIEW removes it; a later reference fails.
+        assert_eq!(
+            env.engine.execute_autocommit("DROP VIEW biggest").unwrap(),
+            Outcome::DropView {
+                name: "biggest".into()
+            }
+        );
+        assert!(
+            env.engine
+                .execute_autocommit("SELECT * FROM biggest")
+                .is_err()
+        );
+        // DROP VIEW IF EXISTS on a missing view is a no-op.
+        env.engine
+            .execute_autocommit("DROP VIEW IF EXISTS biggest")
+            .unwrap();
+        // DROP VIEW on a missing view (no IF EXISTS) errors.
+        assert!(env.engine.execute_autocommit("DROP VIEW nope").is_err());
+    }
+
+    #[test]
+    fn cyclic_views_are_rejected() {
+        let env = env();
+        env.engine
+            .execute_autocommit("CREATE TABLE t (id BIGINT PRIMARY KEY)")
+            .unwrap();
+        // Build a cycle: a → b → a (allowed at create time, caught on use).
+        env.engine
+            .execute_autocommit("CREATE VIEW a AS SELECT id FROM t")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE OR REPLACE VIEW b AS SELECT id FROM a")
+            .unwrap();
+        env.engine
+            .execute_autocommit("CREATE OR REPLACE VIEW a AS SELECT id FROM b")
+            .unwrap();
+        // Expanding the cycle hits the depth limit rather than looping forever.
+        assert!(env.engine.execute_autocommit("SELECT id FROM a").is_err());
     }
 }

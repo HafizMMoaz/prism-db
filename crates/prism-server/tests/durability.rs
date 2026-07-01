@@ -245,6 +245,50 @@ fn foreign_keys_survive_restart() {
 }
 
 #[test]
+fn views_survive_restart() {
+    let tmp = TempDir::new("durability_views").unwrap();
+
+    // ---- Session 1: a table, some rows, and a view over them; then close. ----
+    {
+        let db = Arc::new(Database::open(tmp.path()).unwrap());
+        let mut s = Session::new(db.clone());
+        s.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY, n BIGINT)"));
+        s.handle(sql("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"));
+        s.handle(sql("CREATE VIEW big AS SELECT id, n FROM t WHERE n >= 20"));
+        drop(s);
+        drop(db);
+    }
+
+    // ---- Session 2: reopen; the view's definition was recovered from the
+    // catalog, so it still expands and returns the filtered rows. ----
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    match s.handle(sql("SELECT id, n FROM big ORDER BY id")) {
+        Message::SqlResult {
+            status: 0, rows, ..
+        } => {
+            assert_eq!(rows.len(), 2, "view returns the two matching rows");
+            assert_eq!(rows[0][0], Some(WireValue::Int64(2)));
+            assert_eq!(rows[1][0], Some(WireValue::Int64(3)));
+        }
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+    // Dropping the view persists a tombstone, so it stays gone across restart.
+    match s.handle(sql("DROP VIEW big")) {
+        Message::SqlResult { status: 0, .. } => {}
+        other => panic!("expected ok SqlResult, got {other:?}"),
+    }
+    drop(s);
+
+    let db = Arc::new(Database::open(tmp.path()).unwrap());
+    let mut s = Session::new(db);
+    match s.handle(sql("SELECT * FROM big")) {
+        Message::SqlResult { status, .. } => assert_ne!(status, 0, "dropped view stays dropped"),
+        other => panic!("expected SqlResult, got {other:?}"),
+    }
+}
+
+#[test]
 fn checkpoint_then_more_writes_all_survive_durable_restart() {
     // A durable database: write, checkpoint (flush to disk), write more, then
     // reopen. Both the checkpointed and the post-checkpoint data must be there.

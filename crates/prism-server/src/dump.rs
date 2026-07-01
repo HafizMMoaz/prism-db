@@ -67,6 +67,14 @@ fn export_body(db: &Database, txn: &prism_core::txn::TxnHandle, out: &mut String
         }
     }
 
+    // ---- views (after tables, which they may reference) ----
+    for name in catalog.view_names() {
+        if let Some(sql) = catalog.view(&name) {
+            writeln!(out, "\n-- view: {name}").ok();
+            writeln!(out, "CREATE VIEW {name} AS {sql};").ok();
+        }
+    }
+
     // ---- document collections ----
     for name in db.collection_names() {
         writeln!(out, "\n-- collection: {name}").ok();
@@ -98,6 +106,7 @@ pub fn import(db: &Database, dump: &str) -> Result<ImportStats> {
         Ok(()) => {
             txn.commit()?;
             db.persist_sql_tables()?;
+            db.persist_views()?;
             db.checkpoint()?;
             Ok(stats)
         }
