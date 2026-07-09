@@ -9,7 +9,7 @@
     <NoWarn>CS1591</NoWarn>
 
     <PackageId>PrismDb.Client</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>The Prism authors</Authors>
     <Description>Pure-C# client for PrismDB over the binary wire protocol (no native build).</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>

@@ -1,6 +1,6 @@
 {
   "name": "@prismdb/client",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Pure-TypeScript client for PrismDB over the binary wire protocol (no native build).",
   "license": "Apache-2.0",
   "author": "The Prism authors",

@@ -26,7 +26,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -38,20 +38,20 @@ authors = ["The Prism authors"]
 # an explicit version alongside its path: the path drives local builds, the
 # version keeps the deps concrete (not wildcards) for tooling and publishing.
 [workspace.dependencies]
-prism-storage = { path = "crates/prism-storage", version = "0.1.0" }
-prism-wal = { path = "crates/prism-wal", version = "0.1.0" }
-prism-buffer = { path = "crates/prism-buffer", version = "0.1.0" }
-prism-core = { path = "crates/prism-core", version = "0.1.0" }
-prism-index = { path = "crates/prism-index", version = "0.1.0" }
-prism-sql = { path = "crates/prism-sql", version = "0.1.0" }
-prism-doc = { path = "crates/prism-doc", version = "0.1.0" }
-prism-kv = { path = "crates/prism-kv", version = "0.1.0" }
-prism-protocol = { path = "crates/prism-protocol", version = "0.1.0" }
-prism-server = { path = "crates/prism-server", version = "0.1.0" }
-prism-client = { path = "crates/prism-client", version = "0.1.0" }
-prism-shell = { path = "crates/prism-shell", version = "0.1.0" }
-prism-fsck = { path = "crates/prism-fsck", version = "0.1.0" }
-prism-testkit = { path = "crates/prism-testkit", version = "0.1.0" }
+prism-storage = { path = "crates/prism-storage", version = "0.2.0" }
+prism-wal = { path = "crates/prism-wal", version = "0.2.0" }
+prism-buffer = { path = "crates/prism-buffer", version = "0.2.0" }
+prism-core = { path = "crates/prism-core", version = "0.2.0" }
+prism-index = { path = "crates/prism-index", version = "0.2.0" }
+prism-sql = { path = "crates/prism-sql", version = "0.2.0" }
+prism-doc = { path = "crates/prism-doc", version = "0.2.0" }
+prism-kv = { path = "crates/prism-kv", version = "0.2.0" }
+prism-protocol = { path = "crates/prism-protocol", version = "0.2.0" }
+prism-server = { path = "crates/prism-server", version = "0.2.0" }
+prism-client = { path = "crates/prism-client", version = "0.2.0" }
+prism-shell = { path = "crates/prism-shell", version = "0.2.0" }
+prism-fsck = { path = "crates/prism-fsck", version = "0.2.0" }
+prism-testkit = { path = "crates/prism-testkit", version = "0.2.0" }
 
 # Shared external crates are pre-staged here so versions stay consistent across
 # the workspace. They are NOT downloaded until a member actually depends on one,
