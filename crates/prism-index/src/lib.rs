@@ -1,4 +1,4 @@
-//! `prism-index` — access methods that are not heap scan.
+//! `prism-index` - access methods that are not heap scan.
 //!
 //! The ordered [`BTree`] (point + range) and, later, the extendible hash index.
 //! Both map a key space to `RecordId` and live in pages fetched through the

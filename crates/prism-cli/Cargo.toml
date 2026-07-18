@@ -1,6 +1,6 @@
 [package]
 name = "prismdb"
-description = "PrismDB command-line tools: the prismd server, the prism-shell client, and the fsck/dump utilities — one install, all binaries."
+description = "PrismDB command-line tools: the prismd server, the prism-shell client, and the fsck/dump utilities - one install, all binaries."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -24,7 +24,7 @@ eula = false
 # Debian/Ubuntu package (cargo-deb). Asset source paths are relative to this
 # crate dir; `../../` reaches the workspace root. The systemd unit + config are
 # installed and the service is enabled/started by explicit maintainer scripts
-# (deploy/debian/) — the unit uses DynamicUser, so no package account is needed.
+# (deploy/debian/) - the unit uses DynamicUser, so no package account is needed.
 # Built in .github/workflows/linux-packages.yml.
 [package.metadata.deb]
 maintainer = "The Prism authors <hafizmoazkhalid@gmail.com>"

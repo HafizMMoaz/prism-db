@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Last updated:** 2026-05-15
 
-Operators need to know what the server is doing. This document describes the three pillars — logs, metrics, traces — and the conventions for each.
+Operators need to know what the server is doing. This document describes the three pillars - logs, metrics, traces - and the conventions for each.
 
 ## Logging
 
@@ -169,9 +169,9 @@ OTLP/gRPC export to a configurable collector. The server does not bundle a traci
 
 The metrics port also exposes:
 
-- `GET /healthz` — returns 200 if the server is accepting connections; 503 during startup recovery or shutdown.
-- `GET /readyz` — returns 200 if recovery has completed and the server is fully ready.
-- `GET /metrics` — Prometheus exposition.
+- `GET /healthz` - returns 200 if the server is accepting connections; 503 during startup recovery or shutdown.
+- `GET /readyz` - returns 200 if recovery has completed and the server is fully ready.
+- `GET /metrics` - Prometheus exposition.
 
 These are deliberate, narrow endpoints suitable for load balancer probes and orchestration. They do not require authentication.
 
@@ -198,8 +198,8 @@ These reports are the artifact users send when filing bugs.
 
 Built-in `pprof` endpoints on the metrics port:
 
-- `GET /debug/pprof/profile?seconds=30` — CPU profile.
-- `GET /debug/pprof/heap` — allocation snapshot (if `dhat` feature is built in).
+- `GET /debug/pprof/profile?seconds=30` - CPU profile.
+- `GET /debug/pprof/heap` - allocation snapshot (if `dhat` feature is built in).
 
 Disabled by default in release builds; enabled with `--profiling-endpoint=on` flag. Reading the endpoint requires the `OPERATOR` role token.
 
@@ -228,9 +228,9 @@ sample_ratio = 0.01
 
 ## References
 
-- `components/network-server.md` — metrics emitted there.
-- `components/wal.md` — WAL-specific metrics.
-- `operations/build-and-dev.md` — how to enable verbose logging in dev.
+- `components/network-server.md` - metrics emitted there.
+- `components/wal.md` - WAL-specific metrics.
+- `operations/build-and-dev.md` - how to enable verbose logging in dev.
 - `tracing` crate: https://tracing.rs
 - `metrics` crate: https://docs.rs/metrics
 - OpenTelemetry: https://opentelemetry.io

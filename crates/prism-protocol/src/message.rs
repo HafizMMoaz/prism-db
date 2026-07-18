@@ -1,9 +1,9 @@
 //! The protocol messages and the packet (header + body) codec.
 //!
 //! Covers the full message set from `docs/specs/wire-protocol.md`: the session
-//! and transaction control plane — the handshake (`Hello`/`Auth` and their
+//! and transaction control plane - the handshake (`Hello`/`Auth` and their
 //! acks), transaction control (`Begin`/`Commit`/`Abort`/`TxnAck`), cancellation,
-//! notices, keep-alive (`Ping`/`Pong`) — and the query data plane
+//! notices, keep-alive (`Ping`/`Pong`) - and the query data plane
 //! (`SqlExecute`/`SqlResult`, `DocOp`/`DocResult`, `KvOp`/`KvResult`), whose
 //! op-specific bodies and value types live in [`crate::data`].
 
@@ -93,7 +93,7 @@ impl TryFrom<u8> for MessageType {
 pub enum AuthMechanism {
     /// Username + password.
     Password,
-    /// Mutual TLS — the certificate is presented at the TLS layer; only the
+    /// Mutual TLS - the certificate is presented at the TLS layer; only the
     /// username travels in the message body.
     Mtls,
 }
@@ -809,7 +809,7 @@ impl Message {
 }
 
 /// A full protocol packet: a `request_id` plus a [`Message`]. This is the unit
-/// the spec calls a "payload" — the 12-byte common header followed by the
+/// the spec calls a "payload" - the 12-byte common header followed by the
 /// message-specific body. Frame it with [`frame::encode`] to put it on the wire.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Packet {

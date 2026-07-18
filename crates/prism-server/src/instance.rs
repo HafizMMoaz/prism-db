@@ -66,7 +66,7 @@ impl Instance {
     }
 
     /// Validate a database name: non-empty, only `[A-Za-z0-9_-]`, not the
-    /// reserved system name — so it can never traverse out of the data root.
+    /// reserved system name - so it can never traverse out of the data root.
     fn validate(name: &str) -> Result<()> {
         if name.is_empty() {
             return Err(ServerError::State("database name is empty".into()));
@@ -263,7 +263,7 @@ mod tests {
             let inst = Instance::open_with(tmp.path(), Config::default()).unwrap();
             inst.create_database("a").unwrap();
             inst.create_database("b").unwrap();
-            // Same table name in two databases — independent data.
+            // Same table name in two databases - independent data.
             let a = inst.database("a").unwrap();
             let b = inst.database("b").unwrap();
             a.sql()

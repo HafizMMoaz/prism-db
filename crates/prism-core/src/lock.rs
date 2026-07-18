@@ -1,4 +1,4 @@
-//! The lock manager — per-RID write locks with deadlock detection.
+//! The lock manager - per-RID write locks with deadlock detection.
 //!
 //! Under MVCC snapshot isolation, readers never lock; only writers do. A writer
 //! takes an exclusive lock on a [`RecordId`] before modifying it and holds it
@@ -10,7 +10,7 @@
 //! its wait-for edge and check whether that completes a cycle; if so, the
 //! arriving transaction is the victim and gets [`CoreError::Deadlock`]. A cycle
 //! is only ever completed by its final edge, so checking at each wait is
-//! complete — and detection is immediate, with no background thread.
+//! complete - and detection is immediate, with no background thread.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Condvar, Mutex};

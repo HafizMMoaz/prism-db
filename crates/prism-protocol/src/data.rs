@@ -4,14 +4,14 @@
 //! with the same type tags as document fields (`docs/specs/record-format.md`).
 //! [`ColumnDesc`] and the row codec describe a SQL result set. [`DocCommand`]
 //! and [`KvCommand`]/[`KvResultBody`] are the op-specific bodies of the document
-//! and KV messages — documents, keys, and values are opaque byte strings here,
+//! and KV messages - documents, keys, and values are opaque byte strings here,
 //! decoded by the engines, not by the protocol.
 
 use crate::codec::{Reader, Writer};
 use crate::error::{ProtocolError, Result};
 
 // Value type tags (record-format.md). Array/Object/Decimal are not encoded as
-// standalone wire values in v1 — arrays/objects ride inside opaque document
+// standalone wire values in v1 - arrays/objects ride inside opaque document
 // bytes; Decimal is reserved.
 const T_NULL: u8 = 0x00;
 const T_BOOL: u8 = 0x01;
@@ -68,7 +68,7 @@ impl Value {
         }
     }
 
-    /// Encode just the value bytes (no tag) — used for SQL result cells, where
+    /// Encode just the value bytes (no tag) - used for SQL result cells, where
     /// the type comes from the column descriptor.
     pub fn encode_value(&self, w: &mut Writer) -> Result<()> {
         match self {
@@ -121,7 +121,7 @@ impl Value {
         })
     }
 
-    /// Encode a tagged value (`type_tag` byte then the value) — the wire
+    /// Encode a tagged value (`type_tag` byte then the value) - the wire
     /// `TaggedValue` used for SQL parameters.
     pub fn encode_tagged(&self, w: &mut Writer) -> Result<()> {
         w.put_u8(self.type_tag());
@@ -389,7 +389,7 @@ impl DocCommand {
     }
 }
 
-/// A document query filter on the wire — the structured form of a `{...}`
+/// A document query filter on the wire - the structured form of a `{...}`
 /// query. The server maps it to the document engine's own `Filter`; values
 /// reuse the tagged [`Value`] encoding. This is what the `query` blob of a
 /// [`DocCommand`] carries.
@@ -562,7 +562,7 @@ pub enum DocUpdateOp {
     Inc(String, i64),
 }
 
-/// A document update on the wire — an ordered list of field mutations, the
+/// A document update on the wire - an ordered list of field mutations, the
 /// structured form of a MongoDB update document. The server maps it onto the
 /// engine's `Update`. Carried as the `update` blob of an update [`DocCommand`].
 #[derive(Clone, PartialEq, Debug, Default)]

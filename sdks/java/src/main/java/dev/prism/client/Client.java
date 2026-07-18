@@ -219,7 +219,7 @@ public final class Client implements AutoCloseable {
 
     // ---- KV surface -------------------------------------------------------
 
-    /** {@code client.kv} — namespaced key/value operations. */
+    /** {@code client.kv} - namespaced key/value operations. */
     public final class Kv {
         public byte[] get(String namespace, byte[] key) {
             Writer b = new Writer();
@@ -272,7 +272,7 @@ public final class Client implements AutoCloseable {
 
     // ---- Document surface -------------------------------------------------
 
-    /** {@code client.doc} — document collection operations. */
+    /** {@code client.doc} - document collection operations. */
     public final class Doc {
         public ObjectId insertOne(String collection, Map<String, Object> document) {
             Writer b = new Writer();

@@ -34,7 +34,7 @@ Prism uses **physiological logging** and **ARIES recovery**:
 ## Alternatives considered
 
 ### Pure physical logging
-**For:** Trivial to implement — log the bytes that changed, replay the bytes.
+**For:** Trivial to implement - log the bytes that changed, replay the bytes.
 
 **Against:** Large log volume because each log record carries page byte ranges. For a small insert that adds a tuple, the log record contains the inserted bytes and the slot directory delta; physical logging would log both as raw byte changes. Physiological logging produces a smaller record describing the insert operation against the page.
 
@@ -50,7 +50,7 @@ Postgres uses logical replication on top of physical/physiological WAL for strea
 ### Simpler "no UNDO" recovery (NO-STEAL, FORCE)
 **For:** Eliminates the undo phase entirely. The buffer pool refuses to flush dirty pages of uncommitted transactions (NO-STEAL); on commit, all dirty pages are forced to disk before commit completes (FORCE).
 
-**Against:** Severely limits concurrency — long-running transactions pin pages in the buffer pool. FORCE on commit is incompatible with high throughput because every commit waits for synchronous page writes. ARIES with STEAL/NO-FORCE is the engineering standard precisely because it decouples commit latency from page write latency.
+**Against:** Severely limits concurrency - long-running transactions pin pages in the buffer pool. FORCE on commit is incompatible with high throughput because every commit waits for synchronous page writes. ARIES with STEAL/NO-FORCE is the engineering standard precisely because it decouples commit latency from page write latency.
 
 ### Single-page logging without checkpointing
 **For:** Simplest. Recovery scans the entire log on startup.
@@ -93,7 +93,7 @@ This invariant is what makes redo work: after a crash, every page on disk has a 
 
 ## Group commit
 
-`fsync` is expensive — milliseconds even on NVMe. The WAL batches concurrent commits: when transaction T calls `flush_through(L)`, the writer notes the request, waits a tiny budget (microseconds), and `fsync`s all log up to the current write pointer at once. All in-flight commits return together.
+`fsync` is expensive - milliseconds even on NVMe. The WAL batches concurrent commits: when transaction T calls `flush_through(L)`, the writer notes the request, waits a tiny budget (microseconds), and `fsync`s all log up to the current write pointer at once. All in-flight commits return together.
 
 ## Fuzzy checkpointing
 
@@ -132,6 +132,6 @@ Writers continue running throughout. Recovery starts from the last completed che
 - Mohan, Haderle, Lindsay, Pirahesh, Schwarz: "ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging." ACM TODS, 1992. The foundational paper.
 - Gray and Reuter: *Transaction Processing: Concepts and Techniques.* 1992. Chapters 9-11.
 - PostgreSQL WAL documentation.
-- ADR 0002 (page-based storage) — log records reference pages.
-- ADR 0006 (single WAL across models) — the unification depends on this design.
-- `components/recovery.md` — operational details.
+- ADR 0002 (page-based storage) - log records reference pages.
+- ADR 0006 (single WAL across models) - the unification depends on this design.
+- `components/recovery.md` - operational details.

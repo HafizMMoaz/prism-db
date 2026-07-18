@@ -1,4 +1,4 @@
-//! `prism-shell` — the interactive client REPL.
+//! `prism-shell` - the interactive client REPL.
 //!
 //! Connects to a Prism server, authenticates, and runs a read-eval-print loop:
 //! SQL statements and backslash commands (see [`prism_shell::help_text`]) go to

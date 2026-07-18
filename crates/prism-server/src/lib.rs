@@ -1,4 +1,4 @@
-//! `prism-server` — the server and the embedded in-process API.
+//! `prism-server` - the server and the embedded in-process API.
 //!
 //! This crate is the boundary between the wire protocol and the cross-model
 //! engine. [`Database`] assembles the shared storage stack (disk, WAL, buffer
@@ -12,7 +12,7 @@
 //!
 //! **Status (Phase 4 / M4, in progress):** the in-process dispatcher
 //! ([`Session`], the embedded API) plus the Tokio TCP front-end ([`Server`])
-//! that wraps it — a client can now talk to PrismDB over a socket. TLS,
+//! that wraps it - a client can now talk to PrismDB over a socket. TLS,
 //! authentication, idempotency, cancellation, and connection/transaction limits
 //! are a follow-up; see [`Session`] for the per-request simplifications and
 //! [`server`] for the deferred network features.

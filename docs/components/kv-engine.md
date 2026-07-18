@@ -59,7 +59,7 @@ The namespace has one primary index over the keys. Index entries map `key → RI
 `delete(key)`:
 1. Index lookup → RID.
 2. Mark deleted via `record_store.delete`.
-3. Remove the index entry. (Old entries pointing at the deleted version remain visible to readers with older snapshots — visibility filters them out.)
+3. Remove the index entry. (Old entries pointing at the deleted version remain visible to readers with older snapshots - visibility filters them out.)
 
 ## Conditional operations
 
@@ -118,6 +118,6 @@ default_index_kind = "hash"
 
 ## References
 
-- ADR 0005 — record format includes the KV payload format.
-- ADR 0006 — cross-model transactions work because KV uses the same record store.
-- `components/btree.md`, `components/hash-index.md` — the index choices.
+- ADR 0005 - record format includes the KV payload format.
+- ADR 0006 - cross-model transactions work because KV uses the same record store.
+- `components/btree.md`, `components/hash-index.md` - the index choices.

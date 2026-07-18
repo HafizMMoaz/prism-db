@@ -1,7 +1,7 @@
 //! CRC32 helpers for page and database-header integrity.
 //!
 //! Per `docs/specs/page-format.md`, a page's checksum covers bytes
-//! `[16, PAGE_SIZE)` — deliberately excluding the `page_lsn` (bytes `0..8`) and
+//! `[16, PAGE_SIZE)` - deliberately excluding the `page_lsn` (bytes `0..8`) and
 //! the checksum field itself (bytes `8..10`). This lets the WAL update a page's
 //! LSN in place under a write latch without recomputing the body checksum.
 

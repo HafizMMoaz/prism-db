@@ -6,7 +6,7 @@
 
 ## Purpose
 
-The catalog stores metadata about every user-visible object: tables, columns, indexes, collections, KV namespaces, users, roles, permissions. It is stored in the same engine as user data — the catalog is just a set of system tables, bootstrapped at database creation. This means catalog modifications are transactional: a `CREATE TABLE` commits like any other transaction; a crash leaves no half-created tables.
+The catalog stores metadata about every user-visible object: tables, columns, indexes, collections, KV namespaces, users, roles, permissions. It is stored in the same engine as user data - the catalog is just a set of system tables, bootstrapped at database creation. This means catalog modifications are transactional: a `CREATE TABLE` commits like any other transaction; a crash leaves no half-created tables.
 
 ## System tables
 
@@ -183,8 +183,8 @@ The catalog has no user-facing configuration. The system table layout is fixed a
 
 ## References
 
-- ADR 0006 — single TxnManager covers DDL too.
-- `components/sql-engine.md` — primary user of relational catalog.
-- `components/document-engine.md` — uses collection metadata.
-- `components/kv-engine.md` — uses namespace metadata.
+- ADR 0006 - single TxnManager covers DDL too.
+- `components/sql-engine.md` - primary user of relational catalog.
+- `components/document-engine.md` - uses collection metadata.
+- `components/kv-engine.md` - uses namespace metadata.
 - PostgreSQL `pg_class`, `pg_attribute`, `pg_index` are the inspiration.

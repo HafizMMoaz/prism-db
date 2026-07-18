@@ -72,17 +72,17 @@ impl ServerError {
     /// The wire error code (from the ranges in `docs/specs/wire-protocol.md`).
     fn error_code(&self) -> u32 {
         match self {
-            // 0x0400–0x04FF query errors (syntax, plan, type).
+            // 0x0400-0x04FF query errors (syntax, plan, type).
             ServerError::Sql(_) | ServerError::Doc(_) | ServerError::Kv(_) => 0x0400,
-            // 0x0200–0x02FF transaction errors (serialization, deadlock, …).
+            // 0x0200-0x02FF transaction errors (serialization, deadlock, …).
             ServerError::Core(_) => 0x0200,
-            // 0x0300–0x03FF storage / I/O errors.
+            // 0x0300-0x03FF storage / I/O errors.
             ServerError::Io(_) => 0x0300,
-            // 0x0001–0x00FF protocol errors.
+            // 0x0001-0x00FF protocol errors.
             ServerError::State(_) => 0x0001,
-            // 0x0100–0x01FF authentication / authorization.
+            // 0x0100-0x01FF authentication / authorization.
             ServerError::Unauthorized(_) => 0x0101,
-            // 0xFF00–0xFFFF internal / unexpected (incl. not-yet-implemented).
+            // 0xFF00-0xFFFF internal / unexpected (incl. not-yet-implemented).
             ServerError::Unsupported(_) => 0xFF01,
             ServerError::Corrupt(_) => 0xFF02,
         }

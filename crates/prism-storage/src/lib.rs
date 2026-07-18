@@ -1,4 +1,4 @@
-//! `prism-storage` — the storage foundation.
+//! `prism-storage` - the storage foundation.
 //!
 //! Owns the heap file, page read/write primitives, `fsync` semantics, the
 //! slotted-page layout, page checksumming, and platform I/O abstraction.
@@ -6,11 +6,11 @@
 //! `docs/specs/page-format.md`.
 //!
 //! The crate is organized as:
-//! - [`page`] — the on-disk page header and slotted-page operations.
-//! - [`db_header`] — page 0, the database header.
-//! - [`checksum`] — CRC32 helpers for page and header integrity.
-//! - [`disk`] — the [`DiskManager`] and the cross-platform [`IoBackend`] trait.
-//! - [`error`] — the crate error type.
+//! - [`page`] - the on-disk page header and slotted-page operations.
+//! - [`db_header`] - page 0, the database header.
+//! - [`checksum`] - CRC32 helpers for page and header integrity.
+//! - [`disk`] - the [`DiskManager`] and the cross-platform [`IoBackend`] trait.
+//! - [`error`] - the crate error type.
 
 pub mod checksum;
 pub mod db_header;

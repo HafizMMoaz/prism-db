@@ -75,7 +75,7 @@ impl Internal {
 /// the old root's contents to a new page and rewrites the fixed page as the new
 /// parent, so [`BTree::root_page`] never changes. That lets a catalog persist the
 /// root once. Every node write is WAL-logged as a full-page image (redo-only),
-/// so the tree's pages are crash-durable and rebuilt by recovery — no rescan.
+/// so the tree's pages are crash-durable and rebuilt by recovery - no rescan.
 pub struct BTree {
     buffer: Arc<BufferPool>,
     wal: Arc<Wal>,
@@ -669,7 +669,7 @@ mod tests {
             root // drop the tree/buffer/wal (crash: dirty pages never flushed)
         };
 
-        // Recover the heap from the WAL — rebuilds the tree's pages from their
+        // Recover the heap from the WAL - rebuilds the tree's pages from their
         // full-page-image records.
         let wal = Arc::new(Wal::open(&wal_path, wal_cfg).unwrap());
         {
@@ -681,7 +681,7 @@ mod tests {
         let bp =
             Arc::new(BufferPool::new(disk, wal.clone(), BufConfig { frame_count: 16 }).unwrap());
 
-        // Reopen at the fixed root — no rescan — and read everything back.
+        // Reopen at the fixed root - no rescan - and read everything back.
         let tree = BTree::open(bp, wal, root, 4);
         for i in 0..200u32 {
             assert_eq!(

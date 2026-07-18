@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# A developer tool — not shipped in releases/installers.
+# A developer tool - not shipped in releases/installers.
 [package.metadata.dist]
 dist = false
 

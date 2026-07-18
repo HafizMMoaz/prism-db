@@ -162,7 +162,7 @@ Suppose the system crashes between steps 7 and 8 of the original insert example.
 If the crash is between 8 (fsync return) and 9 (response send):
 - The commit record is on disk.
 - The client never received the response.
-- The client must retry; the operation may be replayed. This is why every external request carries an idempotency key — see the SDK API spec.
+- The client must retry; the operation may be replayed. This is why every external request carries an idempotency key - see the SDK API spec.
 
 Recovery details are in `components/recovery.md`.
 

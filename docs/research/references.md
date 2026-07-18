@@ -33,7 +33,7 @@ How Postgres got serializable. The SSI algorithm. Out of scope for Prism v1 but 
 
 **Adya. "Weak Consistency: A Generalized Theory and Optimistic Implementations for Distributed Transactions."** PhD thesis, MIT, 1999.
 
-The deepest treatment of isolation anomalies. Defines G0, G1, G2, etc. — the vocabulary Elle uses.
+The deepest treatment of isolation anomalies. Defines G0, G1, G2, etc. - the vocabulary Elle uses.
 
 ### Indexing
 
@@ -41,7 +41,7 @@ The deepest treatment of isolation anomalies. Defines G0, G1, G2, etc. — the v
 
 The B-link tree. Our B+tree concurrency model.
 
-**Fagin, Nievergelt, Pippenger, Strong. "Extendible Hashing — A Fast Access Method for Dynamic Files."** ACM TODS, September 1979.
+**Fagin, Nievergelt, Pippenger, Strong. "Extendible Hashing - A Fast Access Method for Dynamic Files."** ACM TODS, September 1979.
 
 Our hash index.
 
@@ -61,7 +61,7 @@ Why OS file caches and database buffer pools should not coexist. The reason we u
 
 ### Query execution
 
-**Graefe. "Volcano — An Extensible and Parallel Query Evaluation System."** TKDE, February 1994.
+**Graefe. "Volcano - An Extensible and Parallel Query Evaluation System."** TKDE, February 1994.
 
 The Volcano model. The execution architecture we use.
 
@@ -79,7 +79,7 @@ The honest comparison of execution models. Read before choosing between Volcano,
 
 Origin of multiversion concurrency control.
 
-**Bernstein, Goodman. "Multiversion Concurrency Control — Theory and Algorithms."** ACM TODS, December 1983.
+**Bernstein, Goodman. "Multiversion Concurrency Control - Theory and Algorithms."** ACM TODS, December 1983.
 
 The formal foundation.
 
@@ -118,14 +118,14 @@ Modern, accessible introduction to storage engines and distributed databases. Le
 The reference implementation we consult most. Open source, well-documented, mature.
 
 Useful starting points in the source:
-- `src/backend/access/transam/xlog.c` — WAL.
-- `src/backend/storage/buffer/bufmgr.c` — buffer pool.
-- `src/backend/access/nbtree/` — B-tree.
-- `src/backend/access/heap/heapam.c` — heap access methods.
-- `src/backend/utils/time/snapmgr.c` — snapshot management.
-- `src/backend/utils/cache/` — catalog cache.
+- `src/backend/access/transam/xlog.c` - WAL.
+- `src/backend/storage/buffer/bufmgr.c` - buffer pool.
+- `src/backend/access/nbtree/` - B-tree.
+- `src/backend/access/heap/heapam.c` - heap access methods.
+- `src/backend/utils/time/snapmgr.c` - snapshot management.
+- `src/backend/utils/cache/` - catalog cache.
 
-The architecture differs from Prism in many ways — Postgres has full HOT, vacuum, replication, partitioning — but the fundamentals are recognizably similar.
+The architecture differs from Prism in many ways - Postgres has full HOT, vacuum, replication, partitioning - but the fundamentals are recognizably similar.
 
 ### InnoDB (MySQL)
 
@@ -137,7 +137,7 @@ Worth studying for: doublewrite buffer as torn-write defense, clustered indexes 
 
 Single-file, single-process, no concurrency for writers. Different model entirely, but extremely well-engineered. Worth reading the source: small enough to comprehend in a weekend.
 
-Particularly the WAL mode and the rollback journal — two different recovery approaches in one codebase.
+Particularly the WAL mode and the rollback journal - two different recovery approaches in one codebase.
 
 ### TiKV
 

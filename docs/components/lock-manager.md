@@ -184,7 +184,7 @@ deadlock_detection_interval_ms = 100
 
 ## References
 
-- ADR 0004 — MVCC; reads don't lock.
-- `components/transaction-manager.md` — releases all locks on commit/abort.
-- `components/mvcc.md` — uses the lock manager for write-write conflict prevention.
+- ADR 0004 - MVCC; reads don't lock.
+- `components/transaction-manager.md` - releases all locks on commit/abort.
+- `components/mvcc.md` - uses the lock manager for write-write conflict prevention.
 - Gray and Reuter, *Transaction Processing*, chapter 8.

@@ -1,4 +1,4 @@
-//! `prism-kv` — the key-value engine.
+//! `prism-kv` - the key-value engine.
 //!
 //! Byte-string keys mapped to byte-string values, organized into namespaces. A
 //! namespace is a heap of records whose payload is `(key_len, key, value)`
@@ -8,7 +8,7 @@
 //! `docs/components/kv-engine.md`.
 //!
 //! The index is a WAL-logged [`prism_index::BTree`], so it is durable: after a
-//! restart the namespace reopens at its (fixed) root page — no scan to rebuild an
+//! restart the namespace reopens at its (fixed) root page - no scan to rebuild an
 //! in-memory map. The namespace's heap and its index root are recorded by the
 //! catalog so both are found again on open.
 //!
@@ -403,7 +403,7 @@ mod tests {
         let store = Arc::new(RecordStore::new(buffer, wal, txns.clone()));
         store.seed_heap_directory(&report.heaps);
 
-        // Reopen at the persisted index root — no rebuild scan.
+        // Reopen at the persisted index root - no rebuild scan.
         let ns = KvNamespace::open(store, heap, root);
         let reader = txns.begin(TxnMode::ReadOnly);
         assert_eq!(ns.get(&reader, b"k1").unwrap().as_deref(), Some(&b"v1"[..]));

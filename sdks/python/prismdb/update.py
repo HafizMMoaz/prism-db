@@ -29,17 +29,17 @@ class U:
 
     @staticmethod
     def set(field: str, value: Value) -> DocUpdate:
-        """``$set`` — set ``field`` to ``value``."""
+        """``$set`` - set ``field`` to ``value``."""
         return DocUpdate("set", field, value=value)
 
     @staticmethod
     def unset(field: str) -> DocUpdate:
-        """``$unset`` — remove ``field``."""
+        """``$unset`` - remove ``field``."""
         return DocUpdate("unset", field)
 
     @staticmethod
     def inc(field: str, delta: Union[int, float]) -> DocUpdate:
-        """``$inc`` — add ``delta`` to the integer ``field``."""
+        """``$inc`` - add ``delta`` to the integer ``field``."""
         return DocUpdate("inc", field, delta=int(delta))
 
 

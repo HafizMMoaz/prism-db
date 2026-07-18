@@ -1,5 +1,5 @@
 /*
- * prism.h — a pure-C client for PrismDB over the binary wire protocol.
+ * prism.h - a pure-C client for PrismDB over the binary wire protocol.
  *
  * Single-header public API; the implementation lives in prism.c. Speaks
  * docs/specs/wire-protocol.md directly over a TCP socket (Winsock on Windows,

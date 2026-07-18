@@ -1,7 +1,7 @@
 //! User accounts, password authentication, and per-user privileges.
 //!
 //! Passwords are stored as scrypt PHC hashes ([`docs/components/network-server.md`],
-//! "Authentication") — never in plaintext. Verification is constant-time within
+//! "Authentication") - never in plaintext. Verification is constant-time within
 //! scrypt and needs no RNG; only account creation salts and hashes.
 //!
 //! Each account carries a [`Privileges`] set (READ / WRITE / ADMIN). The session
@@ -113,7 +113,7 @@ struct Account {
     /// per-database override below.
     privileges: Privileges,
     /// Per-database overrides keyed by database name. An entry shadows
-    /// `privileges` for that database (it may grant more or — as `NONE` — deny).
+    /// `privileges` for that database (it may grant more or - as `NONE` - deny).
     db_grants: HashMap<String, Privileges>,
 }
 

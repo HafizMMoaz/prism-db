@@ -426,7 +426,7 @@ The SDK follows semver. Breaking changes only in major versions; minor versions 
 
 ## References
 
-- ADR 0008 — protocol design.
-- ADR 0009 — napi-rs decision.
-- `specs/wire-protocol.md` — the protocol this SDK speaks.
+- ADR 0008 - protocol design.
+- ADR 0009 - napi-rs decision.
+- `specs/wire-protocol.md` - the protocol this SDK speaks.
 - napi-rs: https://napi.rs

@@ -2,7 +2,7 @@
 
 A **pure-TypeScript** client for [PrismDB](https://github.com/HafizMMoaz/prism-db), speaking the binary
 wire protocol directly over a TCP (or TLS) socket. No native addon, no build
-toolchain beyond `tsc` — it runs anywhere Node does.
+toolchain beyond `tsc` - it runs anywhere Node does.
 
 > Implements `docs/specs/wire-protocol.md`. The byte layouts are kept in lockstep
 > with the Rust `prism-protocol` crate and validated end-to-end against `prismd`.
@@ -61,17 +61,17 @@ TLS options) for TLS. On a multi-database server, pass `database` to select it a
 connect (runs `USE <database>`); otherwise run `db.sql("USE <name>")` yourself,
 and manage databases with `CREATE DATABASE` / `DROP DATABASE` / `SHOW DATABASES`.
 
-### SQL — `db.sql(text, { params?, returnRows? })`
+### SQL - `db.sql(text, { params?, returnRows? })`
 
 Returns `{ columns, rows, raw, affectedRows }`. `rows` are objects keyed by
 column name; `raw` keeps the cells in column order. `affectedRows` is a `bigint`.
 
-### KV — `db.kv`
+### KV - `db.kv`
 
 `get(ns, key) → Buffer | null`, `put(ns, key, value)`, `delete(ns, key)`. Keys
 and values are `string | Uint8Array`.
 
-### Documents — `db.doc`
+### Documents - `db.doc`
 
 `insertOne`/`insertMany` (return the assigned `ObjectId`s), `find`/`findOne`,
 `updateOne`/`updateMany`, `deleteOne`/`deleteMany`. Build filters with `Q` and
@@ -92,7 +92,7 @@ await db.doc.updateOne("people", Q.eq("name", "carol"), [
 ]);
 ```
 
-### Transactions — `db.begin(mode?)`, `db.commit({ idempotencyKey? })`, `db.abort()`
+### Transactions - `db.begin(mode?)`, `db.commit({ idempotencyKey? })`, `db.abort()`
 
 One `Client` is one server session, so calls between `begin()` and `commit()`
 run in that transaction. `commit({ idempotencyKey })` makes a retried commit safe.

@@ -5,7 +5,7 @@ name: Publish Python SDK
 # sdks/python/pyproject.toml as part of cutting the release), and can be
 # dispatched manually.
 #
-# Authentication is PyPI Trusted Publishing (OpenID Connect) — no API token. The
+# Authentication is PyPI Trusted Publishing (OpenID Connect) - no API token. The
 # matching publisher on PyPI must be configured as:
 #   Owner=HafizMMoaz  Repository=prism-db  Workflow=pypi-publish.yml  Environment=pypi
 on:

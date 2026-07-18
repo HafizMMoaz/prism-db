@@ -1,7 +1,7 @@
 //! The `prism-protocol` decode error type.
 //!
 //! Encoding never fails for well-formed in-memory messages, so only decoding
-//! produces errors — a frame from the wire is untrusted input.
+//! produces errors - a frame from the wire is untrusted input.
 
 use std::fmt;
 

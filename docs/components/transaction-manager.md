@@ -105,7 +105,7 @@ Pruning: the commit log can be pruned for TxnIds older than the oldest active tr
 
 A transaction T sees a tuple version V if:
 - `V.xmin < T.snapshot.xmax_excluded.min` (committed long before our begin), OR
-- `V.xmin` is in T.snapshot.committed_set (committed but after begin? no — see visibility logic in MVCC.md)
+- `V.xmin` is in T.snapshot.committed_set (committed but after begin? no - see visibility logic in MVCC.md)
 
 The precise visibility logic is in `components/mvcc.md`. The transaction manager's job is to provide a consistent snapshot at begin and to answer commit-status queries during execution.
 
@@ -130,7 +130,7 @@ After step 3 returns, the transaction is durable. If we crash between 1 and 3, r
    a. Reverse-apply: read before_image, write to page (incrementing page_lsn)
    b. wal.append(LogRecord::Clr { txn, page, slot, undo_image: ... })
 3. wal.append(LogRecord::Abort { txn })  → abort_lsn
-4. wal.flush_through(abort_lsn) [optional in v1 — abort durability is a correctness nicety, not a requirement; we choose to fsync abort to keep recovery simple]
+4. wal.flush_through(abort_lsn) [optional in v1 - abort durability is a correctness nicety, not a requirement; we choose to fsync abort to keep recovery simple]
 5. commit_log.insert(txn.id, Aborted)
 6. active_txns.remove(txn.id)
 ```
@@ -139,7 +139,7 @@ CLRs make undo idempotent: if we crash during step 2, the next recovery resumes 
 
 ## Drop guard
 
-`TxnHandle` implements `Drop`: if it is dropped without `commit()` or `abort()` having been called, the drop calls `abort()`. This catches mistakes — leaked transactions roll back instead of leaking forever.
+`TxnHandle` implements `Drop`: if it is dropped without `commit()` or `abort()` having been called, the drop calls `abort()`. This catches mistakes - leaked transactions roll back instead of leaking forever.
 
 In Rust this is enforced naturally by ownership: every code path that holds a `TxnHandle` either passes it to `commit`/`abort` (consuming it) or drops it.
 
@@ -188,8 +188,8 @@ abort_fsync = true
 
 ## References
 
-- ADR 0004 — MVCC and snapshot isolation.
-- ADR 0006 — single TxnManager across models.
-- `components/mvcc.md` — visibility logic that consumes the snapshot.
-- `components/lock-manager.md` — write-write conflict resolution.
-- `components/recovery.md` — analysis phase reconstructs the active txn table.
+- ADR 0004 - MVCC and snapshot isolation.
+- ADR 0006 - single TxnManager across models.
+- `components/mvcc.md` - visibility logic that consumes the snapshot.
+- `components/lock-manager.md` - write-write conflict resolution.
+- `components/recovery.md` - analysis phase reconstructs the active txn table.

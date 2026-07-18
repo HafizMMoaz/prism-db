@@ -1,4 +1,4 @@
-"""prismdb — a pure-Python client for PrismDB over the binary wire protocol
+"""prismdb - a pure-Python client for PrismDB over the binary wire protocol
 (``docs/specs/wire-protocol.md``). No native build, no C extensions.
 
     from prismdb import Client, Q, U

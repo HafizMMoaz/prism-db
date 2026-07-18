@@ -3,7 +3,7 @@
 **/*.rs.bk
 *.pdb
 
-# Cargo (workspace lockfile IS committed — it has binaries)
+# Cargo (workspace lockfile IS committed - it has binaries)
 # Do not ignore Cargo.lock
 
 # proptest persists minimized regressions; these ARE committed

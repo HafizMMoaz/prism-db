@@ -8,7 +8,7 @@ This directory contains every design document for the Prism database engine. It 
 |---|---|
 | [`overview/`](overview/) | Executive summary, vision, scope, glossary, roadmap |
 | [`architecture/`](architecture/) | System-level architecture, data flow, module layout, threat model |
-| [`adr/`](adr/) | Architecture Decision Records — every significant choice with rationale |
+| [`adr/`](adr/) | Architecture Decision Records - every significant choice with rationale |
 | [`components/`](components/) | Per-component design documents |
 | [`specs/`](specs/) | Wire-level and on-disk specifications |
 | [`operations/`](operations/) | Build, test, benchmark, observability, fault injection |

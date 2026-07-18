@@ -5,7 +5,7 @@ name: Publish .NET SDK
 # sdks/dotnet/src/PrismDb/PrismDb.csproj as part of cutting the release), and can
 # be dispatched manually.
 #
-# Authentication is NuGet Trusted Publishing (OpenID Connect) — no API key. The
+# Authentication is NuGet Trusted Publishing (OpenID Connect) - no API key. The
 # matching policy on nuget.org must be configured as:
 #   Package Owner=hafizmmoaz  Repository Owner=HafizMMoaz  Repository=prism-db
 #   Workflow File=nuget-publish.yml  Environment=nuget

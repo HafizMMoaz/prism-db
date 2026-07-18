@@ -671,7 +671,7 @@ impl Session {
         }
 
         // Document/KV DDL (DROP COLLECTION / DROP NAMESPACE) over the current
-        // database — the relational engine does not know these object kinds.
+        // database - the relational engine does not know these object kinds.
         if is_object_ddl_sql(&sql) {
             return match self.run_object_ddl_sql(&sql) {
                 Ok(msg) => msg,
@@ -1126,7 +1126,7 @@ impl Session {
 
 impl Drop for Session {
     /// A session that goes away with an explicit transaction still open aborts
-    /// it — so a dropped connection never leaves a transaction holding locks.
+    /// it - so a dropped connection never leaves a transaction holding locks.
     fn drop(&mut self) {
         if let SessionTxn::Explicit {
             db,

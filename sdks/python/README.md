@@ -2,7 +2,7 @@
 
 A **pure-Python** client for [PrismDB](https://github.com/HafizMMoaz/prism-db), speaking the binary
 wire protocol directly over a TCP (or TLS) socket. No native extension, no build
-toolchain — it runs anywhere CPython does.
+toolchain - it runs anywhere CPython does.
 
 > Implements `docs/specs/wire-protocol.md`. The byte layouts are kept in lockstep
 > with the Rust `prism-protocol` crate and the reference Node SDK.
@@ -54,17 +54,17 @@ Performs the `Hello`/`Auth` handshake. Omit `username` to skip authentication
 `ssl.SSLContext`) for TLS. On a multi-database server, pass `database=` to select
 it at connect; otherwise run `db.sql("USE <name>")` yourself.
 
-### SQL — `db.sql(text, params=None, *, return_rows=True)`
+### SQL - `db.sql(text, params=None, *, return_rows=True)`
 
 Returns a `SqlResult` with `.columns`, `.rows` (list of dicts keyed by column
 name), `.raw` (cells in column order), and `.affected_rows` (int).
 
-### KV — `db.kv`
+### KV - `db.kv`
 
 `get(ns, key) -> bytes | None`, `put(ns, key, value)`, `delete(ns, key)`. Keys
 and values are `str` (UTF-8) or `bytes`.
 
-### Documents — `db.doc`
+### Documents - `db.doc`
 
 `insert_one` / `insert_many` (return the assigned `ObjectId`s), `find` / `find_one`,
 `count`, `update_one` / `update_many`, `delete_one` / `delete_many`. Build filters
@@ -84,7 +84,7 @@ db.doc.update_one("people", Q.eq("name", "carol"), [
 ])
 ```
 
-### Transactions — `db.begin(mode="read_write")`, `db.commit(idempotency_key=0)`, `db.abort()`
+### Transactions - `db.begin(mode="read_write")`, `db.commit(idempotency_key=0)`, `db.abort()`
 
 One `Client` is one server session, so calls between `begin()` and `commit()`
 run in that transaction. `commit(idempotency_key=...)` makes a retried commit safe.

@@ -33,7 +33,7 @@ Rustup users get this automatically. CI verifies the exact version. No other Rus
 TLS uses `rustls` (no system OpenSSL needed) so the default build has no native
 crypto dependency on any platform.
 
-All three operating systems are supported, first-class targets — for the server,
+All three operating systems are supported, first-class targets - for the server,
 the SDK, and the shell. Platform-specific file I/O lives behind the storage trait
 in `prism-storage` (`components/disk-manager.md`); everything above that layer is
 portable Rust.
@@ -255,6 +255,6 @@ Property tests run with a default case count; bump it to reproduce or to gain co
 ## References
 
 - `Cargo.toml` workspace manifest is the source of truth for crates and dependencies.
-- `operations/testing-strategy.md` — what to write tests for.
-- `operations/benchmarking.md` — how to measure.
-- `project/engineering-standards.md` — style and review conventions.
+- `operations/testing-strategy.md` - what to write tests for.
+- `operations/benchmarking.md` - how to measure.
+- `project/engineering-standards.md` - style and review conventions.

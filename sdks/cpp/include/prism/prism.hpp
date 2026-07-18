@@ -1,4 +1,4 @@
-// prism/prism.hpp — a modern C++17 client for PrismDB over the binary wire
+// prism/prism.hpp - a modern C++17 client for PrismDB over the binary wire
 // protocol (docs/specs/wire-protocol.md). The value model, codec, and message
 // (de)serialisation live here inline so they can be unit-tested without linking
 // or a socket; the transport and high-level Client are implemented in prism.cpp.

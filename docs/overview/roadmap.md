@@ -5,7 +5,7 @@
 
 This document describes the phased delivery plan for Prism v1.0. Dates are illustrative for a four-month engineering effort and will be re-baselined when implementation starts. The phase ordering is normative; the dates are not.
 
-## Phase 0 — Design (current phase)
+## Phase 0 - Design (current phase)
 
 Lock the design before code begins. Output of this phase is the documentation corpus in this repository.
 
@@ -15,7 +15,7 @@ Exit criteria:
 - All specifications (`docs/specs/`) are complete enough to implement against.
 - The risk register identifies known risks with owners.
 
-## Phase 1 — Foundation
+## Phase 1 - Foundation
 
 The plumbing nothing else can be built on top of. If Phase 1 is wrong, everything after it is wasted.
 
@@ -31,7 +31,7 @@ Exit criteria:
 - Buffer pool sustains target throughput for cached workloads (baseline TBD).
 - WAL achieves target write throughput under group commit (baseline TBD).
 
-## Phase 2 — Transactions and recovery
+## Phase 2 - Transactions and recovery
 
 The conceptual heart of the engine. The phase most likely to slip.
 
@@ -48,7 +48,7 @@ Exit criteria:
 - Recovery passes the Phase 1 fault-injection harness extended to multi-transaction workloads
 - Concurrent stress test: N threads, random ops, random `kill -9`, all invariants hold
 
-## Phase 3 — Access methods
+## Phase 3 - Access methods
 
 Three layers on top of the unified store. Each is a thin layer once the foundation works.
 
@@ -65,7 +65,7 @@ Exit criteria:
 - Cross-model atomicity verified: insert row + update doc + put KV in one transaction, kill at any point, recovery is atomic
 - Index usage verified by query plan dumps
 
-## Phase 4 — Surface area
+## Phase 4 - Surface area
 
 Make the engine usable from outside.
 
@@ -81,7 +81,7 @@ Exit criteria:
 - Shell can connect, authenticate, run queries across all three models
 - Metrics endpoint exposes core counters and histograms
 
-## Phase 5 — Hardening
+## Phase 5 - Hardening
 
 The phase that distinguishes "we built a database" from "we built a database that works."
 

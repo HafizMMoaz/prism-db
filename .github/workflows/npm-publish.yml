@@ -3,7 +3,7 @@ name: Publish Node SDK
 # Publishes sdks/node (@prismdb/client) to npm with the version in its
 # package.json. Runs when a GitHub Release is published (bump the SDK version in
 # sdks/node/package.json as part of cutting the release), and can be dispatched
-# manually — e.g. to ship the SDK for the current main when a release tag predates
+# manually - e.g. to ship the SDK for the current main when a release tag predates
 # a packaging fix.
 on:
   release:

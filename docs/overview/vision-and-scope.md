@@ -83,9 +83,9 @@ These are explicitly excluded. Anyone arguing to pull them in is arguing to slip
 - Cost-based query optimizer (statistics-driven join reordering)
 - Vectorized execution
 - Columnar storage
-- Materialized views (logical/non-materialized views **are** in scope — see above)
+- Materialized views (logical/non-materialized views **are** in scope - see above)
 - Stored procedures or user-defined functions
-- Recursive CTEs and window frame clauses (`ROWS`/`RANGE`) — non-recursive CTEs and unframed window functions **are** in scope
+- Recursive CTEs and window frame clauses (`ROWS`/`RANGE`) - non-recursive CTEs and unframed window functions **are** in scope
 - Full-text search (beyond basic substring `LIKE`)
 
 ### Advanced indexing

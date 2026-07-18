@@ -1,10 +1,10 @@
-//! `prismd` — the Prism server binary: a multi-database server over one data
+//! `prismd` - the Prism server binary: a multi-database server over one data
 //! directory (each database is a subdirectory; `_system` holds the accounts).
 //!
 //! Usage:
-//! - `prismd init [data-dir]` — create/initialize the data directory.
+//! - `prismd init [data-dir]` - create/initialize the data directory.
 //! - `prismd run [data-dir] [bind] [--data DIR] [--bind ADDR]
-//!   [--tls-cert FILE --tls-key FILE]` — serve over TCP.
+//!   [--tls-cert FILE --tls-key FILE]` - serve over TCP.
 //!
 //! The data directory defaults to `$PRISM_DATA_DIR`, else a platform location
 //! (`%ProgramData%\PrismDB\data` on Windows, `/var/lib/prismdb` on Linux when it

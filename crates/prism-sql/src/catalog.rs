@@ -1,6 +1,6 @@
 //! The in-memory relational catalog: tables, their columns, and their heap.
 //!
-//! Scope (this slice): held in memory only — schema persistence across restart
+//! Scope (this slice): held in memory only - schema persistence across restart
 //! arrives with the full system-table catalog. Table heaps are allocated from a
 //! simple counter, disjoint from KV/document heaps by convention.
 
@@ -303,7 +303,7 @@ impl Catalog {
         Ok(())
     }
 
-    /// Install a view at load time (no name-collision or replace checks — the
+    /// Install a view at load time (no name-collision or replace checks - the
     /// persisted catalog is trusted). Used when reloading after restart.
     pub fn register_view(&self, name: &str, query_sql: String) {
         self.views

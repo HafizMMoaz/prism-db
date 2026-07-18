@@ -33,7 +33,7 @@ Flags:
 
 ## Prompt and modes
 
-The shell has three modes — `sql`, `doc`, `kv` — switched by meta-commands.
+The shell has three modes - `sql`, `doc`, `kv` - switched by meta-commands.
 
 ```
 prism (sql)>     SQL mode prompt
@@ -223,7 +223,7 @@ Long results stream as they arrive: rows appear incrementally. The pager (`less`
 
 ```
 prism (sql)> SELECT * FROM big_table LIMIT 100;
-[100 rows in 23ms — parse 0.2ms, plan 0.5ms, execute 22ms, fetch 0.1ms]
+[100 rows in 23ms - parse 0.2ms, plan 0.5ms, execute 22ms, fetch 0.1ms]
 ```
 
 ## Configuration
@@ -239,7 +239,7 @@ timing = true
 
 ## References
 
-- ADR 0008 — wire protocol the shell speaks.
-- `specs/sdk-api.md` — the alternative for programmatic clients.
-- `specs/wire-protocol.md` — the shell uses this directly.
+- ADR 0008 - wire protocol the shell speaks.
+- `specs/sdk-api.md` - the alternative for programmatic clients.
+- `specs/wire-protocol.md` - the shell uses this directly.
 - `rustyline` for the line editor.

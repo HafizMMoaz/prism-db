@@ -125,13 +125,13 @@ What lives where:
 
 | Asset | Where | Sensitivity |
 |---|---|---|
-| User credentials (hashed) | Catalog, on disk | High — encrypt the filesystem |
-| Session tokens | In-memory only | High — never written to disk |
+| User credentials (hashed) | Catalog, on disk | High - encrypt the filesystem |
+| Session tokens | In-memory only | High - never written to disk |
 | User data | Heap file | Operator's classification, treat as max |
 | WAL | WAL files | Same as user data |
-| Configuration | TOML file | Medium — may contain TLS keys |
+| Configuration | TOML file | Medium - may contain TLS keys |
 | TLS private keys | Operator-managed path | Critical |
-| Logs | stdout or file | Medium — may contain query text |
+| Logs | stdout or file | Medium - may contain query text |
 
 ## Logging and audit
 

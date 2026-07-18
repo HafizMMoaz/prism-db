@@ -48,7 +48,7 @@ When a lint flags something we genuinely think is fine, use `#[allow]` with a co
 
 ### `Result`, not `panic!`
 
-Use `Result<T, E>` for all recoverable errors. `panic!` only for unreachable cases or invariant violations the compiler can't prove. Recovery code may panic if it cannot proceed — that's the fsync gate pattern.
+Use `Result<T, E>` for all recoverable errors. `panic!` only for unreachable cases or invariant violations the compiler can't prove. Recovery code may panic if it cannot proceed - that's the fsync gate pattern.
 
 ### Error types per crate
 
@@ -66,7 +66,7 @@ pub enum WalError {
 }
 ```
 
-Avoid `anyhow::Error` in library code — it loses type information. Use `anyhow` only at binary boundaries (`main`, tests) where the caller treats every error as opaque.
+Avoid `anyhow::Error` in library code - it loses type information. Use `anyhow` only at binary boundaries (`main`, tests) where the caller treats every error as opaque.
 
 ### `?` is preferred to `match`
 
@@ -122,7 +122,7 @@ crate/
 └── benches/                # Benchmarks
 ```
 
-`lib.rs` is short — it declares modules and re-exports the public API. No business logic lives there.
+`lib.rs` is short - it declares modules and re-exports the public API. No business logic lives there.
 
 ## Visibility
 
@@ -157,7 +157,7 @@ let server = Server::builder()
     .build()?;
 ```
 
-Not for everything — only when the alternative would be a struct with 6+ public fields or a function with 6+ arguments.
+Not for everything - only when the alternative would be a struct with 6+ public fields or a function with 6+ arguments.
 
 ### Avoid `Box<dyn Trait>` in hot paths
 
@@ -187,7 +187,7 @@ Comment non-obvious ordering choices.
 
 ### Channels
 
-`crossbeam-channel` for synchronous bounded channels; `tokio::sync::mpsc` for async. Avoid unbounded channels — they hide backpressure problems.
+`crossbeam-channel` for synchronous bounded channels; `tokio::sync::mpsc` for async. Avoid unbounded channels - they hide backpressure problems.
 
 ## Logging
 
@@ -207,7 +207,7 @@ tracing::error!(error = %e, page_id = ?page, "page read failed");
 
 Tokio runtime. Sync work that takes more than a few microseconds (page parsing, hash computation) goes in `spawn_blocking` to avoid stalling the executor.
 
-The synchronous core (record store, buffer pool, WAL) is not async — it has explicit blocking calls. Async wrappers live in the network and SDK layers.
+The synchronous core (record store, buffer pool, WAL) is not async - it has explicit blocking calls. Async wrappers live in the network and SDK layers.
 
 ## Testing
 
@@ -324,6 +324,6 @@ These are enforced by `rustfmt` and EditorConfig.
 
 ## References
 
-- `project/code-review-guide.md` — what reviewers check.
-- `operations/build-and-dev.md` — the dev workflow.
+- `project/code-review-guide.md` - what reviewers check.
+- `operations/build-and-dev.md` - the dev workflow.
 - The Rust API Guidelines: https://rust-lang.github.io/api-guidelines/

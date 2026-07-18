@@ -1,6 +1,6 @@
 //! Durability across restart: data written and committed in all three models is
 //! still queryable by name after closing and reopening the same `Database`
-//! directory — proving the catalog (table/collection/namespace → heap) and the
+//! directory - proving the catalog (table/collection/namespace → heap) and the
 //! record store both recover.
 
 use std::sync::Arc;
@@ -92,7 +92,7 @@ fn all_three_models_survive_restart() {
                 value: b"100".to_vec(),
             },
         ));
-        // drop session, then database (clean close — committed WAL is on disk)
+        // drop session, then database (clean close - committed WAL is on disk)
         drop(s);
         drop(db);
     }

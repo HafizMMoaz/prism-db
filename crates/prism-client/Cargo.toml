@@ -8,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 # A leaf for applications: depends only on the protocol types and an async
-# runtime — never on the server or the engines (see module-layout.md).
+# runtime - never on the server or the engines (see module-layout.md).
 [dependencies]
 prism-protocol = { workspace = true }
 tokio = { workspace = true }

@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>PrismDB — install</title>
+<title>PrismDB - install</title>
 <meta name="description" content="Install PrismDB: one storage engine, three data models (SQL, document, key-value). Packages for Linux, macOS, Windows, and client SDKs for seven languages." />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -29,7 +29,7 @@
   a{color:inherit}
   .wrap{max-width:1040px; margin:0 auto; padding:0 24px}
 
-  /* spectrum hairline at the very top — the one ambient use of full color */
+  /* spectrum hairline at the very top - the one ambient use of full color */
   .spectrum-edge{height:3px; border:0; margin:0;
     background:linear-gradient(90deg,var(--sql),#7B43D6,var(--doc),#E0556E,var(--kv));}
 
@@ -160,7 +160,7 @@
     <div>
       <p class="eyebrow">single-node · multi-model</p>
       <h1>One engine.<br />Three&nbsp;<span class="spectrum-text">models</span>.</h1>
-      <p class="lede">PrismDB speaks SQL, documents, and key–value over one storage engine — and one transaction spans all three.</p>
+      <p class="lede">PrismDB speaks SQL, documents, and key-value over one storage engine - and one transaction spans all three.</p>
       <div class="cta-row">
         <a class="btn primary" href="#install">Install for <span id="os-name">your OS</span></a>
         <a class="btn" href="https://github.com/HafizMMoaz/prism-db">View on GitHub</a>
@@ -189,7 +189,7 @@
         <path class="ray r3" d="M389 187 L600 262" pathLength="1"/>
         <text class="rlabel l1" x="612" y="116">relational <tspan class="dim">· SQL</tspan></text>
         <text class="rlabel l2" x="612" y="192">document <tspan class="dim">· JSON</tspan></text>
-        <text class="rlabel l3" x="612" y="266">key–value</text>
+        <text class="rlabel l3" x="612" y="266">key-value</text>
       </svg>
     </div>
   </section>
@@ -197,7 +197,7 @@
   <section class="install" id="install">
     <div class="sec-head">
       <h2>Install</h2>
-      <span class="hint">one install — server, shell, and tools</span>
+      <span class="hint">one install - server, shell, and tools</span>
     </div>
 
     <div class="tabs" role="tablist" aria-label="Operating system">
@@ -210,14 +210,14 @@
     <div class="panel" data-os="linux" role="tabpanel">
       <div class="cards">
         <div class="card">
-          <div class="label"><span class="name">APT — Debian / Ubuntu</span><span class="tag">apt upgrade keeps it current</span></div>
+          <div class="label"><span class="name">APT - Debian / Ubuntu</span><span class="tag">apt upgrade keeps it current</span></div>
           <div class="code"><button class="copy">Copy</button><pre><code>curl -fsSL https://hafizmmoaz.github.io/prism-db/prismdb-archive-keyring.asc | sudo gpg --dearmor -o /usr/share/keyrings/prismdb.gpg
 echo "deb [signed-by=/usr/share/keyrings/prismdb.gpg] https://hafizmmoaz.github.io/prism-db/deb ./" | sudo tee /etc/apt/sources.list.d/prismdb.list
 sudo apt update &amp;&amp; sudo apt install prismdb</code></pre></div>
           <p class="note">Installs the binaries and starts <code>prismd</code> as a systemd service.</p>
         </div>
         <div class="card">
-          <div class="label"><span class="name">DNF — Fedora / RHEL / CentOS</span><span class="tag">signed repo</span></div>
+          <div class="label"><span class="name">DNF - Fedora / RHEL / CentOS</span><span class="tag">signed repo</span></div>
           <div class="code"><button class="copy">Copy</button><pre><code>sudo tee /etc/yum.repos.d/prismdb.repo &gt;/dev/null &lt;&lt;'EOF'
 [prismdb]
 name=PrismDB
@@ -273,7 +273,7 @@ sudo dnf install prismdb</code></pre></div>
 pip      install prismdb             <span class="tok-c"># Python</span>
 dotnet   add package PrismDb.Client  <span class="tok-c"># C# / .NET</span>
 composer require prismdb/client      <span class="tok-c"># PHP</span></code></pre></div>
-        <p class="note">Pure wire-protocol clients — also Java, C, and C++. <a href="https://github.com/HafizMMoaz/prism-db/tree/main/sdks">All SDKs →</a></p>
+        <p class="note">Pure wire-protocol clients - also Java, C, and C++. <a href="https://github.com/HafizMMoaz/prism-db/tree/main/sdks">All SDKs →</a></p>
       </div>
       <div class="card">
         <div class="label"><span class="name">From source</span><span class="tag">Rust 1.85+</span></div>
@@ -283,7 +283,7 @@ composer require prismdb/client      <span class="tok-c"># PHP</span></code></pr
   </section>
 
   <section class="quick">
-    <div class="sec-head"><h2>Quick start</h2><span class="hint">default account: admin / admin — change before exposing</span></div>
+    <div class="sec-head"><h2>Quick start</h2><span class="hint">default account: admin / admin - change before exposing</span></div>
     <div class="grid">
       <div class="step">
         <p class="k">// start the server</p>

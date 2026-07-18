@@ -255,9 +255,9 @@ If recovery is wrong, nothing else matters. We treat its test coverage according
 
 ## References
 
-- `operations/build-and-dev.md` — how to run tests.
-- `operations/fault-injection.md` — the crash-recovery harness.
-- `operations/benchmarking.md` — performance regression suite.
-- `components/recovery.md` — what we are testing the correctness of.
+- `operations/build-and-dev.md` - how to run tests.
+- `operations/fault-injection.md` - the crash-recovery harness.
+- `operations/benchmarking.md` - performance regression suite.
+- `components/recovery.md` - what we are testing the correctness of.
 - proptest: https://github.com/proptest-rs/proptest
 - Elle: https://github.com/jepsen-io/elle

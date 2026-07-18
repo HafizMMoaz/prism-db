@@ -187,14 +187,14 @@ fn grant_and_revoke_take_effect() {
         "readonly cannot insert"
     );
 
-    // Promote to readwrite — the next op in the same session is allowed.
+    // Promote to readwrite - the next op in the same session is allowed.
     assert!(sql_ok(admin.handle(sql("GRANT readwrite TO u"))));
     assert!(
         sql_ok(u.handle(sql("INSERT INTO t VALUES (1)"))),
         "after GRANT, insert allowed"
     );
 
-    // Revoke everything — even reads are denied now.
+    // Revoke everything - even reads are denied now.
     assert!(sql_ok(admin.handle(sql("REVOKE ALL FROM u"))));
     assert!(
         denied(u.handle(sql("SELECT id FROM t"))),
@@ -249,7 +249,7 @@ fn users_and_grants_persist_across_restart() {
         drop(db);
     }
 
-    // Session 2: reopen the same directory — accounts and grants survived.
+    // Session 2: reopen the same directory - accounts and grants survived.
     {
         let db = Arc::new(Database::open(&path).unwrap());
         // reader persisted *with* the granted read-write privilege.

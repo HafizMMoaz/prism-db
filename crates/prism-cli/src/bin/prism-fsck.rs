@@ -1,8 +1,8 @@
-//! `prism-fsck` — offline integrity checker.
+//! `prism-fsck` - offline integrity checker.
 //!
 //! `prism-fsck <dir>` validates the database header, every allocated page's
 //! checksum, and the WAL's record CRCs, printing a report and exiting non-zero
-//! if corruption is found. Reads on-disk formats only — never live state. See
+//! if corruption is found. Reads on-disk formats only - never live state. See
 //! `docs/architecture/module-layout.md`.
 
 use std::path::Path;

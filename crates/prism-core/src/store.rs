@@ -1,4 +1,4 @@
-//! The transactional record store — MVCC tuple operations over the buffer pool.
+//! The transactional record store - MVCC tuple operations over the buffer pool.
 //!
 //! This is the seam all three access methods share: it writes [`RecordHeader`]s
 //! and payloads into slotted heap pages through the buffer pool, logs every
@@ -87,7 +87,7 @@ impl RecordStore {
 
     /// Take a checkpoint: flush every dirty page to disk and fsync the heap.
     ///
-    /// This advances the point on disk that crash recovery can trust — after a
+    /// This advances the point on disk that crash recovery can trust - after a
     /// checkpoint, incremental redo skips the flushed prefix and only replays
     /// records written since. Cheap to call periodically or at clean shutdown.
     /// (The WAL invariant means each flushed page's log records are already
@@ -131,7 +131,7 @@ impl RecordStore {
             let guard = self.buffer.fetch_read(r.page)?;
             let page = SlottedPageRef::new(&guard);
             let Some(rec) = page.get(r.slot) else {
-                return Ok(None); // slot gone — end of chain
+                return Ok(None); // slot gone - end of chain
             };
             let Some(header) = RecordHeader::decode(rec) else {
                 return Ok(None);
@@ -252,7 +252,7 @@ impl RecordStore {
         let mut tables = self.heaps.lock().expect("heaps poisoned");
         let candidates: Vec<PageId> = tables.pages.get(&heap).cloned().unwrap_or_default();
 
-        // Newest pages first — most likely to have room.
+        // Newest pages first - most likely to have room.
         for &pid in candidates.iter().rev() {
             let mut guard = self.buffer.fetch_write(pid)?;
             let slot = {
@@ -504,7 +504,7 @@ mod tests {
         let rid = env.store.insert(&t1, HEAP, b"v1").unwrap();
         t1.commit().unwrap();
 
-        // Reader begins now — sees v1.
+        // Reader begins now - sees v1.
         let reader = env.txns.begin(TxnMode::ReadOnly);
 
         // A later writer updates the row and commits.
@@ -607,7 +607,7 @@ mod tests {
         const PER: usize = 60;
 
         // Many threads insert into the SAME heap concurrently, interleaved with
-        // scans — the path that serializes on the `heaps` mutex while taking page
+        // scans - the path that serializes on the `heaps` mutex while taking page
         // latches and appending to the WAL. It must finish (no deadlock) and lose
         // nothing. A regression guard for the store's locking discipline.
         thread::scope(|scope| {

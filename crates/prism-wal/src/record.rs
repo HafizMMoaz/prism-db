@@ -270,7 +270,7 @@ pub fn encode_record(lsn: Lsn, record: &LogRecord) -> Vec<u8> {
 /// Decode one frame from the front of `frame`, returning the record and the
 /// total bytes consumed (`32 + body_len + 4`).
 ///
-/// Returns [`WalError::CrcMismatch`] if the trailing CRC does not match — the
+/// Returns [`WalError::CrcMismatch`] if the trailing CRC does not match - the
 /// signal recovery uses to stop at a torn write.
 pub fn decode_record(frame: &[u8]) -> Result<(Lsn, LogRecord, usize)> {
     if frame.len() < RECORD_HEADER_SIZE {

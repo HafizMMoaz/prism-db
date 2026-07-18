@@ -25,19 +25,19 @@ final class DocUpdate
 /** Update builders mirroring the engine's update operators. */
 final class U
 {
-    /** $set — set $field to $value. */
+    /** $set - set $field to $value. */
     public static function set(string $field, mixed $value): DocUpdate
     {
         return new DocUpdate('set', $field, value: $value);
     }
 
-    /** $unset — remove $field. */
+    /** $unset - remove $field. */
     public static function unset(string $field): DocUpdate
     {
         return new DocUpdate('unset', $field);
     }
 
-    /** $inc — add $delta to the integer $field. */
+    /** $inc - add $delta to the integer $field. */
     public static function inc(string $field, int $delta): DocUpdate
     {
         return new DocUpdate('inc', $field, delta: $delta);

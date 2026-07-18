@@ -30,9 +30,9 @@ the server as a managed service that starts on boot, see
 ### Debian / Ubuntu and Fedora / RHEL packages
 
 Native packages install the binaries **and** register `prismd` as a systemd
-service that starts on boot (bound to localhost) — no extra setup.
+service that starts on boot (bound to localhost) - no extra setup.
 
-**From the package repository** (recommended — `apt upgrade` / `dnf upgrade`
+**From the package repository** (recommended - `apt upgrade` / `dnf upgrade`
 keeps it current):
 
 ```bash
@@ -64,7 +64,7 @@ show its state and logs.
 
 ## The data directory
 
-`prismd` stores everything under one data directory — never in your project
+`prismd` stores everything under one data directory - never in your project
 folder. It is resolved in this order:
 
 1. `--data <dir>` on the command line,
@@ -82,7 +82,7 @@ $PRISM_DATA_DIR/
 └── analytics/    # another database
 ```
 
-The default account is `admin` / `admin` — change it before exposing the server.
+The default account is `admin` / `admin` - change it before exposing the server.
 
 ## Quick start (any platform)
 
@@ -112,11 +112,11 @@ requires the `admin` role, as does `CREATE`/`DROP DATABASE`.
 
 ## Run as a service
 
-### Linux — systemd
+### Linux - systemd
 
 `prismd` reads its configuration from the environment, so the service is driven
 entirely by an environment file (`/etc/prismdb/prismd.conf`): the bind address
-(`PRISM_BIND`, **defaulting to localhost** — `admin`/`admin` is a development
+(`PRISM_BIND`, **defaulting to localhost** - `admin`/`admin` is a development
 credential), `PRISM_DATA_DIR`, `RUST_LOG`, and optional `PRISM_TLS_CERT` /
 `PRISM_TLS_KEY`. The unit uses `DynamicUser=` + `StateDirectory=`, so it needs no
 service account and owns `/var/lib/prismdb` itself.
@@ -141,7 +141,7 @@ To accept remote connections, set `PRISM_BIND=0.0.0.0:4444` in
 `/etc/prismdb/prismd.conf` (after configuring TLS and real accounts) and
 `sudo systemctl restart prismd`.
 
-### macOS — Homebrew service
+### macOS - Homebrew service
 
 Installed via Homebrew, run it under `brew services`:
 
@@ -150,7 +150,7 @@ brew services start prismdb      # starts now and on login
 brew services stop  prismdb
 ```
 
-### Windows — service
+### Windows - service
 
 Wrap `prismd` with a service manager. [NSSM](https://nssm.cc) is simplest:
 

@@ -2,7 +2,7 @@
 //!
 //! Emits structured [`tracing`] events on the `audit` target for security-
 //! relevant actions: authentication outcomes, authorization denials, and
-//! user/grant management. **Passwords are never recorded** — only usernames,
+//! user/grant management. **Passwords are never recorded** - only usernames,
 //! OIDs, peer addresses, and the action taken. Initialize a subscriber (see the
 //! `prismd` binary) to route these somewhere; with no subscriber they are free.
 
@@ -16,7 +16,7 @@ pub fn auth_success(username: &str, oid: u64) {
     info!(target: TARGET, event = "auth_success", user = username, oid, "authenticated");
 }
 
-/// A failed authentication (bad credentials or unknown user — not distinguished
+/// A failed authentication (bad credentials or unknown user - not distinguished
 /// in the log, so it cannot reveal which usernames exist via the message).
 pub fn auth_failure(username: &str) {
     warn!(target: TARGET, event = "auth_failure", user = username, "authentication failed");

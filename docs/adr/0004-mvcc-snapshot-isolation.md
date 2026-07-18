@@ -39,7 +39,7 @@ Serializable isolation (SSI on top of snapshot) is **out of scope for v1**. We a
 
 **Against:** Readers block writers and writers block readers. For a workload with long-running reads (analytical queries, document scans, large range scans on KV), throughput collapses under contention. Lock escalation (row → page → table) introduces unfair scheduling and reduces concurrency further.
 
-The cross-model story is also worse: locking a SQL row, a document, and a KV pair in one transaction requires a unified lock manager that can name objects across models. MVCC sidesteps this by versioning at the tuple level — the lock manager only mediates write-write conflicts on the same tuple.
+The cross-model story is also worse: locking a SQL row, a document, and a KV pair in one transaction requires a unified lock manager that can name objects across models. MVCC sidesteps this by versioning at the tuple level - the lock manager only mediates write-write conflicts on the same tuple.
 
 ### Snapshot isolation with SSI on top (Postgres-style serializable)
 **For:** True serializability. Write-skew anomalies prevented. The right answer for users who demand it.
@@ -62,7 +62,7 @@ We prefer to ship snapshot isolation correctly and offer SSI as a post-v1 upgrad
 
 1. **Reads never block.** Readers walk version chains; writers create new versions. Read-only workloads (which dominate most applications) run at full speed regardless of contention.
 
-2. **Implementation is well-bounded.** xmin/xmax per tuple, a commit log, a snapshot at begin — these are concrete, finite mechanisms. The recovery design (ADR 0003) already requires per-tuple metadata; xmin/xmax fits naturally.
+2. **Implementation is well-bounded.** xmin/xmax per tuple, a commit log, a snapshot at begin - these are concrete, finite mechanisms. The recovery design (ADR 0003) already requires per-tuple metadata; xmin/xmax fits naturally.
 
 3. **Cross-model uniformity.** A tuple is a tuple; xmin/xmax bookkeeping works identically for SQL rows, documents, and KV pairs. The cross-model property is preserved.
 
@@ -143,5 +143,5 @@ In v1, version chains are unbounded; old versions accumulate until vacuumed. Vac
 - Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil: "A Critique of ANSI SQL Isolation Levels." SIGMOD 1995. Defines snapshot isolation and its anomalies.
 - Cahill, Röhm, Fekete: "Serializable Isolation for Snapshot Databases." SIGMOD 2008. The SSI paper if we ever want to add it.
 - PostgreSQL MVCC documentation.
-- ADR 0003 — recovery and MVCC compose; the WAL stores xmin/xmax as part of tuple bytes.
-- ADR 0006 — cross-model transactions rely on the model-agnostic property of MVCC.
+- ADR 0003 - recovery and MVCC compose; the WAL stores xmin/xmax as part of tuple bytes.
+- ADR 0006 - cross-model transactions rely on the model-agnostic property of MVCC.

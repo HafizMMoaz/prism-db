@@ -2,7 +2,7 @@
 //!
 //! Drives a real WAL the way a caller would: open in a temp dir, append a
 //! transaction's worth of records, flush (fsync) through the commit, then
-//! reopen from disk and replay — proving durability and recovery round-trip.
+//! reopen from disk and replay - proving durability and recovery round-trip.
 //!
 //! Run with: `cargo run -p prism-wal --example wal_demo`
 
@@ -78,7 +78,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  {lsn}  txn={}  {kind}", record.txn_id);
         count += 1;
     }
-    println!("\nreplayed {count} record(s) — recovery round-trip OK");
+    println!("\nreplayed {count} record(s) - recovery round-trip OK");
 
     let _ = std::fs::remove_dir_all(&dir);
     Ok(())

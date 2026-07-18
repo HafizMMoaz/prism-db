@@ -87,11 +87,11 @@ Reviewers work through this list. Not every item applies to every PR; skip what'
 
 Higher review bar applies to:
 
-- `prism-wal` — durability is everything.
-- `prism-core::recovery` — correctness defines the system.
-- `prism-core::mvcc` — the visibility function is one of two cornerstones (the other is recovery).
-- `prism-core::txn_manager` — transactional state machine.
-- `prism-buffer` — WAL invariant lives here.
+- `prism-wal` - durability is everything.
+- `prism-core::recovery` - correctness defines the system.
+- `prism-core::mvcc` - the visibility function is one of two cornerstones (the other is recovery).
+- `prism-core::txn_manager` - transactional state machine.
+- `prism-buffer` - WAL invariant lives here.
 
 For PRs touching any of these:
 - Two reviewers required.
@@ -183,6 +183,6 @@ Burning a week on a PR over a stuck disagreement is worse than the cost of writi
 
 ## References
 
-- `project/engineering-standards.md` — what we expect code to look like.
-- `operations/testing-strategy.md` — what tests we expect to see.
-- `project/risk-register.md` — what we're afraid of.
+- `project/engineering-standards.md` - what we expect code to look like.
+- `operations/testing-strategy.md` - what tests we expect to see.
+- `project/risk-register.md` - what we're afraid of.

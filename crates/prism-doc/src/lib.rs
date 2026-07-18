@@ -1,4 +1,4 @@
-//! `prism-doc` — the document engine.
+//! `prism-doc` - the document engine.
 //!
 //! Schemaless documents stored as self-describing tagged binary in a collection
 //! (a heap of records), with a MongoDB-subset query language. CRUD goes through

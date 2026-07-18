@@ -1,4 +1,4 @@
-//! `prism-sql` — the relational engine.
+//! `prism-sql` - the relational engine.
 //!
 //! Parses SQL and executes it over the unified record store, so relational data
 //! shares MVCC, locking, recovery, and cross-model transactions with KV and
@@ -6,7 +6,7 @@
 //!
 //! **Scope (this slice):** `CREATE TABLE` (with `PRIMARY KEY`, `NOT NULL`,
 //! `UNIQUE`, literal `DEFAULT`, column- or table-level `CHECK (…)`, and
-//! `FOREIGN KEY`/`REFERENCES` constraints — child-checked on `INSERT`/`UPDATE`,
+//! `FOREIGN KEY`/`REFERENCES` constraints - child-checked on `INSERT`/`UPDATE`,
 //! `RESTRICT` on parent `DELETE`), `CREATE [UNIQUE] INDEX … ON t (c, …)`
 //! / `DROP INDEX` (single- or multi-column secondary indexes, UNIQUE or
 //! non-unique; UNIQUE enforces on `INSERT`/`UPDATE`, and an equality `WHERE` over
@@ -14,8 +14,8 @@
 //! `SELECT [DISTINCT] <exprs|*> FROM t [JOIN …] [WHERE <predicate>]
 //! [ORDER BY col [ASC|DESC], …] [LIMIT n] [OFFSET n]`, `UPDATE t SET … [WHERE …]`,
 //! and `DELETE FROM t [WHERE …]` over a sequential scan (with an index seek when
-//! the `WHERE` pins the primary key or a UNIQUE-indexed column to a literal —
-//! `SELECT … WHERE col = …` — or bounds the primary key with a range,
+//! the `WHERE` pins the primary key or a UNIQUE-indexed column to a literal -
+//! `SELECT … WHERE col = …` - or bounds the primary key with a range,
 //! `> >= < <= BETWEEN`). Queries combine with `UNION`/`INTERSECT`/`EXCEPT`
 //! (`ALL` or distinct). Aggregates are `COUNT`/`SUM`/`AVG`/
 //! `MIN`/`MAX` with an optional `GROUP BY … [HAVING <predicate>]`, for the types
@@ -37,7 +37,7 @@
 //! `LEFT`/`RIGHT`/`REVERSE`/`REPEAT`/`SPACE`/`LPAD`/`RPAD`/`INSTR`/`LOCATE`/
 //! `ASCII`), numeric (`ABS`/`MOD`/`ROUND`/`CEIL`/`FLOOR`/`POW`/`SQRT`/`EXP`/`LN`/
 //! `LOG`/`LOG10`/`LOG2`/`SIGN`/`TRUNCATE`/`PI`/`GREATEST`/`LEAST`), and control
-//! flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) — usable in `WHERE`, `SET`,
+//! flow (`IF`/`IFNULL`/`NULLIF`/`COALESCE`) - usable in `WHERE`, `SET`,
 //! the select list, and `HAVING` (and `ORDER BY` over aggregate output, by name,
 //! 1-based ordinal, or expression text). Subqueries are supported: scalar
 //! `(SELECT …)`, `x [NOT] IN (SELECT …)`, `[NOT] EXISTS (SELECT …)`, and derived
@@ -518,7 +518,7 @@ impl SqlEngine {
         })
     }
 
-    /// `ALTER TABLE … RENAME COLUMN`: metadata only — the payload is positional,
+    /// `ALTER TABLE … RENAME COLUMN`: metadata only - the payload is positional,
     /// so no rows change.
     fn alter_rename_column(&self, table: &Table, from: &str, to: &str) -> Result<Outcome> {
         let idx = table
@@ -543,7 +543,7 @@ impl SqlEngine {
         let mut primary_key = None;
         let mut checks: Vec<String> = Vec::new();
         // Raw FK specs as (child column positions, parent table, parent column
-        // names) — resolved to positions once all columns are known.
+        // names) - resolved to positions once all columns are known.
         let mut fk_specs: Vec<(Vec<usize>, String, Vec<String>)> = Vec::new();
         for (idx, col) in ct.columns.iter().enumerate() {
             let ty = map_data_type(&col.data_type)?;
@@ -707,8 +707,8 @@ impl SqlEngine {
 
     /// Replace every view reference in `body` with the view's definition as a
     /// derived subquery, recursively (so a view may build on other views). A
-    /// view is fully expanded in place — its own CTEs and nested views are
-    /// resolved here — so the result contains no view references and re-running
+    /// view is fully expanded in place - its own CTEs and nested views are
+    /// resolved here - so the result contains no view references and re-running
     /// the executor over a derived subquery does not re-trigger expansion.
     fn expand_views(&self, body: &mut SetExpr, depth: usize) -> Result<()> {
         match body {
@@ -1145,7 +1145,7 @@ impl SqlEngine {
         distinct: bool,
         where_correlated: bool,
     ) -> Result<Outcome> {
-        // Index seek (primary key or a UNIQUE secondary index) when applicable —
+        // Index seek (primary key or a UNIQUE secondary index) when applicable -
         // skipped when the predicate still holds a correlated subquery.
         if !where_correlated {
             if let Some(rows) = self.index_seek(txn, table, schema, &select.selection)? {
@@ -1265,7 +1265,7 @@ impl SqlEngine {
     /// Row ids from a range scan of the primary-key index when `pred` bounds the
     /// PK column with `>`, `>=`, `<`, `<=`, or `BETWEEN` (within a top-level
     /// `AND`). Only fixed-width key types (numeric / timestamp / bool) are
-    /// scanned — text keys vary in length, so an open-ended text range has no safe
+    /// scanned - text keys vary in length, so an open-ended text range has no safe
     /// sentinel and falls back to a full scan. The bounds need only be a correct
     /// superset: `index_seek` re-applies the full predicate to every candidate.
     fn pk_range_seek_rids(&self, table: &Table, pred: &Expr) -> Result<Option<Vec<RecordId>>> {
@@ -1413,8 +1413,8 @@ impl SqlEngine {
         Ok(rows)
     }
 
-    /// Materialize one `FROM`/`JOIN` source — a base table or a derived table
-    /// (`(SELECT …) AS alias`) — into a schema and its rows.
+    /// Materialize one `FROM`/`JOIN` source - a base table or a derived table
+    /// (`(SELECT …) AS alias`) - into a schema and its rows.
     fn source_of(
         &self,
         txn: &TxnHandle,
@@ -1522,7 +1522,7 @@ impl SqlEngine {
         }
     }
 
-    /// Whether a query references a column its own `FROM` does not provide — i.e.
+    /// Whether a query references a column its own `FROM` does not provide - i.e.
     /// it is correlated with an enclosing query.
     fn query_is_correlated(&self, q: &Query) -> bool {
         let SetExpr::Select(s) = q.body.as_ref() else {
@@ -1602,7 +1602,7 @@ impl SqlEngine {
         }
     }
 
-    /// Best-effort output column names of a subquery used as a derived table —
+    /// Best-effort output column names of a subquery used as a derived table -
     /// for correlation analysis only. Explicit projection items resolve to their
     /// name/alias; a `*` falls back to the inner `FROM`'s column names.
     fn derived_output_names(&self, q: &Query) -> Vec<String> {
@@ -1725,10 +1725,10 @@ impl SqlEngine {
     }
 
     /// Replace `(SELECT …)` / `x IN (SELECT …)` / `EXISTS (SELECT …)` in `expr`
-    /// with their results (uncorrelated only — the subquery runs standalone).
+    /// with their results (uncorrelated only - the subquery runs standalone).
     /// `outer = None`: resolve uncorrelated subqueries up front (correlated ones
     /// are left in place for the per-row pass). `outer = Some((schema, row))`:
-    /// the per-row pass — every subquery is decorrelated against the outer row
+    /// the per-row pass - every subquery is decorrelated against the outer row
     /// and run.
     fn resolve_subqueries(
         &self,
@@ -2386,7 +2386,7 @@ impl SqlEngine {
     /// Rows are grouped by the `PARTITION BY` key; within each partition the
     /// `ORDER BY` keys order the rows for ranking and offset functions. Aggregate
     /// windows produce the whole-partition value broadcast to each member (no
-    /// running frame — an explicit frame clause is ignored).
+    /// running frame - an explicit frame clause is ignored).
     fn compute_window(
         &self,
         wf: &WindowFn,
@@ -2546,7 +2546,7 @@ impl SqlEngine {
     ///
     /// A sequential scan applies the predicate per row; matching rows are
     /// re-encoded and written as a new MVCC version. The primary-key index is
-    /// repointed to each new version (its key is unchanged — updating a primary
+    /// repointed to each new version (its key is unchanged - updating a primary
     /// key is rejected, since that would need re-keying and a fresh uniqueness
     /// check). Index seeks for `UPDATE … WHERE pk = …` are a later optimization.
     fn exec_update(
@@ -2725,7 +2725,7 @@ impl SqlEngine {
     /// Enforce a table's `CHECK` predicates against a row about to be written.
     /// The write is rejected unless every predicate evaluates to true; a result
     /// of false *or* NULL/unknown fails (stricter than the SQL standard, which
-    /// passes on unknown — write `col IS NULL OR …` to allow NULLs).
+    /// passes on unknown - write `col IS NULL OR …` to allow NULLs).
     fn enforce_checks(
         &self,
         checks: &[Expr],
@@ -2818,7 +2818,7 @@ impl SqlEngine {
                 let idx = cols.resolve(None, &ident.value)?;
                 Ok(row[idx].clone())
             }
-            // `t.col` — a qualified reference into a joined row.
+            // `t.col` - a qualified reference into a joined row.
             Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
                 let idx = cols.resolve(Some(&parts[0].value), &parts[1].value)?;
                 Ok(row[idx].clone())
@@ -2884,7 +2884,7 @@ impl SqlEngine {
                 }
                 Ok(Value::Bool(found ^ negated))
             }
-            // `v [NOT] BETWEEN lo AND hi` — inclusive; NULL operands exclude.
+            // `v [NOT] BETWEEN lo AND hi` - inclusive; NULL operands exclude.
             Expr::Between {
                 expr: inner,
                 negated,
@@ -2994,7 +2994,7 @@ impl SqlEngine {
             // a floating-point type lands.
             Expr::Ceil { expr: inner, field } => self.ceil_floor(inner, field, row, cols, true),
             Expr::Floor { expr: inner, field } => self.ceil_floor(inner, field, row, cols, false),
-            // `CAST(expr AS <type>)` (and `expr::type`) — convert between scalar
+            // `CAST(expr AS <type>)` (and `expr::type`) - convert between scalar
             // types, e.g. `CAST('2021-06-15' AS TIMESTAMP)` or `CAST(x AS DOUBLE)`.
             Expr::Cast {
                 expr: inner,
@@ -3036,7 +3036,7 @@ impl SqlEngine {
     }
 
     /// Evaluate a scalar function call (date/time, string, numeric helpers).
-    /// Aggregate names are rejected here — they are handled by the aggregate
+    /// Aggregate names are rejected here - they are handled by the aggregate
     /// path, not per-row evaluation.
     fn eval_function(
         &self,
@@ -3337,7 +3337,7 @@ impl SqlEngine {
             },
             "LOCATE" => match (arg(0)?, arg(1)?) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                // LOCATE takes (substring, string) — the reverse of INSTR.
+                // LOCATE takes (substring, string) - the reverse of INSTR.
                 (Value::Text(sub), Value::Text(s)) => Ok(Value::Int64(str_index(&s, &sub))),
                 (a, b) => Err(SqlError::Type(format!(
                     "LOCATE expects text, got {a:?}, {b:?}"
@@ -3508,7 +3508,7 @@ fn compare(op: &BinaryOperator, l: &Value, r: &Value) -> bool {
 
 /// How a projected output column is produced.
 enum ProjKind {
-    /// A direct column index into the (joined) row — used for `*` expansion so a
+    /// A direct column index into the (joined) row - used for `*` expansion so a
     /// duplicate column name across joined tables is never re-resolved by name.
     Col(usize),
     /// An expression evaluated per row.
@@ -3664,7 +3664,7 @@ impl ColumnResolver for JoinSchema {
 
 /// Convert a computed value back into a literal expression, for substituting a
 /// resolved subquery result into the surrounding query. (A `Timestamp` reduces
-/// to its integer microseconds, losing the timestamp type — a known limit.)
+/// to its integer microseconds, losing the timestamp type - a known limit.)
 fn value_to_expr(v: Value) -> Expr {
     Expr::Value(match v {
         Value::Null => SqlValue::Null,
@@ -3901,7 +3901,7 @@ fn collect_ranges_into(expr: &Expr, out: &mut Vec<(String, RangeOp, Value)>) {
 /// wherever its name is referenced (non-recursive). CTEs may reference earlier
 /// ones; a self- or forward-reference is left unresolved, so a recursive CTE
 /// fails at table lookup rather than looping. A CTE column-rename list
-/// (`WITH c(a, b) AS …`) is not applied — references use the body's output names.
+/// (`WITH c(a, b) AS …`) is not applied - references use the body's output names.
 fn expand_ctes(query: &mut Query) {
     let Some(with) = query.with.take() else {
         return;
@@ -4869,8 +4869,8 @@ fn nonunique_key(framed: &[u8], rid: RecordId) -> Vec<u8> {
     k
 }
 
-/// Frame (non-NULL) values into a self-delimiting composite key — each part is a
-/// `u32` length followed by its order-preserving bytes — so a multi-column key is
+/// Frame (non-NULL) values into a self-delimiting composite key - each part is a
+/// `u32` length followed by its order-preserving bytes - so a multi-column key is
 /// unambiguous and all entries for one value share a prefix.
 fn frame_index_key(values: &[&Value]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -5133,7 +5133,7 @@ mod tests {
             env.engine.execute_autocommit("SELECT id FROM t"),
             Err(SqlError::NoSuchTable(_))
         ));
-        // The name is free to reuse — with a fresh, independent schema.
+        // The name is free to reuse - with a fresh, independent schema.
         env.engine
             .execute_autocommit("CREATE TABLE t (other BIGINT)")
             .unwrap();
@@ -5590,7 +5590,7 @@ mod tests {
     #[test]
     fn update_keeps_the_primary_key_index_consistent() {
         // After an UPDATE the PK seek (index path) must still find the row, with
-        // its new column values — i.e. the index was repointed to the new
+        // its new column values - i.e. the index was repointed to the new
         // version, not left dangling at the old one.
         let env = env();
         env.engine
@@ -5896,8 +5896,8 @@ mod tests {
         assert_eq!(
             row,
             vec![
-                Value::Int64(4),  // COUNT(*) — all rows
-                Value::Int64(3),  // COUNT(score) — non-NULL only
+                Value::Int64(4),  // COUNT(*) - all rows
+                Value::Int64(3),  // COUNT(score) - non-NULL only
                 Value::Int64(60), // SUM skips NULL
                 Value::Int64(10), // MIN skips NULL
                 Value::Int64(30), // MAX skips NULL
@@ -6318,7 +6318,7 @@ mod tests {
         assert_eq!(
             r.len(),
             3,
-            "(1,1),(1,2),(2,1) — the duplicate (1,1) collapses"
+            "(1,1),(1,2),(2,1) - the duplicate (1,1) collapses"
         );
     }
 
@@ -7351,7 +7351,7 @@ mod tests {
             vec![vec![Value::Int64(2)], vec![Value::Int64(3)]]
         );
 
-        // INTERSECT ALL: min multiplicity per row — one 2 (a:2,b:1) and one 3 (a:1,b:2).
+        // INTERSECT ALL: min multiplicity per row - one 2 (a:2,b:1) and one 3 (a:1,b:2).
         assert_eq!(
             rows(
                 env.engine
@@ -7371,7 +7371,7 @@ mod tests {
             vec![vec![Value::Int64(1)]]
         );
 
-        // EXCEPT ALL: left multiplicities minus right — 1 once, and one extra 2.
+        // EXCEPT ALL: left multiplicities minus right - 1 once, and one extra 2.
         assert_eq!(
             rows(
                 env.engine
@@ -7717,7 +7717,7 @@ mod tests {
             ]
         );
 
-        // LAG over ascending (distinct) salary — first row has no predecessor.
+        // LAG over ascending (distinct) salary - first row has no predecessor.
         assert_eq!(
             rows(
                 env.engine

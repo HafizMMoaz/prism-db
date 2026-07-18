@@ -26,8 +26,8 @@ Use GitHub's private vulnerability reporting instead:
 
 This opens a private channel visible only to you and the maintainers. If you
 cannot use GitHub's reporting flow, open a normal issue that says only "I would
-like to report a security issue, please enable private reporting" — with no
-technical detail — and we will follow up.
+like to report a security issue, please enable private reporting" - with no
+technical detail - and we will follow up.
 
 ### What to include
 

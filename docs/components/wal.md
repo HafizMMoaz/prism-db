@@ -214,9 +214,9 @@ retain_segments = 32        # for point-in-time recovery
 
 ## References
 
-- ADR 0003 — recovery algorithm.
-- ADR 0006 — single WAL across models.
-- `specs/wal-record-format.md` — byte layout.
-- `components/recovery.md` — the consumer.
+- ADR 0003 - recovery algorithm.
+- ADR 0006 - single WAL across models.
+- `specs/wal-record-format.md` - byte layout.
+- `components/recovery.md` - the consumer.
 - PostgreSQL WAL: `src/backend/access/transam/xlog.c`.
 - ARIES paper (Mohan et al. 1992).

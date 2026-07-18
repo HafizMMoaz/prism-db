@@ -1,20 +1,20 @@
 //! The M3 exit gate: **cross-model ACID**.
 //!
-//! These tests are the whole thesis of PrismDB in executable form — that SQL,
+//! These tests are the whole thesis of PrismDB in executable form - that SQL,
 //! documents, and KV are not three databases bolted together but three faces of
 //! *one* transactional engine. A single transaction reaches into all three
 //! models at once, and the guarantees hold across every one of them together:
 //!
-//! - `commit_is_atomic_across_all_three_models` — one transaction inserts a SQL
+//! - `commit_is_atomic_across_all_three_models` - one transaction inserts a SQL
 //!   row, a document, and a KV pair; on commit all three become visible, and on
 //!   abort none of them do. Atomicity spans the models, not just one engine.
-//! - `crash_during_a_cross_model_txn_recovers_consistently` — a committed
+//! - `crash_during_a_cross_model_txn_recovers_consistently` - a committed
 //!   cross-model transaction survives a crash in full, while a transaction that
 //!   was mid-flight at the crash (data on disk, no commit record) leaves *no*
 //!   trace in *any* model. All-or-nothing, across models, across a restart.
 //!
 //! All three engines share one [`RecordStore`], one [`TxnManager`], one WAL, and
-//! one buffer pool — so MVCC, locking, and recovery are shared, and these
+//! one buffer pool - so MVCC, locking, and recovery are shared, and these
 //! properties fall out of the single engine rather than being coordinated
 //! between separate ones.
 
@@ -173,7 +173,7 @@ fn commit_is_atomic_across_all_three_models() {
     write_all_three(&m, &t2, 2, "rolledback");
     t2.abort().unwrap();
 
-    // None of the aborted transaction's writes are visible — in any model —
+    // None of the aborted transaction's writes are visible - in any model -
     // while the earlier committed write is untouched.
     let r = m.txns.begin(TxnMode::ReadOnly);
     assert_eq!(sql_ids(&m, &r), vec![1], "aborted SQL row left no trace");
@@ -205,13 +205,13 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
         write_all_three(&m, &t1, 1, "committed");
         t1.commit().unwrap();
 
-        // T2: a cross-model transaction that is *mid-flight* — its writes reach
+        // T2: a cross-model transaction that is *mid-flight* - its writes reach
         // all three models but it never commits (the "loser").
         let t2 = m.txns.begin(TxnMode::ReadWrite);
         write_all_three(&m, &t2, 2, "loser");
 
         // T3: a later committed write. Its group-commit flush forces T2's
-        // already-appended data records out to the durable WAL — so recovery
+        // already-appended data records out to the durable WAL - so recovery
         // genuinely has to replay the loser's records and then *hide* them,
         // rather than the loser conveniently never reaching disk.
         let t3 = m.txns.begin(TxnMode::ReadWrite);
@@ -220,7 +220,7 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
 
         // Crash: leave the block. The storage stack (`m`) and the still-open
         // loser `t2` are dropped without a clean flush. T2's `Drop` appends a
-        // best-effort abort, but it is never flushed — so the durable WAL ends
+        // best-effort abort, but it is never flushed - so the durable WAL ends
         // at T3's commit, with T2's data records present but T2 uncommitted: a
         // genuine mid-flight loser for recovery to neutralize.
         let roots = (m.kv.index_root(), m.docs.index_root());
@@ -256,7 +256,7 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
     // The KV index tree reopens at its persisted root (no rescan needed).
     let reader = m.txns.begin(TxnMode::ReadOnly);
 
-    // The committed cross-model transaction survived — in full, in every model.
+    // The committed cross-model transaction survived - in full, in every model.
     assert_eq!(
         sql_ids(&m, &reader),
         vec![1],
@@ -278,7 +278,7 @@ fn crash_during_a_cross_model_txn_recovers_consistently() {
         "the flushing committed write survived"
     );
 
-    // The mid-flight transaction left no trace — in any model — even though its
+    // The mid-flight transaction left no trace - in any model - even though its
     // records were on durable storage at the moment of the crash.
     assert!(
         doc_accts(&m, &reader, "loser").is_empty(),

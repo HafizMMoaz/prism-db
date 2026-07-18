@@ -2,7 +2,7 @@
 //!
 //! Every message on the wire is `[length: u32][payload: length bytes]`, where
 //! `length` does not include the prefix itself (`docs/specs/wire-protocol.md`).
-//! Little-endian, matching the rest of the protocol — the ADR's mention of a
+//! Little-endian, matching the rest of the protocol - the ADR's mention of a
 //! big-endian prefix is superseded by the normative spec.
 //!
 //! These functions are pure buffer operations (no socket I/O): the server reads
@@ -26,11 +26,11 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
 /// Try to parse one frame from the front of `buf`.
 ///
 /// Returns:
-/// - `Ok(Some((payload, consumed)))` — a complete frame; `payload` is the slice
+/// - `Ok(Some((payload, consumed)))` - a complete frame; `payload` is the slice
 ///   between the prefix and the frame end, `consumed` is the total bytes to
 ///   advance the read buffer by (prefix + payload).
-/// - `Ok(None)` — not enough bytes yet; the caller should read more and retry.
-/// - `Err(FrameTooLarge)` — the declared length exceeds [`MAX_FRAME_SIZE`]; the
+/// - `Ok(None)` - not enough bytes yet; the caller should read more and retry.
+/// - `Err(FrameTooLarge)` - the declared length exceeds [`MAX_FRAME_SIZE`]; the
 ///   caller should close the connection.
 pub fn parse(buf: &[u8]) -> Result<Option<(&[u8], usize)>> {
     if buf.len() < LENGTH_PREFIX {

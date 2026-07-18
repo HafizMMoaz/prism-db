@@ -25,7 +25,7 @@ use crate::segment::{self, SEGMENT_HEADER_SIZE, SegmentHeader};
 pub enum SyncMode {
     /// fsync on flush and segment rotation (durable; the production setting).
     Fsync,
-    /// No fsync. Faster, **not durable** — for tests only.
+    /// No fsync. Faster, **not durable** - for tests only.
     None,
 }
 
@@ -263,7 +263,7 @@ impl Iterator for Replay {
             let off = self.offset as usize;
 
             // Not enough room for a header, or an empty (zeroed) slot: this
-            // segment is exhausted — advance to the next one.
+            // segment is exhausted - advance to the next one.
             if off + record::RECORD_HEADER_SIZE > bytes.len() || u64_le(bytes, off) == 0 {
                 self.seg_id += 1;
                 self.offset = SEGMENT_HEADER_SIZE as u32;

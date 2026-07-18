@@ -1,4 +1,4 @@
-// prism.cpp — transport (TCP sockets) and the high-level Client. The codec and
+// prism.cpp - transport (TCP sockets) and the high-level Client. The codec and
 // message (de)serialisation live in prism/prism.hpp; this file wires them to a
 // synchronous request/reply socket connection.
 

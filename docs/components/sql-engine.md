@@ -6,12 +6,12 @@
 
 ## Purpose
 
-The SQL engine translates SQL strings into executor pipelines that operate on the record store. It is the relational access method. Its job is to be a clean, narrow, predictable implementation of a useful subset of SQL — not to compete with Postgres on feature breadth.
+The SQL engine translates SQL strings into executor pipelines that operate on the record store. It is the relational access method. Its job is to be a clean, narrow, predictable implementation of a useful subset of SQL - not to compete with Postgres on feature breadth.
 
 > **Design target vs. what ships today.** The pipeline, binder, rewriter,
 > planner, and Volcano operators described below are the *target* architecture.
 > The engine that ships today interprets the parsed `sqlparser-rs` AST directly
-> against the catalog — there is no separate bind/rewrite/plan IR yet, joins are
+> against the catalog - there is no separate bind/rewrite/plan IR yet, joins are
 > nested-loop, and index use is a rule-based equality seek (no cost model). The
 > **[Implemented surface](#implemented-surface-current)** section below is the
 > authoritative list of what actually works; the `prism-sql` crate-level doc
@@ -28,12 +28,12 @@ doc comment, which is kept authoritative.
   and `FOREIGN KEY`/`REFERENCES` (child checked on `INSERT`/`UPDATE`, parent
   `RESTRICT` on `DELETE`). `ALTER TABLE` (add / drop / rename column, rename
   table), `DROP TABLE`.
-- `CREATE [OR REPLACE] VIEW v AS <query>` / `DROP VIEW [IF EXISTS] v` — logical
+- `CREATE [OR REPLACE] VIEW v AS <query>` / `DROP VIEW [IF EXISTS] v` - logical
   views. The view's `SELECT` text is stored in the catalog and expanded into a
   derived subquery wherever the view is referenced (so views may build on other
   views; a cyclic definition is caught by a depth limit). Materialized views and
   an explicit view column list (`CREATE VIEW v (a, b) AS …`) are deferred.
-- `CREATE [UNIQUE] INDEX name ON t (c, …)` / `DROP INDEX` — secondary B+tree
+- `CREATE [UNIQUE] INDEX name ON t (c, …)` / `DROP INDEX` - secondary B+tree
   indexes over one **or more** columns, `UNIQUE` or non-unique. `UNIQUE` is
   enforced on `INSERT`/`UPDATE`; both can serve equality seeks.
 - `INSERT … VALUES (…), …` and `INSERT … SELECT` (the source query materializes
@@ -41,17 +41,17 @@ doc comment, which is kept authoritative.
   `UPDATE t SET … [WHERE …]`, `DELETE FROM t [WHERE …]`. (Updating a
   `PRIMARY KEY` column is deferred.)
 
-**Queries** — `SELECT [DISTINCT] <exprs | *> FROM … [WHERE …]
+**Queries** - `SELECT [DISTINCT] <exprs | *> FROM … [WHERE …]
 [GROUP BY … [HAVING …]] [ORDER BY … [ASC|DESC]] [LIMIT n] [OFFSET n]`, combinable
 with `UNION` / `INTERSECT` / `EXCEPT` (each `ALL` or distinct; the outer
 `ORDER BY`/`LIMIT`/`OFFSET` binds to the combined result).
 - **Access path:** sequential scan, with a rule-based **index seek** when (within
-  a top-level `AND`) the `WHERE` pins the primary key — or every column of a
-  secondary index — to a literal, or bounds the primary key with a range
+  a top-level `AND`) the `WHERE` pins the primary key - or every column of a
+  secondary index - to a literal, or bounds the primary key with a range
   (`>`/`>=`/`<`/`<=`/`BETWEEN`, fixed-width key types). The residual predicate is
   re-applied to the seeked rows.
 - **Joins** (nested-loop): `INNER`, `LEFT`, `RIGHT`, `FULL OUTER`, `CROSS`,
-  comma-separated cartesian products, and self-joins via aliases — with `ON`,
+  comma-separated cartesian products, and self-joins via aliases - with `ON`,
   `USING (…)`, and `NATURAL` (the latter two coalesce the join columns).
   `t.col`-qualified references work throughout the statement.
 - **Aggregates:** `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, with optional
@@ -69,7 +69,7 @@ with `UNION` / `INTERSECT` / `EXCEPT` (each `ALL` or distinct; the outer
   `OVER (PARTITION BY … ORDER BY …)`, one value per row. Aggregate windows cover
   the whole partition; explicit frame clauses (`ROWS`/`RANGE …`) are deferred.
 
-**Expressions** — arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
+**Expressions** - arithmetic (`+ - * / %`), comparisons, `AND`/`OR`/`NOT`,
 `IS [NOT] NULL`, `[NOT] IN (…)`, `[NOT] BETWEEN … AND …`, `[NOT] LIKE` (`%`/`_`),
 `CASE`, `CAST(x AS <type>)`, and scalar functions:
 - **date/time:** `NOW`, `CURDATE`, `YEAR`/`MONTH`/`DAY`/`HOUR`/`MINUTE`/`SECOND`/
@@ -227,7 +227,7 @@ pub enum Type {
     Bool,         // BOOL / BOOLEAN
     Int64,        // BIGINT / INT / INTEGER
     Double,       // DOUBLE / FLOAT / REAL
-    Timestamp,    // TIMESTAMP — epoch microseconds
+    Timestamp,    // TIMESTAMP - epoch microseconds
     Text,         // TEXT / VARCHAR / CHAR
 }
 
@@ -242,9 +242,9 @@ pub enum Value {
 ```
 
 `Int64` is the one integer width and `Double` the one float width (narrower
-SQL spellings map onto them). The binary **wire/SDK** value space is broader —
+SQL spellings map onto them). The binary **wire/SDK** value space is broader -
 it also carries `Int32`, `Float32`, `Binary`, and `ObjectId` tags for the KV and
-document models (`docs/specs/record-format.md`) — but a relational column is one
+document models (`docs/specs/record-format.md`) - but a relational column is one
 of the five types above.
 
 Coercion: integers widen to doubles in mixed arithmetic; `TIMESTAMP` parses from
@@ -283,8 +283,8 @@ allow_implicit_cross_join = false
 
 ## References
 
-- ADR 0010 — Volcano execution.
-- `components/catalog.md` — what the binder consults.
-- `components/btree.md`, `components/mvcc.md` — what the executor calls.
+- ADR 0010 - Volcano execution.
+- `components/catalog.md` - what the binder consults.
+- `components/btree.md`, `components/mvcc.md` - what the executor calls.
 - `sqlparser-rs`: https://github.com/sqlparser-rs/sqlparser-rs
 - PostgreSQL's executor as a reference.

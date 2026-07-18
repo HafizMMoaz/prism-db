@@ -27,7 +27,7 @@ This is the architectural fork that defines the project.
 
 ## Decision
 
-Prism uses **one transaction manager and one WAL** shared by all three access methods. Cross-model transactions are implemented by the structural property that there is nothing to cross — operations across models route through the same transaction.
+Prism uses **one transaction manager and one WAL** shared by all three access methods. Cross-model transactions are implemented by the structural property that there is nothing to cross - operations across models route through the same transaction.
 
 ## Alternatives considered
 
@@ -136,8 +136,8 @@ The single-WAL design has none of these. The WAL is the WAL; the access methods 
 
 ## References
 
-- ADR 0003 — WAL design.
-- ADR 0004 — MVCC isolation.
-- ADR 0005 — unified record format.
+- ADR 0003 - WAL design.
+- ADR 0004 - MVCC isolation.
+- ADR 0005 - unified record format.
 - Postgres's WAL is unary in this sense (one log per cluster). MongoDB's journal likewise. There is precedent.
 - Gray and Reuter, *Transaction Processing*, on why 2PC is the wrong tool for one-process transactions.

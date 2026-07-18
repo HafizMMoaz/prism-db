@@ -1,4 +1,4 @@
-//! `prism-buffer` — the buffer pool.
+//! `prism-buffer` - the buffer pool.
 //!
 //! The in-memory cache of pages. Owns a fixed pool of frames; loads pages on
 //! demand, pins them during use, and evicts under pressure via clock sweep.

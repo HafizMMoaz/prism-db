@@ -1,5 +1,5 @@
 //! Client round-trips against a hand-rolled mock server that speaks the wire
-//! protocol — so the client is exercised without depending on `prism-server`.
+//! protocol - so the client is exercised without depending on `prism-server`.
 
 use std::net::SocketAddr;
 
@@ -19,7 +19,7 @@ async fn mock_server() -> SocketAddr {
         let (mut stream, _) = listener.accept().await.unwrap();
         while let Some(packet) = read_packet(&mut stream).await {
             // Before answering a Ping, send an unsolicited notice (request_id 0)
-            // — the client must skip it and still match the Pong.
+            // - the client must skip it and still match the Pong.
             if matches!(packet.message, Message::Ping) {
                 let notice = Packet::new(
                     0,

@@ -7,6 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Intentionally has no Prism dependencies — both the server and clients pull
+# Intentionally has no Prism dependencies - both the server and clients pull
 # this in. See docs/architecture/module-layout.md.
 [dependencies]

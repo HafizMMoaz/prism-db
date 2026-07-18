@@ -2,7 +2,7 @@
 
 A **pure-C** client for [PrismDB](https://github.com/HafizMMoaz/prism-db), speaking the binary wire
 protocol directly over a TCP socket. Single header (`include/prism.h`) plus a
-single source file (`src/prism.c`), no third-party dependencies — drop it into
+single source file (`src/prism.c`), no third-party dependencies - drop it into
 any C99/C11 project. Cross-platform: Winsock on Windows, BSD sockets elsewhere.
 
 > Implements `docs/specs/wire-protocol.md`. The byte layouts are kept in lockstep

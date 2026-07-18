@@ -61,20 +61,20 @@ int main() {
 
 ## API
 
-- **`prism::Value`** — a `std::variant`-backed value. Construct implicitly from
+- **`prism::Value`** - a `std::variant`-backed value. Construct implicitly from
   `bool`, integers (default to **Int64**), `double`, `std::string`/`const char*`,
   `std::vector<uint8_t>` (Binary), `prism::Int32{n}`, `prism::Timestamp{us}`,
   `prism::ObjectId`, or `nullptr` (Null). Read with `asBool/asInt64/asInt32/
   asDouble/asString/asBytes/asObjectId` (throw on mismatch).
-- **SQL** — `db.sql(text, params)` → `SqlResult{columns, rows, affectedRows}`;
+- **SQL** - `db.sql(text, params)` → `SqlResult{columns, rows, affectedRows}`;
   `result.column("name")` gives a column index.
-- **KV** — `kvGet` (→ `std::optional`), `kvPut`, `kvDelete`.
-- **Documents** — `insertOne`/`insertMany`, `find`/`findOne`, `count`,
+- **KV** - `kvGet` (→ `std::optional`), `kvPut`, `kvDelete`.
+- **Documents** - `insertOne`/`insertMany`, `find`/`findOne`, `count`,
   `updateOne`/`updateMany`, `deleteOne`/`deleteMany`. Build filters with
   `prism::Query` (`all/eq/ne/gt/lt/gte/lte/in/nin/exists/and_/or_/not_`) and
   updates with `prism::Update{}.set(...).inc(...).unset(...)`.
-- **Transactions** — `begin(readOnly=false)`, `commit(idempotencyKey=0)`, `abort()`.
-- **Errors** — `prism::ServerError` (carries `info.code`, `info.sqlstate`,
+- **Transactions** - `begin(readOnly=false)`, `commit(idempotencyKey=0)`, `abort()`.
+- **Errors** - `prism::ServerError` (carries `info.code`, `info.sqlstate`,
   `info.message`, `info.detail`, `info.position`) and `prism::ProtocolError`,
   both deriving from `prism::Error`.
 

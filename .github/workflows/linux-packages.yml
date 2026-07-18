@@ -2,7 +2,7 @@ name: Linux packages
 
 # Builds the native Debian/RPM packages and attaches them to the GitHub Release.
 # Runs when a Release is published; dispatch manually to (re)build for an existing
-# tag — `ref` is the code to build from, `release_tag` the release to upload to.
+# tag - `ref` is the code to build from, `release_tag` the release to upload to.
 on:
   release:
     types: [published]

@@ -1,11 +1,11 @@
-//! `prism-bench` — synthetic workloads over the embedded engine.
+//! `prism-bench` - synthetic workloads over the embedded engine.
 //!
 //! Drives the in-process [`Database`]/[`Session`] API (no network) and reports
 //! throughput and latency percentiles. The workloads here are the testable core;
 //! the binary parses arguments and prints the report. See
 //! `docs/operations/benchmarking.md`.
 //!
-//! **Scope (this version):** four workloads — `kv` (a read/write mix), `sql`
+//! **Scope (this version):** four workloads - `kv` (a read/write mix), `sql`
 //! (insert throughput), `doc` (insertOne throughput), and `xmodel` (one explicit
 //! transaction per op touching SQL + document + KV). Requests go through
 //! [`Session`] exactly as a network client's would, minus the socket. The full
@@ -27,7 +27,7 @@ pub struct Params {
     pub keys: usize,
     /// Worker threads.
     pub threads: usize,
-    /// Percent of KV ops that are reads (0–100).
+    /// Percent of KV ops that are reads (0-100).
     pub read_pct: u8,
     /// KV value size in bytes.
     pub value_size: usize,
@@ -292,7 +292,7 @@ pub fn run_doc(db: &Arc<Database>, p: &Params) -> Result<BenchResult, String> {
 }
 
 /// Cross-model: one explicit transaction per op, writing a SQL row, a document,
-/// and a KV pair, then committing — the single-WAL cross-model path.
+/// and a KV pair, then committing - the single-WAL cross-model path.
 pub fn run_xmodel(db: &Arc<Database>, p: &Params) -> Result<BenchResult, String> {
     {
         let mut s = Session::new(db.clone());

@@ -23,8 +23,8 @@ Targets: Linux `x86_64`/`aarch64`, macOS `x86_64`/`aarch64`, Windows `x86_64`.
 
 A separate workflow,
 [`linux-packages.yml`](../../.github/workflows/linux-packages.yml), also builds
-the native **`.deb`** (cargo-deb) and **`.rpm`** (cargo-generate-rpm) — each
-registering `prismd` as a systemd service — and attaches them to the same
+the native **`.deb`** (cargo-deb) and **`.rpm`** (cargo-generate-rpm) - each
+registering `prismd` as a systemd service - and attaches them to the same
 release. It runs on `release: published`, and can be dispatched manually
 (`ref` = code to build, `release_tag` = release to upload to) to (re)build for an
 existing tag. The metadata lives in `crates/prism-cli/Cargo.toml`; the service
@@ -36,7 +36,7 @@ unit/config and Debian maintainer scripts are in [`deploy/`](../../deploy).
    dist pushes the formula there on each release; users then
    `brew install HafizMMoaz/prism/prismdb`.
 2. **Tap push token.** The default `GITHUB_TOKEN` cannot push to another repo, so
-   add a repo secret `HOMEBREW_TAP_TOKEN` — a fine-grained PAT with `contents:write`
+   add a repo secret `HOMEBREW_TAP_TOKEN` - a fine-grained PAT with `contents:write`
    on `homebrew-prism`. (If you skip the tap, drop `publish-jobs`/`tap` from
    `dist-workspace.toml` and re-run `dist generate`.)
 
@@ -63,7 +63,7 @@ published to npm by [`.github/workflows/npm-publish.yml`](../../.github/workflow
 It publishes the version in `sdks/node/package.json`, so **bump that version
 alongside the Cargo version when cutting a release**. It runs when a GitHub
 Release is published, and can be dispatched manually (Actions → **Publish Node
-SDK** → Run workflow → ref `main`) — useful for the first publish, or when a
+SDK** → Run workflow → ref `main`) - useful for the first publish, or when a
 release tag predates a packaging fix. The job builds, tests, and runs `npm
 publish --provenance --access public`.
 
@@ -97,7 +97,7 @@ key). To rotate the key, regenerate it, replace the secret and that file.
 
 ## Changing the build
 
-Edit `dist-workspace.toml` (installers, targets, tap, …) and **regenerate** CI —
+Edit `dist-workspace.toml` (installers, targets, tap, …) and **regenerate** CI -
 never hand-edit `release.yml`:
 
 ```sh

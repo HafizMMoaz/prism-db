@@ -34,7 +34,7 @@ pub struct CrashReport {
     pub stats: FaultStats,
     /// Pages inspected after reopen.
     pub pages_checked: usize,
-    /// Pages whose checksum failed (torn/lost/uninitialized — detected).
+    /// Pages whose checksum failed (torn/lost/uninitialized - detected).
     pub torn_detected: usize,
 }
 
@@ -162,7 +162,7 @@ pub fn run_scenario(
     let stats = handle.stats();
     if stats.violations > 0 {
         return Err(format!(
-            "seed {seed:#x}: WAL invariant violated {} time(s) — a heap page was written ahead of the durable WAL",
+            "seed {seed:#x}: WAL invariant violated {} time(s) - a heap page was written ahead of the durable WAL",
             stats.violations
         ));
     }

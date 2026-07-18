@@ -1,4 +1,4 @@
-//! `FaultyDisk` — an [`IoBackend`] shim that injects I/O faults and probes the
+//! `FaultyDisk` - an [`IoBackend`] shim that injects I/O faults and probes the
 //! WAL invariant.
 //!
 //! It wraps a real backend and, per a seeded probability config, can:
@@ -9,7 +9,7 @@
 //!
 //! When given a [`Wal`] handle it also asserts, on every full-page heap write,
 //! that the page's `page_lsn` (bytes 0..8) does not exceed the WAL's durable
-//! LSN — i.e. the buffer pool never writes a page ahead of the log. Violations
+//! LSN - i.e. the buffer pool never writes a page ahead of the log. Violations
 //! are counted (see [`FaultStats::violations`]).
 
 use std::io;

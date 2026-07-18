@@ -1,4 +1,4 @@
-//! `prism-testkit` — reusable test harnesses.
+//! `prism-testkit` - reusable test harnesses.
 //!
 //! Home for the fault-injection harness and shared fixtures used across crates.
 //! Not published; not subject to backward compatibility. See

@@ -51,7 +51,7 @@ impl ObjectKind {
 
 /// Whether a catalog record creates/updates an object or removes it (a
 /// tombstone). The records are append-only and replayed in order on open, so
-/// the last record per object wins — giving `DROP` without rewriting history.
+/// the last record per object wins - giving `DROP` without rewriting history.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CatalogOp {
     /// Create or update the object.
@@ -413,7 +413,7 @@ impl UserOp {
 
 /// One persisted user account, written append-only to a reserved system heap.
 /// On open the records are replayed in order, so the last `Upsert` for a
-/// username wins and a `Delete` tombstones it — giving durable accounts and
+/// username wins and a `Delete` tombstones it - giving durable accounts and
 /// grants without in-place updates.
 #[derive(Clone, Debug)]
 pub struct UserEntry {

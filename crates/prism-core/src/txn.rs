@@ -56,7 +56,7 @@ pub struct Snapshot {
     /// One past the highest transaction id allocated at snapshot time; any
     /// `t >= xmax` began after us and is invisible.
     pub xmax: TxnId,
-    /// Transactions in progress at snapshot time — invisible even if they later
+    /// Transactions in progress at snapshot time - invisible even if they later
     /// commit.
     pub active: HashSet<TxnId>,
 }
@@ -206,7 +206,7 @@ impl TxnManager {
         let snapshot = {
             let mut active = self.active.lock().expect("active set poisoned");
             // `active` excludes us (not inserted yet); concurrently-allocated
-            // ids are either here (active) or >= xmax — invisible either way.
+            // ids are either here (active) or >= xmax - invisible either way.
             let active_set: HashSet<TxnId> = active.iter().copied().collect();
             let xmax = self.next_txn.load(Ordering::SeqCst);
             let xmin = active.iter().next().copied().unwrap_or(txn_id).min(txn_id);

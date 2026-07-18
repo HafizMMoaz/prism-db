@@ -24,7 +24,7 @@ pub const FLAG_LOCKED: u16 = 1 << 3;
 /// A record identifier: a page plus a slot within it.
 ///
 /// Encoded into 6 bytes for `prev_version` chains (4-byte page + 2-byte slot),
-/// which caps a v1 database at `2^32` pages (32 TiB) — a documented limit.
+/// which caps a v1 database at `2^32` pages (32 TiB) - a documented limit.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct RecordId {
     /// The page holding the record.

@@ -3,7 +3,7 @@
 //!
 //! Locking discipline (to avoid deadlock): the directory mutex is always
 //! acquired **before** any per-frame state mutex. The directory mutex doubles
-//! as the "allocation latch" — it is held across the whole cache-miss/eviction
+//! as the "allocation latch" - it is held across the whole cache-miss/eviction
 //! path so only one thread evicts at a time. Per-frame content latches
 //! (`RwLock`) are acquired *after* releasing the directory mutex (the frame is
 //! pinned first, so it cannot be evicted while we wait).
@@ -583,7 +583,7 @@ mod tests {
 
     proptest! {
         /// With more pages than frames, every page must read back exactly what
-        /// was written — proving eviction+reload preserves data — and all pins
+        /// was written - proving eviction+reload preserves data - and all pins
         /// must settle to zero.
         #[test]
         fn pages_survive_eviction_under_pressure(reads in vec(0u8..8, 1..300)) {

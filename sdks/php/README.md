@@ -56,17 +56,17 @@ Pass `useTls: true` (with optional `tls:` stream SSL context options) for TLS. O
 a multi-database server, pass `database:` to select it at connect; otherwise run
 `$db->sql('USE <name>')` yourself.
 
-### SQL — `$db->sql(string $text, array $params = [], bool $returnRows = true)`
+### SQL - `$db->sql(string $text, array $params = [], bool $returnRows = true)`
 
 Returns a `SqlResult` with `->columns`, `->rows` (associative arrays keyed by
 column name), `->raw` (cells in column order), and `->affectedRows` (int).
 
-### KV — `$db->kv`
+### KV - `$db->kv`
 
 `get(ns, key): ?string`, `put(ns, key, value)`, `delete(ns, key)`. Keys and
 values are byte strings.
 
-### Documents — `$db->doc`
+### Documents - `$db->doc`
 
 `insertOne` / `insertMany` (return the assigned `ObjectId`s), `find` / `findOne`,
 `count`, `updateOne` / `updateMany`, `deleteOne` / `deleteMany`. Build filters with
@@ -86,7 +86,7 @@ $db->doc->updateOne('people', Q::eq('name', 'carol'), [
 ]);
 ```
 
-### Transactions — `$db->begin(bool $readOnly = false)`, `$db->commit(int $idempotencyKey = 0)`, `$db->abort()`
+### Transactions - `$db->begin(bool $readOnly = false)`, `$db->commit(int $idempotencyKey = 0)`, `$db->abort()`
 
 One `Client` is one server session, so calls between `begin()` and `commit()` run
 in that transaction.

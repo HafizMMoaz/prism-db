@@ -3,16 +3,16 @@
 **Status:** Accepted (living document)
 **Last updated:** 2026-05-15
 
-Risks ranked by potential impact × likelihood. Each entry has an owner, a description of the failure mode, the mitigation strategy, and a status. Mitigations should not be aspirational — they should be specific things we will do.
+Risks ranked by potential impact × likelihood. Each entry has an owner, a description of the failure mode, the mitigation strategy, and a status. Mitigations should not be aspirational - they should be specific things we will do.
 
-## R1 — Recovery correctness
+## R1 - Recovery correctness
 
 **Category:** Engineering
 **Impact:** Catastrophic (data loss)
 **Likelihood:** High (without effort)
 **Owner:** TBD
 
-**Description:** ARIES recovery is conceptually well-understood but has many edge cases. A bug in the analysis, redo, or undo phase can leave the database in an inconsistent state — silent data loss, wrong query results, or unable-to-start. The bug may not appear until production load hits an unusual crash pattern.
+**Description:** ARIES recovery is conceptually well-understood but has many edge cases. A bug in the analysis, redo, or undo phase can leave the database in an inconsistent state - silent data loss, wrong query results, or unable-to-start. The bug may not appear until production load hits an unusual crash pattern.
 
 **Specific failure modes:**
 - Off-by-one in the dirty page table reconstruction.
@@ -28,7 +28,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Open. All mitigations to be implemented during M2.
 
-## R2 — Scope creep / time overrun
+## R2 - Scope creep / time overrun
 
 **Category:** Project
 **Impact:** High (project doesn't ship)
@@ -44,7 +44,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Continuous. Re-checked weekly.
 
-## R3 — Performance is "fine" for benchmarks but bad in practice
+## R3 - Performance is "fine" for benchmarks but bad in practice
 
 **Category:** Engineering
 **Impact:** Medium
@@ -60,7 +60,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Open.
 
-## R4 — fsync trust
+## R4 - fsync trust
 
 **Category:** Engineering
 **Impact:** Catastrophic (silent data loss)
@@ -74,11 +74,11 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 - Use `F_FULLFSYNC` on macOS (the only reliable form there).
 - Document the supported filesystems explicitly (ext4, xfs, apfs).
 - Operator guidance to test with `diskchecker.pl` before production.
-- On certain detected errors from fsync (EIO), the engine panics rather than continuing — the "fsync gate" pattern.
+- On certain detected errors from fsync (EIO), the engine panics rather than continuing - the "fsync gate" pattern.
 
 **Status:** Open. To be implemented in M1's WAL.
 
-## R5 — Concurrency bugs in B+tree
+## R5 - Concurrency bugs in B+tree
 
 **Category:** Engineering
 **Impact:** High
@@ -95,7 +95,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Open. To be implemented in M3.
 
-## R6 — Cross-model transaction edge cases
+## R6 - Cross-model transaction edge cases
 
 **Category:** Engineering
 **Impact:** High
@@ -111,7 +111,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Open. Verified during M3.
 
-## R7 — Out-of-scope SQL feature requested by users
+## R7 - Out-of-scope SQL feature requested by users
 
 **Category:** Project
 **Impact:** Low (perception)
@@ -127,7 +127,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Continuous.
 
-## R8 — Memory leaks in long-running server
+## R8 - Memory leaks in long-running server
 
 **Category:** Engineering
 **Impact:** Medium (operations)
@@ -143,7 +143,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Open.
 
-## R9 — Documentation drift
+## R9 - Documentation drift
 
 **Category:** Project
 **Impact:** Medium (developer experience)
@@ -159,7 +159,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Continuous.
 
-## R10 — Single-developer bus factor
+## R10 - Single-developer bus factor
 
 **Category:** Project
 **Impact:** High
@@ -175,7 +175,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Continuous.
 
-## R11 — napi-rs SDK packaging
+## R11 - napi-rs SDK packaging
 
 **Category:** Engineering
 **Impact:** Medium (adoption)
@@ -191,7 +191,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Open. M4.
 
-## R12 — Tooling churn
+## R12 - Tooling churn
 
 **Category:** Engineering
 **Impact:** Low
@@ -207,7 +207,7 @@ Risks ranked by potential impact × likelihood. Each entry has an owner, a descr
 
 **Status:** Continuous.
 
-## R13 — Hardware-specific bugs
+## R13 - Hardware-specific bugs
 
 **Category:** Engineering
 **Impact:** High
@@ -238,10 +238,10 @@ Anyone can add a risk. The template:
 - Mitigation strategy (what we will do, not what we hope).
 - Status.
 
-Risks discovered post-release are still added — they inform v1.1.
+Risks discovered post-release are still added - they inform v1.1.
 
 ## References
 
-- `project/milestones.md` — risks are mapped to milestones.
-- `operations/testing-strategy.md` — how we verify mitigations.
-- `operations/fault-injection.md` — the deepest mitigation effort.
+- `project/milestones.md` - risks are mapped to milestones.
+- `operations/testing-strategy.md` - how we verify mitigations.
+- `operations/fault-injection.md` - the deepest mitigation effort.

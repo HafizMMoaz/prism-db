@@ -20,15 +20,15 @@ namespace PrismDb
     /// <summary>Update builders mirroring the engine's update operators.</summary>
     public static class U
     {
-        /// <summary>$set — set <paramref name="field"/> to <paramref name="value"/>.</summary>
+        /// <summary>$set - set <paramref name="field"/> to <paramref name="value"/>.</summary>
         public static DocUpdate Set(string field, object? value) =>
             new DocUpdate { Op = "set", Field = field, Value = value };
 
-        /// <summary>$unset — remove <paramref name="field"/>.</summary>
+        /// <summary>$unset - remove <paramref name="field"/>.</summary>
         public static DocUpdate Unset(string field) =>
             new DocUpdate { Op = "unset", Field = field };
 
-        /// <summary>$inc — add <paramref name="delta"/> to the integer <paramref name="field"/>.</summary>
+        /// <summary>$inc - add <paramref name="delta"/> to the integer <paramref name="field"/>.</summary>
         public static DocUpdate Inc(string field, long delta) =>
             new DocUpdate { Op = "inc", Field = field, Delta = delta };
     }

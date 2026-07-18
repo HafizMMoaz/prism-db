@@ -6,7 +6,7 @@
 //!
 //! - relational tables as replayable SQL (`CREATE TABLE …;` + `INSERT …;`),
 //! - documents as `DOC <collection> <hex>` (hex of the tagged-binary document),
-//! - key–value pairs as `KV <namespace> <hexKey> <hexValue>`.
+//! - key-value pairs as `KV <namespace> <hexKey> <hexValue>`.
 //!
 //! Import replays the directives into the target database and persists the
 //! catalog. SQL is the human-readable structure+data surface; documents and KV
@@ -31,7 +31,7 @@ pub struct ImportStats {
     pub rows: usize,
     /// Documents inserted.
     pub documents: usize,
-    /// Key–value pairs written.
+    /// Key-value pairs written.
     pub kv_pairs: usize,
 }
 
@@ -85,7 +85,7 @@ fn export_body(db: &Database, txn: &prism_core::txn::TxnHandle, out: &mut String
         }
     }
 
-    // ---- key–value namespaces ----
+    // ---- key-value namespaces ----
     for name in db.kv_namespace_names() {
         writeln!(out, "\n-- namespace: {name}").ok();
         let ns = db.kv_namespace(&name)?;

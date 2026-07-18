@@ -33,21 +33,21 @@ The protocol is documented in `specs/wire-protocol.md`. Summary:
 ### HTTP / REST
 **For:** Universal, debuggable, no SDK required.
 
-**Against:** Per-request overhead is significant when transactions involve many small operations. A connection-oriented protocol with multiplexing is far more appropriate for an OLTP workload. Also: REST and transactions are an awkward fit — keeping a transaction context across requests requires either session affinity or token round-tripping, both inferior to a stateful connection.
+**Against:** Per-request overhead is significant when transactions involve many small operations. A connection-oriented protocol with multiplexing is far more appropriate for an OLTP workload. Also: REST and transactions are an awkward fit - keeping a transaction context across requests requires either session affinity or token round-tripping, both inferior to a stateful connection.
 
 We will likely provide an HTTP gateway as a separate product for ad-hoc tooling, but it is not the primary protocol.
 
 ### gRPC
 **For:** Battle-tested, multiplexed, generated clients in every language.
 
-**Against:** Protobuf is large and adds dependencies (`prost`, `tonic`). HTTP/2 framing adds bytes per message. The schema-evolution story is excellent but we don't need it for v1 — we control both ends. gRPC is a defensible choice; we are deferring it on simplicity grounds.
+**Against:** Protobuf is large and adds dependencies (`prost`, `tonic`). HTTP/2 framing adds bytes per message. The schema-evolution story is excellent but we don't need it for v1 - we control both ends. gRPC is a defensible choice; we are deferring it on simplicity grounds.
 
 ### Wire-compatibility (Postgres or Mongo protocol)
 **For:** Existing tools (psql, mongo shell, ORMs, drivers) work immediately.
 
 **Against:** Each protocol is large (Postgres frontend/backend protocol is ~30 message types) and includes features we don't support, so we would be implementing a partial protocol that silently fails on unsupported messages. Worse: it commits us to data shapes that match the originating system. Postgres-compatible means looking like a SQL database, which buries the document and KV models.
 
-Implementing wire compatibility is also a substantial project on its own — Cockroach took years to converge on Postgres wire compatibility. We are not signing up for that scope.
+Implementing wire compatibility is also a substantial project on its own - Cockroach took years to converge on Postgres wire compatibility. We are not signing up for that scope.
 
 ### Multiple protocols (REST + binary)
 **For:** Best of both.
@@ -128,6 +128,6 @@ Connections start in plaintext on the listening port unless TLS-on-port is confi
 
 ## References
 
-- ADR 0009 — Node.js SDK; the protocol is what the SDK speaks.
-- `specs/wire-protocol.md` — normative.
-- For comparison, the Postgres frontend/backend protocol documentation (`https://www.postgresql.org/docs/current/protocol.html`) — what we are not implementing.
+- ADR 0009 - Node.js SDK; the protocol is what the SDK speaks.
+- `specs/wire-protocol.md` - normative.
+- For comparison, the Postgres frontend/backend protocol documentation (`https://www.postgresql.org/docs/current/protocol.html`) - what we are not implementing.

@@ -311,7 +311,7 @@ fn per_database_grant_scopes_data_access() {
         alice.handle(sql("CREATE TABLE t (id BIGINT PRIMARY KEY)"))
     ));
     assert!(ok(alice.handle(sql("INSERT INTO t VALUES (1)"))));
-    // But `secret`, with no grant, is closed to her — even `USE` is denied.
+    // But `secret`, with no grant, is closed to her - even `USE` is denied.
     assert!(
         errored(alice.handle(sql("USE secret"))),
         "no grant on secret => USE denied"

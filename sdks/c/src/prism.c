@@ -1,5 +1,5 @@
 /*
- * prism.c — implementation of the pure-C PrismDB client (see include/prism.h).
+ * prism.c - implementation of the pure-C PrismDB client (see include/prism.h).
  *
  * Mirrors the reference Node SDK and crates/prism-protocol byte-for-byte. All
  * multi-byte integers are little-endian; 64-bit values are written/read byte by

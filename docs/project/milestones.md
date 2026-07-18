@@ -15,12 +15,12 @@ This document lists the milestones for v1.0, with target dates, owners (TBD), ex
 | M3 | Three models | 2026-09-15 | Pending |
 | M4 | Surface and harness | 2026-10-15 | Pending |
 
-## M0 — Design lock (2026-05-15)
+## M0 - Design lock (2026-05-15)
 
 **Goal:** All architectural decisions documented and accepted.
 
 **Exit criteria:**
-- All ADRs (0001–0010) marked Accepted.
+- All ADRs (0001-0010) marked Accepted.
 - All component design docs written.
 - All on-disk specifications written.
 - Wire protocol and SDK API specified.
@@ -29,7 +29,7 @@ This document lists the milestones for v1.0, with target dates, owners (TBD), ex
 
 **Not in scope:** any code beyond a workspace skeleton and CI plumbing.
 
-## M1 — Foundation (target 2026-06-30)
+## M1 - Foundation (target 2026-06-30)
 
 **Goal:** Persistent storage layer working end-to-end, single-threaded.
 
@@ -46,7 +46,7 @@ This document lists the milestones for v1.0, with target dates, owners (TBD), ex
 - `O_DIRECT` semantics differ across filesystems. Mitigation: fall back to buffered I/O with explicit fsync where O_DIRECT is rejected.
 - Group commit tuning. Mitigation: starting point 1 ms window; tune from benchmark data.
 
-## M2 — Transactions and recovery (target 2026-07-31)
+## M2 - Transactions and recovery (target 2026-07-31)
 
 **Goal:** ACID transactions over the storage layer; ARIES recovery proven correct.
 
@@ -64,7 +64,7 @@ This document lists the milestones for v1.0, with target dates, owners (TBD), ex
 - Recovery edge cases. Mitigation: read ARIES paper carefully, code reviews of every recovery code path, extreme test coverage.
 - Lock manager deadlock detection bugs. Mitigation: synthetic deadlock test cases; randomized fairness tests.
 
-## M3 — Three models (target 2026-09-15)
+## M3 - Three models (target 2026-09-15)
 
 **Goal:** SQL, document, and KV engines all working over the unified record store with cross-model transactions.
 
@@ -84,7 +84,7 @@ This document lists the milestones for v1.0, with target dates, owners (TBD), ex
 - SQL parser/binder complexity. Mitigation: use `sqlparser-rs` for parsing; build a narrow binder that rejects unsupported features clearly.
 - B+tree concurrency bugs. Mitigation: Lehman-Yao tested extensively with property tests.
 
-## M4 — Surface and harness (target 2026-10-15)
+## M4 - Surface and harness (target 2026-10-15)
 
 **Goal:** Network protocol, SDK, shell, and the production-grade test harness.
 
@@ -147,6 +147,6 @@ The drop reflects compounding risk: each milestone depends on the previous, and 
 
 ## References
 
-- `overview/roadmap.md` — the narrative version.
-- `project/risk-register.md` — risks behind these milestones.
-- `operations/build-and-dev.md` — how the work happens.
+- `overview/roadmap.md` - the narrative version.
+- `project/risk-register.md` - risks behind these milestones.
+- `operations/build-and-dev.md` - how the work happens.

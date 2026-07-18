@@ -179,7 +179,7 @@ Wire protocol types. Pure data definitions, no I/O.
 - Serialization via a stable binary format (see `specs/wire-protocol.md`)
 - Versioning
 
-**Depends on:** nothing in Prism (intentional — both server and clients pull this in).
+**Depends on:** nothing in Prism (intentional - both server and clients pull this in).
 
 ### `prism-server`
 The server binary.
@@ -246,9 +246,9 @@ Benchmark harness binary.
 ## Test layout
 
 Per crate:
-- `src/` — implementation
-- `tests/` — integration tests
-- `benches/` — Criterion benchmarks
+- `src/` - implementation
+- `tests/` - integration tests
+- `benches/` - Criterion benchmarks
 - Property-based tests live alongside the modules they test, using `proptest`.
 
 Cross-crate tests (the Jepsen-style harness, the end-to-end shell tests) live in `tools/jepsen/` and `tools/e2e/`, as separate workspaces to keep `cargo test` fast.

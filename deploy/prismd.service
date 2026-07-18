@@ -12,7 +12,7 @@ DynamicUser=true
 
 # systemd creates and owns /var/lib/prismdb for the service. The config file
 # (installed at /etc/prismdb/prismd.conf) points PRISM_DATA_DIR at it and sets
-# the bind address, log level, and optional TLS — edit it, then restart.
+# the bind address, log level, and optional TLS - edit it, then restart.
 StateDirectory=prismdb
 EnvironmentFile=/etc/prismdb/prismd.conf
 

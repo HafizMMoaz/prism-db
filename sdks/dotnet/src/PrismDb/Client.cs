@@ -202,7 +202,7 @@ namespace PrismDb
         };
     }
 
-    /// <summary>client.Kv — namespaced key/value operations.</summary>
+    /// <summary>client.Kv - namespaced key/value operations.</summary>
     public sealed class KvSurface
     {
         private readonly Client _c;
@@ -235,7 +235,7 @@ namespace PrismDb
         }
     }
 
-    /// <summary>client.Doc — document collection operations.</summary>
+    /// <summary>client.Doc - document collection operations.</summary>
     public sealed class DocSurface
     {
         private readonly Client _c;

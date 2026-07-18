@@ -1,5 +1,5 @@
 //! End-to-end tests for the in-process dispatcher: protocol messages in,
-//! protocol messages out, against a real shared engine — including a single
+//! protocol messages out, against a real shared engine - including a single
 //! explicit transaction that spans all three models.
 
 use std::sync::Arc;
@@ -530,7 +530,7 @@ fn doc_update_operators_over_the_wire() {
         ],
     ));
 
-    // $set name, $inc visits by 5, $unset temp — all in one update.
+    // $set name, $inc visits by 5, $unset temp - all in one update.
     let q = DocQuery::Eq("name".into(), WireValue::Str("alice".into()));
     let upd = DocUpdate {
         ops: vec![
@@ -681,7 +681,7 @@ fn idempotent_commit_dedupes_and_discards_the_retry() {
     }));
 
     // A "retry": a fresh transaction does different work but commits with the
-    // SAME key. It must be de-duplicated — the original outcome is replayed and
+    // SAME key. It must be de-duplicated - the original outcome is replayed and
     // this transaction's write is discarded.
     let mut s2 = Session::new(db.clone());
     s2.handle(Message::Begin {
@@ -803,7 +803,7 @@ fn drop_collection_and_namespace() {
     ddl_err(s.handle(sql("DROP NAMESPACE cache")));
     ddl_ok(s.handle(sql("DROP NAMESPACE IF EXISTS cache")));
 
-    // Re-using the name gives a fresh, empty object — the old data is gone.
+    // Re-using the name gives a fresh, empty object - the old data is gone.
     s.handle(kv_put("cache", b"k2", b"v2"));
     assert_eq!(
         kv_value(s.handle(kv_get("cache", b"k"))),

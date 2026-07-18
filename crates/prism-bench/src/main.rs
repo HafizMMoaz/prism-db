@@ -1,4 +1,4 @@
-//! `prism-bench` — the benchmark harness binary.
+//! `prism-bench` - the benchmark harness binary.
 //!
 //! Runs synthetic workloads through the embedded engine and prints throughput
 //! and latency percentiles. See `docs/operations/benchmarking.md`.

@@ -70,7 +70,7 @@ Offset  Size  Field
                               for "is forwarding pointer" flag
 ```
 
-`record_offset = 0` means the slot is empty (record has been deleted or never allocated). Slot IDs are stable — when a slot is freed, its ID is not reused immediately; the slot stays empty until the page is compacted (rare).
+`record_offset = 0` means the slot is empty (record has been deleted or never allocated). Slot IDs are stable - when a slot is freed, its ID is not reused immediately; the slot stays empty until the page is compacted (rare).
 
 `record_length` high bit (bit 15) set means the slot is a forwarding pointer; the record bytes hold an 8-byte `RecordId` instead of a normal record. This is how oversized updates that don't fit in place are handled: the original slot becomes a pointer to the new location.
 
@@ -240,8 +240,8 @@ The `format_version` field on page 0 governs the entire on-disk format. Version 
 
 ## References
 
-- ADR 0002 — slotted page choice.
-- ADR 0005 — record header layout.
-- `specs/record-format.md` — record byte layout.
-- `components/disk-manager.md` — page I/O.
-- `components/btree.md`, `components/hash-index.md` — index page consumers.
+- ADR 0002 - slotted page choice.
+- ADR 0005 - record header layout.
+- `specs/record-format.md` - record byte layout.
+- `components/disk-manager.md` - page I/O.
+- `components/btree.md`, `components/hash-index.md` - index page consumers.

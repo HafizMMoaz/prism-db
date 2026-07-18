@@ -1,6 +1,6 @@
 //! TLS configuration for the server (rustls, ring crypto backend).
 //!
-//! TLS 1.2/1.3 over the same length-prefixed protocol — the connection is
+//! TLS 1.2/1.3 over the same length-prefixed protocol - the connection is
 //! wrapped before the first frame is read. The server presents a certificate;
 //! clients verify it. mTLS (client certificates) is a follow-up. See
 //! `docs/components/network-server.md`.

@@ -194,7 +194,7 @@ enabled = false
 
 ## References
 
-- ADR 0008 — protocol choice.
-- `specs/wire-protocol.md` — normative byte layout.
-- `components/transaction-manager.md` — session txn handling.
+- ADR 0008 - protocol choice.
+- `specs/wire-protocol.md` - normative byte layout.
+- `components/transaction-manager.md` - session txn handling.
 - Tokio documentation for the async model.

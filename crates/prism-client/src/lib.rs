@@ -1,11 +1,11 @@
-//! `prism-client` — an async client for the Prism wire protocol.
+//! `prism-client` - an async client for the Prism wire protocol.
 //!
 //! A thin, typed wrapper over `prism-protocol`: connect over TCP, complete the
 //! `Hello`/`Auth` handshake, then issue SQL / KV / document requests and read
 //! typed responses. One request is in flight at a time per [`Client`] (responses
 //! are matched by `request_id`; multiplexing is a future addition).
 //!
-//! This crate is a leaf — it depends only on the protocol types and tokio, never
+//! This crate is a leaf - it depends only on the protocol types and tokio, never
 //! on the server or engines (`docs/architecture/module-layout.md`). Documents
 //! are exchanged as opaque tagged-binary bytes; build and parse them with
 //! `prism-doc` on the application side.
@@ -321,7 +321,7 @@ impl Client {
         self.doc(collection, DocCommand::InsertOne(doc)).await
     }
 
-    /// Find documents matching `query` — the bytes of an encoded
+    /// Find documents matching `query` - the bytes of an encoded
     /// [`prism_protocol::DocQuery`] (`DocQuery::to_bytes`).
     pub async fn doc_find(&mut self, collection: &str, query: Vec<u8>) -> Result<DocReply> {
         self.doc(

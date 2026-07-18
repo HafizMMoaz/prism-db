@@ -47,7 +47,7 @@ If we were building an analytical engine, vectorization would be the right answe
 ### Morsel-driven
 **For:** Excellent scaling on modern multicore hardware for analytical queries.
 
-**Against:** Same reasoning as vectorized — overkill for OLTP queries that don't have enough work to parallelize within a single query.
+**Against:** Same reasoning as vectorized - overkill for OLTP queries that don't have enough work to parallelize within a single query.
 
 ## Why Volcano for Prism specifically
 
@@ -118,7 +118,7 @@ In v1, all sort and hash-join state is in memory. The query is aborted with `OUT
 
 ## References
 
-- Graefe: "Volcano — An Extensible and Parallel Query Evaluation System." TKDE 1994.
+- Graefe: "Volcano - An Extensible and Parallel Query Evaluation System." TKDE 1994.
 - PostgreSQL executor source (`src/backend/executor/`).
 - Kersten et al.: "Everything You Always Wanted to Know About Compiled and Vectorized Queries But Were Afraid to Ask." VLDB 2018. The reference comparison.
-- ADR 0001 — Rust trait objects make Volcano operators clean to express.
+- ADR 0001 - Rust trait objects make Volcano operators clean to express.

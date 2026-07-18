@@ -1,4 +1,4 @@
-// @prismdb/client — a pure-TypeScript client for PrismDB over the binary wire
+// @prismdb/client - a pure-TypeScript client for PrismDB over the binary wire
 // protocol (docs/specs/wire-protocol.md). No native build.
 
 export { Client } from "./client.js";

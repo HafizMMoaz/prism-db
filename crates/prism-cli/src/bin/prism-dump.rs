@@ -1,4 +1,4 @@
-//! `prism-dump` — logical backup/restore for a PrismDB directory.
+//! `prism-dump` - logical backup/restore for a PrismDB directory.
 //!
 //!   prism-dump export <dir> [file]   dump structure + data (stdout if no file)
 //!   prism-dump import <dir> <file>   restore a dump into the database

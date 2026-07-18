@@ -1,7 +1,7 @@
 //! A tiny deterministic PRNG (SplitMix64).
 //!
 //! Seeded and reproducible so every harness run derives all randomness from a
-//! single master seed — a failure is replayed by re-running the same seed. We
+//! single master seed - a failure is replayed by re-running the same seed. We
 //! avoid a `rand` dependency for the foundation crates.
 
 /// A SplitMix64 generator.

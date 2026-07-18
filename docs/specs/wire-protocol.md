@@ -320,7 +320,7 @@ Backward-compatible additions (new message types, new fields gated on feature fl
 
 ## References
 
-- ADR 0008 — binary protocol decision.
-- `components/network-server.md` — server-side implementation.
-- `specs/sdk-api.md` — high-level client surface.
-- `specs/record-format.md` — type tag encodings.
+- ADR 0008 - binary protocol decision.
+- `components/network-server.md` - server-side implementation.
+- `specs/sdk-api.md` - high-level client surface.
+- `specs/record-format.md` - type tag encodings.

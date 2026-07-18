@@ -44,7 +44,7 @@ Bit  Name              Meaning
 
 `prev_version` is a 6-byte little-endian `RecordId`:
 - Bytes 0-5 are the low 48 bits of the RecordId.
-- The high 16 bits (slot_id) come from a flags field — actually no.
+- The high 16 bits (slot_id) come from a flags field - actually no.
 
 Correction: a `RecordId` is 64 bits total. To fit in 6 bytes (48 bits), we restrict prev_version to record IDs within the same database file with `page_id < 2^32` and `slot_id < 2^16`. Specifically: 4 bytes page_id, 2 bytes slot_id, totaling 6 bytes.
 
@@ -234,7 +234,7 @@ The record header layout is version 1. Future format versions are documented sep
 
 ## References
 
-- ADR 0005 — unified record format decision.
-- `specs/page-format.md` — containing layout.
-- `components/mvcc.md` — uses xmin/xmax/prev_version.
-- `components/sql-engine.md`, `components/document-engine.md`, `components/kv-engine.md` — each access method's payload interpreter.
+- ADR 0005 - unified record format decision.
+- `specs/page-format.md` - containing layout.
+- `components/mvcc.md` - uses xmin/xmax/prev_version.
+- `components/sql-engine.md`, `components/document-engine.md`, `components/kv-engine.md` - each access method's payload interpreter.

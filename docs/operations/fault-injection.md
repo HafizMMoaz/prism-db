@@ -3,7 +3,7 @@
 **Status:** Accepted
 **Last updated:** 2026-05-15
 
-A database earns trust by being crashed, killed, starved of disk, and starved of memory — repeatedly, under realistic load — and still coming back consistent. This document describes the fault-injection harness, what it tests, and the bar for accepting changes that touch recovery, the WAL, or the buffer pool.
+A database earns trust by being crashed, killed, starved of disk, and starved of memory - repeatedly, under realistic load - and still coming back consistent. This document describes the fault-injection harness, what it tests, and the bar for accepting changes that touch recovery, the WAL, or the buffer pool.
 
 ## Goals
 
@@ -238,8 +238,8 @@ The harness tests what we ask it to. Bugs in the harness, the consistency checke
 
 ## References
 
-- `components/recovery.md` — what we are testing.
-- `operations/testing-strategy.md` — the broader test layering.
+- `components/recovery.md` - what we are testing.
+- `operations/testing-strategy.md` - the broader test layering.
 - Jepsen: https://jepsen.io
 - Elle: https://github.com/jepsen-io/elle
-- Mohan et al. 1992 — ARIES correctness arguments we are validating.
+- Mohan et al. 1992 - ARIES correctness arguments we are validating.

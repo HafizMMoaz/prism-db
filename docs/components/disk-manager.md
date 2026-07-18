@@ -36,7 +36,7 @@ impl DiskManager {
 1. **Sized writes only.** `write_page` writes exactly `PAGE_SIZE` bytes at offset `page_id * PAGE_SIZE`. No partial writes from this layer.
 2. **No torn write protection.** The disk manager assumes the OS and disk may tear an 8 KiB write into smaller atomic units. Higher layers (WAL, page checksums) detect torn writes.
 3. **No retries.** I/O errors propagate up. The caller decides whether to retry, abort, or panic.
-4. **Single owner.** One process opens one heap file. The disk manager takes an exclusive OS file lock to prevent concurrent opens — `flock` on Linux, `flock`/`fcntl` on macOS, `LockFileEx` (or an exclusive share mode) on Windows — and a second `open()` on a locked file returns `LockedByOtherProcess`.
+4. **Single owner.** One process opens one heap file. The disk manager takes an exclusive OS file lock to prevent concurrent opens - `flock` on Linux, `flock`/`fcntl` on macOS, `LockFileEx` (or an exclusive share mode) on Windows - and a second `open()` on a locked file returns `LockedByOtherProcess`.
 5. **fsync is explicit.** `write_page` returns when the bytes have been handed to the OS, not when they are durable. Durability requires `sync()`.
 
 ## File layout
@@ -64,7 +64,7 @@ Page 0 is read at startup and its magic and version validated. Mismatch → `Inc
 Prism is a first-class citizen on Linux, macOS, and Windows. All OS-specific
 file behavior is confined to one trait inside `prism-storage`; the rest of the
 engine is portable Rust and never sees a platform `#[cfg]`. The trait abstracts
-exactly three things — positioned read, positioned write, and durable sync —
+exactly three things - positioned read, positioned write, and durable sync -
 plus open/lock/allocate. Each OS provides a backend, and every backend has a
 portable buffered fallback so the engine runs even where the fast path is
 unavailable (e.g. tmpfs rejecting direct I/O, or a filesystem without it).
@@ -156,6 +156,6 @@ The disk manager is `Send + Sync`. Multiple threads can call `read_page` and `wr
 
 ## References
 
-- ADR 0002 — page-based storage.
-- ADR 0003 — WAL invariant requires durable sync semantics.
-- `specs/page-format.md` — the byte layout the disk manager reads and writes.
+- ADR 0002 - page-based storage.
+- ADR 0003 - WAL invariant requires durable sync semantics.
+- `specs/page-format.md` - the byte layout the disk manager reads and writes.

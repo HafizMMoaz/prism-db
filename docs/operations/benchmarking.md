@@ -201,4 +201,4 @@ These are not the primary numbers, but they catch design flaws that the median w
 - `cargo-flamegraph`: https://github.com/flamegraph-rs/flamegraph
 - TPC-C specification: https://www.tpc.org/tpcc/
 - YCSB: https://github.com/brianfrankcooper/YCSB
-- `operations/testing-strategy.md` — broader test context.
+- `operations/testing-strategy.md` - broader test context.

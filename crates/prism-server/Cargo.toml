@@ -22,7 +22,7 @@ prism-kv = { workspace = true }
 prism-protocol = { workspace = true }
 # The embedded API assembles the shared storage stack (disk + WAL + buffer pool
 # + transaction manager + record store) and drives it directly, so it depends on
-# the lower layers as well as the three engines. Downward only — no cycle.
+# the lower layers as well as the three engines. Downward only - no cycle.
 prism-core = { workspace = true }
 prism-storage = { workspace = true }
 prism-buffer = { workspace = true }

@@ -1,7 +1,7 @@
 # prism-client (Java)
 
 A **pure-Java** client for [PrismDB](https://github.com/HafizMMoaz/prism-db), speaking the binary wire
-protocol directly over a TCP (or TLS) socket. No native dependency, no JNI — just
+protocol directly over a TCP (or TLS) socket. No native dependency, no JNI - just
 the JDK. Requires Java 11+.
 
 > Implements `docs/specs/wire-protocol.md`. The byte layouts are kept in lockstep
@@ -56,17 +56,17 @@ Fluent options: `host`, `port`, `username` (omit to skip auth), `password`,
 `database`, `tls(true)`, `connectTimeoutMs`, `clientName`, `clientVersion`. There
 is also `Client.connect(host, port, username, password)`.
 
-### SQL — `db.sql(text)` / `db.sql(text, params)`
+### SQL - `db.sql(text)` / `db.sql(text, params)`
 
 `params` is any `List<?>`. Returns a `SqlResult` with `columns`, `rows` (maps keyed
 by column name), `raw` (cells in column order), and `affectedRows`.
 
-### KV — `db.kv`
+### KV - `db.kv`
 
 `get(ns, key) → byte[]` (null if absent), `getString(...)`, `put(ns, key, value)`,
 `delete(ns, key)`. Keys/values are `String` (UTF-8) or `byte[]`.
 
-### Documents — `db.doc`
+### Documents - `db.doc`
 
 `insertOne` / `insertMany` (return the assigned `ObjectId`s), `find` / `findOne`,
 `count`, `updateOne` / `updateMany`, `deleteOne` / `deleteMany`. Build filters with
@@ -83,7 +83,7 @@ db.doc.updateOne("people", Q.eq("name", "carol"),
     List.of(U.set("city", "Boston"), U.inc("age", 1), U.unset("temp")));
 ```
 
-### Transactions — `db.begin()` / `db.begin(readOnly)`, `db.commit()` / `db.commit(key)`, `db.abort()`
+### Transactions - `db.begin()` / `db.begin(readOnly)`, `db.commit()` / `db.commit(key)`, `db.abort()`
 
 One `Client` is one server session, so calls between `begin()` and `commit()` run
 in that transaction.

@@ -1,7 +1,7 @@
-//! `prism-protocol` — wire protocol types and serialization.
+//! `prism-protocol` - wire protocol types and serialization.
 //!
 //! Message enums and their stable little-endian binary encoding, plus the
-//! length-prefixed framing — pure data definitions with no socket I/O, so both
+//! length-prefixed framing - pure data definitions with no socket I/O, so both
 //! the server and every client depend on it without pulling in the engine. See
 //! `docs/specs/wire-protocol.md` and `docs/adr/0008-binary-wire-protocol.md`.
 //!
@@ -10,7 +10,7 @@
 //! body. [`Packet`] is the header + body; [`frame`] adds and strips the length
 //! prefix.
 //!
-//! **Coverage:** the full v1 message set — the session and transaction control
+//! **Coverage:** the full v1 message set - the session and transaction control
 //! plane (handshake, authentication, `Begin`/`Commit`/`Abort`, cancellation,
 //! notices, keep-alive) and the query data plane (`SqlExecute`/`SqlResult`,
 //! `DocOp`/`DocResult`, `KvOp`/`KvResult`), plus framing, the little-endian

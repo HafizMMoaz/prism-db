@@ -1,4 +1,4 @@
-//! `prism-wal` — the write-ahead log.
+//! `prism-wal` - the write-ahead log.
 //!
 //! Append-only log of page mutations: LSN allocation, group-commit flush,
 //! segment rotation, and the replay iterator used by recovery. Built on
@@ -6,10 +6,10 @@
 //! `docs/specs/wal-record-format.md`, and ADR 0003.
 //!
 //! Modules:
-//! - [`record`] — the [`LogRecord`] enum and frame encode/decode (with CRC).
-//! - [`segment`] — segment headers and file naming.
-//! - [`wal`] — the [`Wal`] type: open/append/flush_through/replay.
-//! - [`error`] — the crate error type.
+//! - [`record`] - the [`LogRecord`] enum and frame encode/decode (with CRC).
+//! - [`segment`] - segment headers and file naming.
+//! - [`wal`] - the [`Wal`] type: open/append/flush_through/replay.
+//! - [`error`] - the crate error type.
 
 pub mod error;
 pub mod record;
@@ -28,7 +28,7 @@ pub use wal::{Config, SyncMode, Wal};
 pub struct Lsn(pub u64);
 
 impl Lsn {
-    /// The zero LSN — "nothing is durable yet" and the sentinel for an empty
+    /// The zero LSN - "nothing is durable yet" and the sentinel for an empty
     /// record header slot. No real record is ever assigned LSN 0.
     pub const ZERO: Lsn = Lsn(0);
 

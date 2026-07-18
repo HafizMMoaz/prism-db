@@ -110,7 +110,7 @@ def tag_of(v: Value) -> int:
         return v.tag
     if isinstance(v, ObjectId):
         return TAG.OBJECTID
-    if isinstance(v, bool):  # must precede int — bool is a subclass of int
+    if isinstance(v, bool):  # must precede int - bool is a subclass of int
         return TAG.BOOL
     if isinstance(v, int):
         return TAG.INT64

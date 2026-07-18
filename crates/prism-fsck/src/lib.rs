@@ -1,4 +1,4 @@
-//! `prism-fsck` — an offline integrity checker for a Prism database directory.
+//! `prism-fsck` - an offline integrity checker for a Prism database directory.
 //!
 //! Reads only the on-disk formats (no live engine, no recovery, no mutation) and
 //! validates them:
@@ -10,8 +10,8 @@
 //!   record (a crash mid-write) is just a warning.
 //!
 //! Per `docs/architecture/module-layout.md` this depends only on `prism-storage`
-//! and `prism-wal`. Deeper semantic checks — MVCC version chains, heap↔index
-//! consistency — need the engine layer and are a follow-up.
+//! and `prism-wal`. Deeper semantic checks - MVCC version chains, heap↔index
+//! consistency - need the engine layer and are a follow-up.
 
 use std::fmt;
 use std::path::Path;
@@ -28,7 +28,7 @@ const OFF_PAGE_TYPE: usize = 10;
 /// The outcome of checking a database directory.
 #[derive(Default, Debug)]
 pub struct Report {
-    /// Whether `heap.db` page 0 is a database header (vs a data page — the
+    /// Whether `heap.db` page 0 is a database header (vs a data page - the
     /// current store reserves no header page, so this is informational).
     pub header_present: bool,
     /// Total pages in `heap.db`.
@@ -126,7 +126,7 @@ fn check_heap(path: &Path, report: &mut Report) {
             .expect("exact page slice");
 
         // Page 0 may be a database header (a future feature). If it decodes as
-        // one, note it; otherwise it is just a data page — fall through and
+        // one, note it; otherwise it is just a data page - fall through and
         // checksum it like any other.
         if index == 0 && DbHeader::decode(page).is_ok() {
             report.header_present = true;
@@ -202,7 +202,7 @@ fn check_wal(dir: &Path, report: &mut Report) {
                     offset += total;
                 }
                 // A full frame whose CRC is wrong: the bytes are present but
-                // corrupt (bit-rot or a torn write) — flag it.
+                // corrupt (bit-rot or a torn write) - flag it.
                 Err(WalError::CrcMismatch) => {
                     report.errors.push(format!(
                         "wal segment {id}: record at offset {offset} failed CRC (torn write or corruption)"
@@ -210,7 +210,7 @@ fn check_wal(dir: &Path, report: &mut Report) {
                     break;
                 }
                 // A frame shorter than declared at the end of the file is the
-                // normal incomplete tail of a crash mid-write — a warning.
+                // normal incomplete tail of a crash mid-write - a warning.
                 Err(WalError::Decode(_)) => {
                     report.warnings.push(format!(
                         "wal segment {id}: incomplete final record at offset {offset} (crash mid-write)"

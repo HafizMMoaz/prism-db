@@ -21,7 +21,7 @@ final class SqlResult
     }
 }
 
-/** client->kv — namespaced key/value operations. */
+/** client->kv - namespaced key/value operations. */
 final class KvSurface
 {
     public function __construct(private Client $c)
@@ -48,7 +48,7 @@ final class KvSurface
     }
 }
 
-/** client->doc — document collection operations. */
+/** client->doc - document collection operations. */
 final class DocSurface
 {
     public function __construct(private Client $c)

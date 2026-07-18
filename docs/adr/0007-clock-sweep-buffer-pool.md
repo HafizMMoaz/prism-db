@@ -87,7 +87,7 @@ struct BufferPool {
 6. Return page reference.
 
 ### Eviction path (cache miss)
-1. Look up — miss.
+1. Look up - miss.
 2. Walk the clock hand:
    - For each frame: if pinned, skip. If unpinned and `usage_count > 0`, decrement and continue. If unpinned and `usage_count == 0`:
      - If dirty: enforce WAL invariant (`wal.flush_through(page.page_lsn)`), then write page to disk.
@@ -126,7 +126,7 @@ Number of frames = `buffer_pool_bytes / page_size`. For an 8 KiB page and a 1 Gi
 - Simple, well-understood implementation.
 
 ### Constrained
-- Worst-case eviction scan is 4N frames. Pathological — never observed in practice — but bounded.
+- Worst-case eviction scan is 4N frames. Pathological - never observed in practice - but bounded.
 - No automatic adaptation to scan-heavy workloads. Mitigation: a `BUFFER_POOL_HINT_SCAN` flag on operations the SQL planner knows are scans, causing those frames to enter at `usage_count = 0` rather than 1. (Postgres's "ring buffer" trick, simplified.)
 
 ### Required follow-on
@@ -138,5 +138,5 @@ Number of frames = `buffer_pool_bytes / page_size`. For an 8 KiB page and a 1 Gi
 - PostgreSQL `bufmgr` source: `src/backend/storage/buffer/bufmgr.c`.
 - Effelsberg and Härder: "Principles of Database Buffer Management." TODS 1984. Survey of policies.
 - O'Neil, O'Neil, Weikum: "The LRU-K Page Replacement Algorithm." SIGMOD 1993.
-- ADR 0002 — page-based storage; the buffer pool exists to cache pages.
-- `components/buffer-pool.md` — operational details.
+- ADR 0002 - page-based storage; the buffer pool exists to cache pages.
+- `components/buffer-pool.md` - operational details.

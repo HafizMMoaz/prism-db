@@ -1,5 +1,5 @@
 //! End-to-end TLS: a TLS-wrapped server and the real client connecting over TLS
-//! to run SQL — the same protocol, encrypted.
+//! to run SQL - the same protocol, encrypted.
 //!
 //! Uses a static, long-lived self-signed certificate for `localhost` (embedded
 //! below) so the tests need no certificate-generation dependency.

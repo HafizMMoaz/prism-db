@@ -15,15 +15,15 @@ export type DocUpdate =
 
 /** Update builders mirroring the engine's update operators. */
 export const U = {
-  /** `$set` — set `field` to `value`. */
+  /** `$set` - set `field` to `value`. */
   set(field: string, value: Value): DocUpdate {
     return { op: "set", field, value };
   },
-  /** `$unset` — remove `field`. */
+  /** `$unset` - remove `field`. */
   unset(field: string): DocUpdate {
     return { op: "unset", field };
   },
-  /** `$inc` — add `delta` to the integer `field`. */
+  /** `$inc` - add `delta` to the integer `field`. */
   inc(field: string, delta: number | bigint): DocUpdate {
     return { op: "inc", field, delta };
   },

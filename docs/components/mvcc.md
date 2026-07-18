@@ -207,10 +207,10 @@ deadlock_detection_interval_ms = 100
 
 ## References
 
-- ADR 0004 — snapshot isolation choice.
-- ADR 0005 — unified record format and xmin/xmax bookkeeping.
-- ADR 0006 — single TxnManager and WAL underpin this.
-- `components/transaction-manager.md` — snapshot provider.
-- `components/lock-manager.md` — write-write conflict resolution.
-- Berenson et al. 1995 — isolation level definitions.
+- ADR 0004 - snapshot isolation choice.
+- ADR 0005 - unified record format and xmin/xmax bookkeeping.
+- ADR 0006 - single TxnManager and WAL underpin this.
+- `components/transaction-manager.md` - snapshot provider.
+- `components/lock-manager.md` - write-write conflict resolution.
+- Berenson et al. 1995 - isolation level definitions.
 - PostgreSQL MVCC.

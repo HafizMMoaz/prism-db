@@ -5,7 +5,7 @@
 
 ## Context
 
-The primary client target for v1 is Node.js — JavaScript and TypeScript developers building applications against Prism. The SDK is what most users will see; its ergonomics directly determine adoption.
+The primary client target for v1 is Node.js - JavaScript and TypeScript developers building applications against Prism. The SDK is what most users will see; its ergonomics directly determine adoption.
 
 Ways to provide a Node.js SDK:
 
@@ -34,7 +34,7 @@ Prebuilt binaries for:
 ### Pure JavaScript
 **For:** Universal install. No native build. Smaller attack surface (no native code).
 
-**Against:** All wire-protocol serialization happens in JavaScript. For a workload with thousands of small operations per second per client, this is a measurable overhead. More importantly: we want to share the protocol implementation between the SDK and an embedded mode (where Prism is linked directly into the Node process). The embedded mode requires native code. Maintaining two implementations of the protocol — one in JS, one in Rust — is a long-term tax.
+**Against:** All wire-protocol serialization happens in JavaScript. For a workload with thousands of small operations per second per client, this is a measurable overhead. More importantly: we want to share the protocol implementation between the SDK and an embedded mode (where Prism is linked directly into the Node process). The embedded mode requires native code. Maintaining two implementations of the protocol - one in JS, one in Rust - is a long-term tax.
 
 We will likely provide a pure-JS fallback as a separate package for edge environments (Cloudflare Workers, etc.) that can't run native addons. But the primary SDK is native.
 
@@ -63,7 +63,7 @@ We do both, with the embedded mode as a v1.1 deliverable. v1 ships the remote SD
 
 3. **Prebuilt binary distribution.** `napi-rs` integrates with GitHub Actions to publish per-platform binaries to npm. The user runs `npm install @prism-db/sdk` and gets the right binary; no compilation on install.
 
-4. **Active project.** `napi-rs` is used by sharp, parcel, swc, prisma — mainstream Node.js infrastructure. Not a research toy.
+4. **Active project.** `napi-rs` is used by sharp, parcel, swc, prisma - mainstream Node.js infrastructure. Not a research toy.
 
 5. **Easy bridging to in-process embedded mode later.** Same Rust types used by the server can be exposed directly to JavaScript without a network round-trip.
 
@@ -138,6 +138,6 @@ Every transaction carries an idempotency key (auto-generated or caller-supplied)
 ## References
 
 - napi-rs: <https://napi.rs/>
-- ADR 0001 — Rust choice; napi-rs is contingent on it.
-- ADR 0008 — wire protocol; the SDK speaks it.
-- `specs/sdk-api.md` — surface details.
+- ADR 0001 - Rust choice; napi-rs is contingent on it.
+- ADR 0008 - wire protocol; the SDK speaks it.
+- `specs/sdk-api.md` - surface details.

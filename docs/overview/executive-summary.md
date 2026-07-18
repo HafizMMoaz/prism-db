@@ -14,7 +14,7 @@ Modern application development pushes engineers toward polyglot persistence: Pos
 
 ## The thesis
 
-The storage primitive underneath all three models is the same: a tuple of bytes, written through a write-ahead log, addressable by a logical identifier, versioned for concurrent readers. The user-facing differences — tables with schemas, schemaless documents, opaque key-value pairs — are access methods, not storage methods.
+The storage primitive underneath all three models is the same: a tuple of bytes, written through a write-ahead log, addressable by a logical identifier, versioned for concurrent readers. The user-facing differences - tables with schemas, schemaless documents, opaque key-value pairs - are access methods, not storage methods.
 
 If we commit to that observation in the design, one engine can serve all three models with a shared buffer pool, a shared WAL, and a shared transaction manager. A single transaction can touch any combination of the three. ACID is inherited; it does not need to be reconstructed at the application layer.
 
@@ -25,9 +25,9 @@ Prism is a single-node embedded-or-server database engine, written in Rust, prov
 1. **A unified storage layer.** 8 KiB slotted pages, one heap file per database, page-grained WAL with ARIES-style recovery.
 2. **A unified transaction manager.** MVCC with snapshot isolation. One transaction ID space across all models. One commit record per transaction regardless of how many models it touched.
 3. **Three access methods on top:**
-   - **Relational** — SQL surface (subset of SQL:2016), B+tree primary and secondary indexes, Volcano executor.
-   - **Document** — schemaless documents stored as tagged binary blobs, indexed by `_id` and by user-declared field paths.
-   - **Key-value** — ordered keys with point and range access, hash index for point lookups, optional ordered index for ranges.
+   - **Relational** - SQL surface (subset of SQL:2016), B+tree primary and secondary indexes, Volcano executor.
+   - **Document** - schemaless documents stored as tagged binary blobs, indexed by `_id` and by user-declared field paths.
+   - **Key-value** - ordered keys with point and range access, hash index for point lookups, optional ordered index for ranges.
 4. **Network and embedded access.** Binary TCP protocol for remote clients; in-process API for embedded use. Official SDK for Node.js via `napi-rs`. Interactive shell for ad-hoc work.
 
 ## Success criteria for v1.0

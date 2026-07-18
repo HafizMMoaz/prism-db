@@ -26,8 +26,8 @@ Recovery is single-threaded in v1. The server does not accept connections until 
 ## Outputs
 
 - The buffer pool, transaction manager, and commit log initialized to a consistent state.
-- The active transaction table containing exactly the transactions that were committed at crash time (yes, even though they're not "active" anymore — see below) and aborted transactions removed.
-- Wait — re-stating cleanly: after recovery, no transactions are active. Committed ones have their effects on pages; aborted/loser ones have been rolled back.
+- The active transaction table containing exactly the transactions that were committed at crash time (yes, even though they're not "active" anymore - see below) and aborted transactions removed.
+- Wait - re-stating cleanly: after recovery, no transactions are active. Committed ones have their effects on pages; aborted/loser ones have been rolled back.
 
 ## Phase 1: Analysis
 
@@ -54,7 +54,7 @@ For each record R in [last_checkpoint, end_of_log]:
 
 After analysis:
 - DPT contains every page that may need redo.
-- ATT contains every transaction's final state. Transactions still `Active` at end-of-log are **loser transactions** — they will be rolled back in undo.
+- ATT contains every transaction's final state. Transactions still `Active` at end-of-log are **loser transactions** - they will be rolled back in undo.
 
 The earliest `rec_lsn` in DPT is the start LSN for the redo phase.
 
@@ -79,7 +79,7 @@ CLRs are also redone: applying a CLR re-applies its undo image. This is what mak
 
 For each loser transaction (still `Active` in ATT after analysis), walk backward through its WAL records and apply inverses.
 
-The algorithm processes losers in parallel: at any moment, we know the "next LSN to undo" for each loser. We pick the loser whose next-LSN is largest (deepest in the log), undo that record, and update the loser's next-LSN to that record's `prev_lsn`. This way losers are undone in reverse total order — important for any inter-transaction dependencies.
+The algorithm processes losers in parallel: at any moment, we know the "next LSN to undo" for each loser. We pick the loser whose next-LSN is largest (deepest in the log), undo that record, and update the loser's next-LSN to that record's `prev_lsn`. This way losers are undone in reverse total order - important for any inter-transaction dependencies.
 
 For each step:
 1. Identify the loser L with the largest undo_next_lsn.
@@ -101,7 +101,7 @@ When a loser's undo_next_lsn reaches 0:
 - Remove from losers.
 
 When all losers are done:
-- `wal.flush_through(end_of_log)` — make sure the Abort records and CLRs are durable.
+- `wal.flush_through(end_of_log)` - make sure the Abort records and CLRs are durable.
 - Recovery completes.
 
 ## Bringing the active transaction table to live state
@@ -120,7 +120,7 @@ Pages may have torn writes from the crash. Two cases:
 1. **Page was clean at crash time.** The on-disk page is intact (no in-flight write). Recovery doesn't touch it; it's already correct.
 2. **Page was dirty at crash time.** It's in DPT. Recovery's redo replays every WAL record affecting it from `rec_lsn` forward, overwriting whatever torn bytes exist. After redo, page is correct.
 
-The implicit assumption: pages that were not in DPT at crash time were either not dirty, or were dirty but flushed before crash (in which case they're correct on disk). The DPT bootstrap from the checkpoint is conservative — it can contain extra pages that were clean by crash time, but it cannot omit a page that was actually dirty (because every dirty-making operation goes through the WAL, and analysis re-derives DPT from those records).
+The implicit assumption: pages that were not in DPT at crash time were either not dirty, or were dirty but flushed before crash (in which case they're correct on disk). The DPT bootstrap from the checkpoint is conservative - it can contain extra pages that were clean by crash time, but it cannot omit a page that was actually dirty (because every dirty-making operation goes through the WAL, and analysis re-derives DPT from those records).
 
 ## Full-page images
 
@@ -177,7 +177,7 @@ See `operations/fault-injection.md` for the full harness.
 ## References
 
 - Mohan, Haderle, Lindsay, Pirahesh, Schwarz: "ARIES." ACM TODS 1992. The foundational paper. **Read this before touching this code.**
-- ADR 0003 — WAL and ARIES choice.
-- `components/wal.md` — log format and replay API.
-- `components/transaction-manager.md` — commit log reconstruction.
-- `operations/fault-injection.md` — the test harness.
+- ADR 0003 - WAL and ARIES choice.
+- `components/wal.md` - log format and replay API.
+- `components/transaction-manager.md` - commit log reconstruction.
+- `operations/fault-injection.md` - the test harness.

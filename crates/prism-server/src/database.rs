@@ -1,7 +1,7 @@
 //! The embedded database: the shared storage stack plus the three engines.
 //!
 //! `Database` assembles one disk manager, WAL, buffer pool, transaction manager,
-//! and record store, then layers the SQL, document, and KV engines on top — all
+//! and record store, then layers the SQL, document, and KV engines on top - all
 //! sharing that single store, so a transaction spans all three models (the
 //! cross-model ACID guarantee). A [`crate::Session`] borrows a `Database` to
 //! serve protocol requests.
@@ -208,7 +208,7 @@ impl Database {
         names
     }
 
-    /// Names of all key–value namespaces, sorted (for enumeration / export).
+    /// Names of all key-value namespaces, sorted (for enumeration / export).
     pub fn kv_namespace_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .kv_namespaces
@@ -615,7 +615,7 @@ impl Database {
     }
 
     /// Persist every view currently in the catalog (used after a bulk restore).
-    /// Persisting is idempotent — the latest `Upsert` per name wins on reload.
+    /// Persisting is idempotent - the latest `Upsert` per name wins on reload.
     pub fn persist_views(&self) -> Result<()> {
         for name in self.sql.catalog().view_names() {
             self.persist_view(&name)?;
@@ -672,7 +672,7 @@ impl Database {
         Ok(true)
     }
 
-    /// Drop a key–value namespace: persist a tombstone and forget its mapping,
+    /// Drop a key-value namespace: persist a tombstone and forget its mapping,
     /// returning whether it existed. Its heap and index pages are abandoned.
     pub fn drop_namespace(&self, name: &str) -> Result<bool> {
         if !self
@@ -789,7 +789,7 @@ impl Database {
                     next_doc = next_doc.max(entry.heap + 1);
                 }
                 ObjectKind::Namespace => {
-                    // Reopen the durable index tree at its persisted root — no
+                    // Reopen the durable index tree at its persisted root - no
                     // rescan to rebuild an in-memory map.
                     let ns = KvNamespace::open(self.store.clone(), heap, PageId(entry.root_page));
                     kv_namespaces.insert(entry.name, Arc::new(ns));

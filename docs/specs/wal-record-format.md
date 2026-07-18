@@ -83,13 +83,13 @@ To find the next record: starting at offset O of the current record, the next re
 lsn: u64 = (segment_id: u32) << 32 | (offset_in_segment: u32)
 ```
 
-This gives 4 billion segments, each up to 4 GiB, totaling 16 EiB of WAL — effectively unlimited.
+This gives 4 billion segments, each up to 4 GiB, totaling 16 EiB of WAL - effectively unlimited.
 
 When reading by LSN: derive segment_id from high 32 bits, open that segment, seek to offset_in_segment, read.
 
 ## Record types
 
-### 0x01 — Insert
+### 0x01 - Insert
 
 ```
 page_id:        u64
@@ -99,7 +99,7 @@ after_image:    u32 length + bytes
 
 `after_image` is the full record bytes (24-byte record header + payload). Replaying inserts re-inserts the record at the given slot.
 
-### 0x02 — Update
+### 0x02 - Update
 
 ```
 page_id:        u64
@@ -110,7 +110,7 @@ after_image:    u32 length + bytes
 
 Both images included for undo support. before_image is the record bytes before the update; after_image is after.
 
-### 0x03 — Delete
+### 0x03 - Delete
 
 ```
 page_id:        u64
@@ -120,7 +120,7 @@ before_image:   u32 length + bytes
 
 Records the pre-delete bytes for undo. After delete, the slot's record has `xmax = txn_id`.
 
-### 0x10 — Commit
+### 0x10 - Commit
 
 ```
 commit_micros:  i64    (wall-clock commit time)
@@ -129,7 +129,7 @@ flags:          u32    (reserved)
 
 Marks the transaction durable. Recovery treats txns with a Commit record as winners.
 
-### 0x11 — Abort
+### 0x11 - Abort
 
 ```
 (no body beyond header)
@@ -137,7 +137,7 @@ Marks the transaction durable. Recovery treats txns with a Commit record as winn
 
 Marks the transaction aborted. Recovery treats txns with an Abort record as already-aborted (no undo needed).
 
-### 0x20 — CLR (Compensation Log Record)
+### 0x20 - CLR (Compensation Log Record)
 
 ```
 page_id:        u64
@@ -148,7 +148,7 @@ undo_next_lsn:  u64    (where the next-to-undo record is, or 0 if done)
 
 Written during undo. `undo_image` contains the bytes to write back to the page (the before-image of the record being undone). `undo_next_lsn` tells the next recovery where to resume undoing this txn.
 
-### 0x30 — BeginCheckpoint
+### 0x30 - BeginCheckpoint
 
 ```
 checkpoint_id:  u64
@@ -156,7 +156,7 @@ checkpoint_id:  u64
 
 Marks the start of a checkpoint. The corresponding CheckpointContents and EndCheckpoint follow.
 
-### 0x31 — CheckpointContents
+### 0x31 - CheckpointContents
 
 ```
 dirty_page_count:    u32
@@ -167,7 +167,7 @@ active_txns:         [(txn_id: u64, state: u8, last_lsn: u64)] × active_txn_cou
 
 The dirty page table and active transaction table at checkpoint time. Recovery uses these to bootstrap its analysis.
 
-### 0x32 — EndCheckpoint
+### 0x32 - EndCheckpoint
 
 ```
 checkpoint_id:  u64
@@ -175,7 +175,7 @@ checkpoint_id:  u64
 
 Marks the end of a checkpoint. Recovery looks for the most recent EndCheckpoint to determine the last completed checkpoint LSN.
 
-### 0x40 — IndexInsert
+### 0x40 - IndexInsert
 
 ```
 page_id:    u64    (the index leaf or hash bucket page)
@@ -183,7 +183,7 @@ key:        u16 length + bytes
 rid:        u64
 ```
 
-### 0x41 — IndexDelete
+### 0x41 - IndexDelete
 
 ```
 page_id:    u64
@@ -191,7 +191,7 @@ key:        u16 length + bytes
 rid:        u64
 ```
 
-### 0x42 — PageSplit (B+tree)
+### 0x42 - PageSplit (B+tree)
 
 ```
 left_page:      u64
@@ -204,7 +204,7 @@ parent_slot:    u16
 
 Logged when a B+tree page splits. Replay reconstructs the new page structure.
 
-### 0x43 — BucketSplit (hash)
+### 0x43 - BucketSplit (hash)
 
 ```
 old_bucket:    u64
@@ -212,13 +212,13 @@ new_bucket:    u64
 new_local_depth: u8
 ```
 
-### 0x44 — DirectoryExpand (hash)
+### 0x44 - DirectoryExpand (hash)
 
 ```
 new_global_depth: u8
 ```
 
-### 0x50 — FullPageImage
+### 0x50 - FullPageImage
 
 ```
 page_id:        u64
@@ -227,7 +227,7 @@ image:          u32 length + bytes    (exactly PAGE_SIZE bytes)
 
 Written for any page on its first modification after each checkpoint, to defend against torn writes. Replay overwrites the page.
 
-### 0x80 — UserDefined / Extension
+### 0x80 - UserDefined / Extension
 
 Reserved for future extensions. The body format is opaque to the WAL but understood by some higher-level component. v1 does not use this; it exists so v2 can add record types without bumping the format version.
 
@@ -253,11 +253,11 @@ Typical record sizes:
 - Commit: 32 + 8 + 4 + 4 = 48 bytes.
 - Full-page image: 32 + 8 + 4 + 8192 + 4 = 8240 bytes (one per page per checkpoint cycle in the worst case).
 
-A typical 1000-tps insert-only workload writes about 170 KB/sec of WAL plus ~50 KB of commit records — easily within SSD bandwidth.
+A typical 1000-tps insert-only workload writes about 170 KB/sec of WAL plus ~50 KB of commit records - easily within SSD bandwidth.
 
 ## References
 
-- ADR 0003 — recovery design.
-- `components/wal.md` — operational details.
-- `components/recovery.md` — replay logic.
-- Mohan et al. 1992 — ARIES paper.
+- ADR 0003 - recovery design.
+- `components/wal.md` - operational details.
+- `components/recovery.md` - replay logic.
+- Mohan et al. 1992 - ARIES paper.

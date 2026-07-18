@@ -27,7 +27,7 @@ Terms used throughout the Prism design corpus, defined once here. When a documen
 
 **Fuzzy checkpoint.** A checkpoint taken without halting writers. Begins with a `BEGIN_CHECKPOINT` log record capturing the active transaction table and dirty page table, ends with an `END_CHECKPOINT` log record marking it complete. Recovery starts from the most recent completed checkpoint.
 
-**Heap file.** A file on disk holding pages. Prism uses one heap file per database. Pages within the file are addressed by page ID, which is `(file_id, page_offset)` — though with one file per database, file ID is constant.
+**Heap file.** A file on disk holding pages. Prism uses one heap file per database. Pages within the file are addressed by page ID, which is `(file_id, page_offset)` - though with one file per database, file ID is constant.
 
 **Idempotent.** An operation that produces the same final state regardless of how many times it is applied. Recovery operations must be idempotent because crashes during recovery cause partial replays.
 

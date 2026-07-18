@@ -190,5 +190,5 @@ The B+tree has no user-facing configuration; the page size (8 KiB) is fixed, and
 
 - Lehman and Yao: "Efficient Locking for Concurrent Operations on B-Trees." ACM TODS 1981.
 - PostgreSQL's nbtree (Postgres uses Lehman-Yao with extensions).
-- ADR 0010 — index scan operators are part of the Volcano executor.
-- `components/recovery.md` — how index pages recover.
+- ADR 0010 - index scan operators are part of the Volcano executor.
+- `components/recovery.md` - how index pages recover.

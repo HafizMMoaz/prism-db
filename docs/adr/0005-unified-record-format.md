@@ -5,7 +5,7 @@
 
 ## Context
 
-If the cross-model thesis is to hold, the storage layer must store SQL rows, documents, and KV pairs in a uniform way. Otherwise we have three storage layouts requiring three buffer pool integrations, three WAL paths, and three recovery strategies — which is just three databases in a trench coat.
+If the cross-model thesis is to hold, the storage layer must store SQL rows, documents, and KV pairs in a uniform way. Otherwise we have three storage layouts requiring three buffer pool integrations, three WAL paths, and three recovery strategies - which is just three databases in a trench coat.
 
 The question is what the uniform representation should be.
 
@@ -30,7 +30,7 @@ The record header is universal: every tuple in every page of every model has the
 The three access methods interpret the payload differently:
 
 - **Relational:** payload is a row encoded as `[null_bitmap][fixed_fields][var_offsets][var_data]`. The schema (from the catalog) tells the SQL engine how to decode it.
-- **Document:** payload is a tagged binary document (similar to BSON but our own format). Self-describing — no external schema needed.
+- **Document:** payload is a tagged binary document (similar to BSON but our own format). Self-describing - no external schema needed.
 - **Key-value:** payload is `[key_len: u16][key: bytes][value: bytes]`. The slot's length minus header gives total payload length; key_len splits the rest.
 
 ## Alternatives considered
@@ -47,7 +47,7 @@ Every model stores its data in slotted pages but xmin/xmax live somewhere else (
 
 **Against:** Visibility checks become two-lookup operations: fetch the record, then look up its version metadata. This doubles the work on the hottest path in the engine.
 
-The shared MVCC header costs 24 bytes per tuple. For a 100-byte tuple, this is 24% overhead — significant. For a 1 KiB tuple, 2.4% — negligible. Most realistic workloads have tuples larger than 100 bytes; the overhead is acceptable.
+The shared MVCC header costs 24 bytes per tuple. For a 100-byte tuple, this is 24% overhead - significant. For a 1 KiB tuple, 2.4% - negligible. Most realistic workloads have tuples larger than 100 bytes; the overhead is acceptable.
 
 ### Self-describing payload everywhere (BSON-like for all)
 Even SQL rows would be stored as tagged binary documents.
@@ -113,9 +113,9 @@ struct RecordHeader {
 ```
 
 Flags include:
-- `bit 0`: HAS_NEXT_VERSION — version chain pointer is valid
-- `bit 1`: FORWARDED — payload starts with a RID forwarding pointer; resolve through it
-- `bit 2`: TOMBSTONE — deleted, payload meaningless (used in some access method internals)
+- `bit 0`: HAS_NEXT_VERSION - version chain pointer is valid
+- `bit 1`: FORWARDED - payload starts with a RID forwarding pointer; resolve through it
+- `bit 2`: TOMBSTONE - deleted, payload meaningless (used in some access method internals)
 - `bit 3-15`: reserved
 
 The header is `repr(C)` and serialized little-endian. The on-disk byte layout is normative; the in-memory Rust struct is illustrative.
@@ -149,7 +149,7 @@ This is the same approach Postgres uses (Postgres calls it "heap-only tuples" wh
 
 ## References
 
-- ADR 0002 — slotted page layout.
-- ADR 0004 — xmin/xmax semantics.
+- ADR 0002 - slotted page layout.
+- ADR 0004 - xmin/xmax semantics.
 - PostgreSQL tuple format documentation.
-- `specs/page-format.md` and `specs/record-format.md` — normative byte layouts.
+- `specs/page-format.md` and `specs/record-format.md` - normative byte layouts.

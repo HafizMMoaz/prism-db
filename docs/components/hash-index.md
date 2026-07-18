@@ -127,7 +127,7 @@ bucket_overflow_threshold = 0.9  # fraction of bucket capacity before split
 
 ## References
 
-- Fagin, Nievergelt, Pippenger, Strong: "Extendible Hashing — A Fast Access Method for Dynamic Files." ACM TODS 1979.
+- Fagin, Nievergelt, Pippenger, Strong: "Extendible Hashing - A Fast Access Method for Dynamic Files." ACM TODS 1979.
 - PostgreSQL hash access method (limited use historically; we are doing better with the WAL integration).
-- ADR 0005 — unified record format; values are RIDs.
-- `components/kv-engine.md` — primary user.
+- ADR 0005 - unified record format; values are RIDs.
+- `components/kv-engine.md` - primary user.

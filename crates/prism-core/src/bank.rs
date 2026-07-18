@@ -1,22 +1,22 @@
-//! The bank-transfer harness — the M2 exit gate.
+//! The bank-transfer harness - the M2 exit gate.
 //!
 //! A bank has N accounts whose balances sum to a constant. Each transfer moves
 //! money between two accounts in one transaction, preserving the total. Two
 //! tests exercise the whole transactional stack against the *total-balance
 //! invariant*:
 //!
-//! 1. [`bank_transfer_survives_crash`] — single-threaded transfers plus one
+//! 1. [`bank_transfer_survives_crash`] - single-threaded transfers plus one
 //!    uncommitted "loser", then a simulated crash and `recover()`. After
 //!    recovery the total must hold and the loser's transfer must be discarded
 //!    (atomicity + durability + correct redo / loser handling).
-//! 2. [`bank_transfer_concurrent_preserves_total`] — many threads transferring
+//! 2. [`bank_transfer_concurrent_preserves_total`] - many threads transferring
 //!    in parallel (each account guarded by a test-side mutex so transactions
 //!    never spuriously conflict), verifying the total holds under concurrent
 //!    commits and MVCC reads. DB-level write-lock contention is covered by the
 //!    lock-manager tests.
 //!
 //! Accounts are addressed by their current `RecordId`, tracked test-side (the
-//! test process never crashes — only the engine state is dropped), since
+//! test process never crashes - only the engine state is dropped), since
 //! scan-after-recovery awaits the catalog.
 
 use std::path::Path;
@@ -121,7 +121,7 @@ fn run_bank_crash(seed: u64) {
         let bb = read_balance(&store, &t, rids[1]).unwrap();
         let _ = store.update(&t, rids[0], &(ba - 77).to_le_bytes()).unwrap();
         let _ = store.update(&t, rids[1], &(bb + 77).to_le_bytes()).unwrap();
-        std::mem::forget(t); // crash before commit/abort — a loser; model unchanged
+        std::mem::forget(t); // crash before commit/abort - a loser; model unchanged
 
         // Crash: drop everything without a clean flush.
         drop(store);
@@ -238,7 +238,7 @@ fn bank_transfer_concurrent_preserves_total() {
 /// there is no deadlock), which serializes transfers that share an account at
 /// the test level: each transaction therefore sees a stable, exclusively-held
 /// pair of rows and never conflicts. Transfers on disjoint accounts still run
-/// concurrently — exercising parallel commits, MVCC reads, and the invariant.
+/// concurrently - exercising parallel commits, MVCC reads, and the invariant.
 /// (DB-level write-lock contention is covered by the lock-manager tests.)
 fn transfer(
     store: &RecordStore,

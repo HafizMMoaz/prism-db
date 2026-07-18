@@ -197,7 +197,7 @@ allocation_latch_timeout_ms = 5000
 
 ## References
 
-- ADR 0007 — clock sweep choice.
-- ADR 0003 — WAL invariant.
-- `components/wal.md` — `flush_through` contract.
-- PostgreSQL `bufmgr.c` — reference implementation.
+- ADR 0007 - clock sweep choice.
+- ADR 0003 - WAL invariant.
+- `components/wal.md` - `flush_through` contract.
+- PostgreSQL `bufmgr.c` - reference implementation.

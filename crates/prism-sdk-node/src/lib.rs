@@ -1,4 +1,4 @@
-//! `prism-sdk-node` — reserved crate for a future native (napi-rs) Node binding.
+//! `prism-sdk-node` - reserved crate for a future native (napi-rs) Node binding.
 //!
 //! The shipping Node.js SDK is **pure TypeScript** over the wire protocol, at
 //! [`sdks/node`](../../sdks/node) (`@prismdb/client`): it speaks

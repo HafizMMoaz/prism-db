@@ -69,7 +69,7 @@
 
         <Package Id='*'
             Keywords='Installer'
-            Description='PrismDB command-line tools: the prismd server, the prism-shell client, and the fsck/dump utilities — one install, all binaries.'
+            Description='PrismDB command-line tools: the prismd server, the prism-shell client, and the fsck/dump utilities - one install, all binaries.'
             Manufacturer='The Prism authors'
             InstallerVersion='450'
             Languages='1033'

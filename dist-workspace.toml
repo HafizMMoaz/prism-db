@@ -11,10 +11,10 @@ cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
 # The installers to generate for each app:
-#   shell      — curl ... | sh   (Linux/macOS)
-#   powershell — irm ... | iex   (Windows)
-#   homebrew   — `brew install` via the tap below (macOS/Linux)
-#   msi        — a Windows .msi installer
+#   shell      - curl ... | sh   (Linux/macOS)
+#   powershell - irm ... | iex   (Windows)
+#   homebrew   - `brew install` via the tap below (macOS/Linux)
+#   msi        - a Windows .msi installer
 installers = ["shell", "powershell", "homebrew", "msi"]
 # The GitHub repo holding the Homebrew formula (created separately; dist pushes to it).
 tap = "HafizMMoaz/homebrew-prism"

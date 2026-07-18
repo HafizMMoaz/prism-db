@@ -1,4 +1,4 @@
-# Prism — workspace manifest.
+# Prism - workspace manifest.
 # This file is the source of truth for crates, shared dependencies, and build
 # profiles. Crate dependency direction is downward only; see
 # docs/architecture/module-layout.md.
@@ -34,7 +34,7 @@ repository = "https://github.com/HafizMMoaz/prism-db"
 homepage = "https://github.com/HafizMMoaz/prism-db"
 authors = ["The Prism authors"]
 
-# Internal crates — referenced by members via `{ workspace = true }`. Each carries
+# Internal crates - referenced by members via `{ workspace = true }`. Each carries
 # an explicit version alongside its path: the path drives local builds, the
 # version keeps the deps concrete (not wildcards) for tooling and publishing.
 [workspace.dependencies]

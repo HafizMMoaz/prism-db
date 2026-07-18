@@ -1,7 +1,7 @@
 # PrismDb.Client (.NET / C#)
 
 A **pure-C#** client for [PrismDB](https://github.com/HafizMMoaz/prism-db), speaking the binary wire
-protocol directly over a TCP (or TLS) socket. No native dependency — it targets
+protocol directly over a TCP (or TLS) socket. No native dependency - it targets
 `netstandard2.0`, so it runs on .NET Framework 4.6.1+, .NET Core, and .NET 5+.
 
 > Implements `docs/specs/wire-protocol.md`. The byte layouts are kept in lockstep
@@ -53,18 +53,18 @@ name, connect timeout, notice handler, client name/version). Omit `username` to
 skip authentication. Pass `tls: true` to validate the server certificate against
 the OS trust store.
 
-### SQL — `db.Sql(text, parameters = null, returnRows = true)`
+### SQL - `db.Sql(text, parameters = null, returnRows = true)`
 
 Returns a `SqlResult` with `Columns`, `Rows` (dictionaries keyed by column name),
 `Raw` (cells in column order), and `AffectedRows` (`ulong`). Parameters are
 positional, `$1`, `$2`, … in the SQL text.
 
-### KV — `db.Kv`
+### KV - `db.Kv`
 
 `Get(ns, key) → byte[]?`, `GetString(ns, key) → string?`, `Put(ns, key, value)`,
 `Delete(ns, key)`. Keys/values are `string` (UTF-8) or `byte[]`.
 
-### Documents — `db.Doc`
+### Documents - `db.Doc`
 
 `InsertOne` / `InsertMany` (return the assigned `ObjectId`s), `Find` / `FindOne`,
 `Count`, `UpdateOne` / `UpdateMany`, `DeleteOne` / `DeleteMany`. Build filters with
@@ -84,7 +84,7 @@ db.Doc.UpdateOne("people", Q.Eq("name", "carol"), new[] {
 });
 ```
 
-### Transactions — `db.Begin(readOnly = false)`, `db.Commit(...)`, `db.Abort()`
+### Transactions - `db.Begin(readOnly = false)`, `db.Commit(...)`, `db.Abort()`
 
 One `Client` is one server session, so calls between `Begin()` and `Commit()` run
 in that transaction.

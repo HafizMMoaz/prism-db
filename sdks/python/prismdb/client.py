@@ -67,7 +67,7 @@ def _bytes(v: BytesLike) -> bytes:
 
 
 class KvSurface:
-    """``client.kv`` — namespaced key/value operations."""
+    """``client.kv`` - namespaced key/value operations."""
 
     def __init__(self, client: "Client") -> None:
         self._c = client
@@ -86,7 +86,7 @@ class KvSurface:
 
 
 class DocSurface:
-    """``client.doc`` — document collection operations."""
+    """``client.doc`` - document collection operations."""
 
     def __init__(self, client: "Client") -> None:
         self._c = client

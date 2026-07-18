@@ -5,7 +5,7 @@
 
 ## Overview
 
-Prism is a layered system. Each layer depends only on the layers below it. The crucial property of the architecture is that all three access methods — SQL, document, KV — are siblings at the same layer, sitting on top of one shared transactional record store. Nothing in the storage or transaction layer knows what data model is being served.
+Prism is a layered system. Each layer depends only on the layers below it. The crucial property of the architecture is that all three access methods - SQL, document, KV - are siblings at the same layer, sitting on top of one shared transactional record store. Nothing in the storage or transaction layer knows what data model is being served.
 
 ## Layer diagram
 
@@ -135,10 +135,10 @@ Single TOML config file. Components read their own section. Hot-reload is not su
 
 The defining architectural property is that the record store, transaction manager, buffer pool, and WAL are singletons within a Prism process. There is one of each, shared across all three access methods. A transaction touching a SQL table and a document collection:
 
-1. Calls `txn = TxnManager.begin()` — gets a TxnId
+1. Calls `txn = TxnManager.begin()` - gets a TxnId
 2. SQL insert: SQL engine compiles to `RecordStore.insert(txn, row_bytes)`
 3. Document update: document engine compiles to `RecordStore.update(txn, rid, doc_bytes)`
-4. Calls `TxnManager.commit(txn)` — writes one commit record to the WAL
+4. Calls `TxnManager.commit(txn)` - writes one commit record to the WAL
 
 The WAL contains records for both operations, both tagged with the same TxnId. Recovery replays both. Visibility logic applies the same way to both. The record store has no special path for cross-model transactions because, from its point of view, there is no such thing as a cross-model transaction; there is just a transaction with records that happened to be interpreted by different access methods.
 

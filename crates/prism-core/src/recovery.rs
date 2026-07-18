@@ -1,4 +1,4 @@
-//! Crash recovery — Analysis + Redo over the WAL.
+//! Crash recovery - Analysis + Redo over the WAL.
 //!
 //! See `docs/components/recovery.md`. **Notable, deliberate deviation:** the
 //! classical ARIES *undo* phase (with CLRs) is unnecessary here because the
@@ -20,7 +20,7 @@
 //! or torn (checksum mismatch) is rebuilt from scratch (base LSN 0, every record
 //! applied), so a possibly-torn page is never trusted. After a [checkpoint]
 //! (`RecordStore::checkpoint`, which flushes and fsyncs all dirty pages), the
-//! prefix is already on disk and redo skips it — bounding redo work to the tail
+//! prefix is already on disk and redo skips it - bounding redo work to the tail
 //! written since the last checkpoint. The analysis of commit/abort status and
 //! the heap directory still scans the full durable log (cheap: no page I/O), so
 //! visibility stays exact; WAL truncation is a follow-up that builds on this.
@@ -54,7 +54,7 @@ pub struct RecoveryReport {
     pub pages_rebuilt: usize,
     /// Committed transactions and their commit LSNs.
     pub committed: Vec<(TxnId, Lsn)>,
-    /// Transactions that aborted or were losers (active at crash) — invisible.
+    /// Transactions that aborted or were losers (active at crash) - invisible.
     pub aborted: Vec<TxnId>,
     /// The heap directory: `heap_id -> pages` (allocation order), for seeding
     /// the record store so heaps and `scan` work after restart.
@@ -180,7 +180,7 @@ pub fn recover(wal: &Wal, disk: &DiskManager) -> Result<RecoveryReport> {
     disk.sync()?;
 
     // Losers (data records but neither committed nor explicitly aborted) are
-    // treated as aborted — their effects stay invisible.
+    // treated as aborted - their effects stay invisible.
     for &t in &data_txns {
         if !committed.contains_key(&t) && !aborted.contains(&t) {
             aborted.insert(t);
@@ -387,7 +387,7 @@ mod tests {
             rid_beta2 = store.update(&t2, rid_beta, b"beta-updated").unwrap();
             t2.commit().unwrap();
 
-            let t3 = txns.begin(TxnMode::ReadWrite); // id 4 — the loser
+            let t3 = txns.begin(TxnMode::ReadWrite); // id 4 - the loser
             rid_ghost = store.insert(&t3, HEAP, b"ghost").unwrap();
             std::mem::forget(t3); // crash before commit/abort: no finalize record
 
